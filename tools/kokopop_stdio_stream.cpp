@@ -344,6 +344,26 @@ int main(int argc, char ** argv) {
         }
     }
 
+    // Flush any remaining accumulated text on EOF
+    if (!text_buffer.empty()) {
+        if (!handles.empty()) {
+            handles.back().join();
+            handles.pop_back();
+        }
+        std::fprintf(stderr, "[kokopop] Synthesizing (EOF flush): %zu chars, voice=%s, speed=%.1f, mode=%s\n",
+                    text_buffer.size(), voice.c_str(), speed, mode_str.c_str());
+        auto handle = kokopop::stream_synthesize(
+            *model,
+            text_buffer,
+            voice,
+            speed,
+            stream_mode,
+            audio_callback,
+            &state);
+        handles.push_back(std::move(handle));
+        text_buffer.clear();
+    }
+
     // Wait for all streams to complete
     std::fprintf(stderr, "[kokopop] Waiting for %zu stream(s) to complete...\n", handles.size());
     for (size_t i = 0; i < handles.size(); ++i) {
