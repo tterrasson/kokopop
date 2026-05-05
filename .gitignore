@@ -1,0 +1,68 @@
+# macOS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# CMake / build directories
+build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+compile_commands.json
+*.o
+*.so
+*.a
+*.dylib
+*.out
+*.bin
+
+# Audio / binary test data
+kmod_mock_test.gguf
+kmod_mock_test.wav
+
+# Compressed profile data
+profile.json.gz
+
+# IDE
+.vscode/settings.json
+.vscode/c_cpp_properties.json
+.vscode/*.code-snippets
+
+# Claude AI
+.claude/settings.local.json
+
+# Plans / scratch
+plans/
+
+# Temporary files
+*.tmp
+*.swp
+*.swo
+*~
+
+# Models
+./models
+*.gguf
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv/
+*.egg-info/
+*.egg
+*.pyc
+.mypy_cache/
+.pytest_cache/
+.tox/
+.hypothesis/
