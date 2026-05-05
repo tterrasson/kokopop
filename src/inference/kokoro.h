@@ -42,7 +42,7 @@ ggml_tensor * linear(ggml_context * ctx, ggml_tensor * weight, ggml_tensor * bia
 ggml_tensor * add_channel_bias(ggml_context * ctx, ggml_tensor * x, ggml_tensor * bias);
 ggml_tensor * conv1d(
     ggml_context * ctx, ggml_tensor * weight, ggml_tensor * input,
-    int stride, int padding, int dilation);
+    int stride, int padding, int dilation, int kernel_size);
 ggml_tensor * conv_transpose1d_crop(
     ggml_context * ctx,
     ggml_tensor * weight,

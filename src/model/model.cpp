@@ -113,24 +113,6 @@ bool load_tensor_data_to_backend(
     return true;
 }
 
-bool is_conv1d_weight(const std::string & name) {
-    const size_t n = name.size();
-    if (n < 7 || name.compare(n - 7, 7, ".weight") != 0) return false;
-    if (name.find(".ups.") != std::string::npos)          return false;
-    if (name.find(".pool.weight") != std::string::npos)   return false;
-    return name.find(".convs1.")          != std::string::npos ||
-           name.find(".convs2.")          != std::string::npos ||
-           name.find("noise_convs.")      != std::string::npos ||
-           name.find("conv_post.weight")  != std::string::npos ||
-           name.find(".conv1.weight")     != std::string::npos ||
-           name.find(".conv2.weight")     != std::string::npos ||
-           name.find(".conv1x1.weight")   != std::string::npos ||
-           name.find(".cnn.")             != std::string::npos ||
-           name.find("F0_conv.weight")    != std::string::npos ||
-           name.find("N_conv.weight")     != std::string::npos ||
-           name.find("asr_res.0.weight")  != std::string::npos;
-}
-
 } // namespace
 
 bool tensor_to_f32(Backend & backend, ggml_tensor * tensor, std::vector<float> & out) {
@@ -415,8 +397,8 @@ bool load_model_from_gguf(
     }
 
     uint32_t version = 0;
-    if (!get_u32(meta, "kokopop.kokoro.version", version) || (version != 2 && version != 3)) {
-        error = "GGUF is not a kokopop Kokoro v2/v3 model; reconvert it with the current converter";
+    if (!get_u32(meta, "kokopop.kokoro.version", version) || version != 4) {
+        error = "GGUF is not a kokopop Kokoro v4 model; reconvert it with the current converter";
         return false;
     }
     m->version = version;
@@ -463,35 +445,17 @@ bool load_model_from_gguf(
         if (mapped != physical_to_logical.end()) {
             logical = mapped->second;
         }
-        if (version == 2) {
-            // v2: strict type checks
-            if (is_conv1d_weight(logical) && tensor->type != GGML_TYPE_F16) {
-                error = "Kokoro v2 GGUF conv1d weight is not f16: " + logical;
-                tensor_failed = true;
-                return;
-            }
-            if (!is_conv1d_weight(logical) && tensor->type == GGML_TYPE_F16) {
-                error = "Kokoro v2 GGUF non-conv tensor is unexpectedly f16: " + logical;
-                tensor_failed = true;
-                return;
-            }
-        } else {
-            // v3: relaxed type checks — allow quantized types
-            if (is_conv1d_weight(logical) && tensor->type != GGML_TYPE_F16) {
-                error = "v3 GGUF conv1d weight must be f16: " + logical;
-                tensor_failed = true;
-                return;
-            }
-            const enum ggml_type t = tensor->type;
-            if (t != GGML_TYPE_F32 && t != GGML_TYPE_F16 &&
-                t != GGML_TYPE_Q5_K && t != GGML_TYPE_Q6_K &&
-                t != GGML_TYPE_Q8_0) {
-                error = "v3 GGUF unsupported tensor type for "
-                    + logical + ": type "
-                    + std::to_string(static_cast<int>(t));
-                tensor_failed = true;
-                return;
-            }
+        // v4: conv1d kernels are stored 2D ([OC, IC*K]) and may be quantized.
+        // The runtime decomposes conv1d into im2col + mul_mat to consume them.
+        const enum ggml_type t = tensor->type;
+        if (t != GGML_TYPE_F32 && t != GGML_TYPE_F16 &&
+            t != GGML_TYPE_Q4_K && t != GGML_TYPE_Q5_K &&
+            t != GGML_TYPE_Q6_K && t != GGML_TYPE_Q8_0) {
+            error = "v4 GGUF unsupported tensor type for "
+                + logical + ": type "
+                + std::to_string(static_cast<int>(t));
+            tensor_failed = true;
+            return;
         }
         m->tensors[logical] = tensor;
 

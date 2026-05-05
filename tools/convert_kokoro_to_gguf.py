@@ -35,10 +35,6 @@ warnings.filterwarnings(
     category=FutureWarning,
 )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Lazy ML dependencies (loaded on demand)
-# ─────────────────────────────────────────────────────────────────────────────
-
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -66,25 +62,15 @@ GGUF_TYPE_ARRAY = 9
 GGML_TYPE_F32 = 0
 GGML_TYPE_F16 = 1
 GGML_TYPE_Q8_0 = 8
+GGML_TYPE_Q4_K = 12
 GGML_TYPE_Q5_K = 13
 GGML_TYPE_Q6_K = 14
 
-KOKOPOP_GGUF_VERSION = 3
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Quantization mapping tables
-# ─────────────────────────────────────────────────────────────────────────────
-
-_QUANT_UNIFORM_MAP: dict[str, int] = {
-    "f16": GGML_TYPE_F16,
-    "f32": GGML_TYPE_F32,
-    "q5_k": GGML_TYPE_Q5_K,
-    "q6_k": GGML_TYPE_Q6_K,
-    "q8_0": GGML_TYPE_Q8_0,
-}
+KOKOPOP_GGUF_VERSION = 4
 
 # Block size for each GGML quant type (from ggml_type_traits)
 _GGML_BLOCK_SIZES: dict[int, int] = {
+    GGML_TYPE_Q4_K: 256,
     GGML_TYPE_Q5_K: 256,
     GGML_TYPE_Q6_K: 256,
     GGML_TYPE_Q8_0: 32,
@@ -92,7 +78,11 @@ _GGML_BLOCK_SIZES: dict[int, int] = {
     GGML_TYPE_F32: 1,
 }
 
-# Patterns indicating a Conv1d weight that must stay F16 at runtime
+VALID_TIERS = ("kokoro-sm", "kokoro-md", "kokoro-lg")
+
+# Patterns indicating a regular Conv1d weight (gets reshape [OC,IC,K] -> [OC,IC*K]).
+# The runtime calls `conv1d()` with these — they MUST all be reshaped to 2D so
+# the runtime can take the unified im2col + mul_mat path without ambiguity.
 _CONV1D_PATTERNS: tuple[str, ...] = (
     ".convs1.",
     ".convs2.",
@@ -104,6 +94,8 @@ _CONV1D_PATTERNS: tuple[str, ...] = (
     ".cnn.",
     "F0_conv.weight",
     "N_conv.weight",
+    "F0_proj.weight",
+    "N_proj.weight",
     "asr_res.0.weight",
 )
 
@@ -138,25 +130,16 @@ def weight_norm_value(module) -> np.ndarray:
 
 
 def is_conv1d_weight(name: str) -> bool:
-    """Return True if *name* refers to a Conv1d weight that must stay F16."""
+    """Return True if *name* is a regular Conv1d weight (reshape candidate).
+
+    Excludes ConvTranspose1d (`.ups.`) which has no clean im2col path,
+    and `.pool.` which is a depthwise pool kernel handled separately.
+    """
     if not name.endswith(".weight"):
         return False
     if ".ups." in name or ".pool.weight" in name:
         return False
     return any(pat in name for pat in _CONV1D_PATTERNS)
-
-
-def runtime_tensor_type(name: str, data: np.ndarray, requested_type: int) -> int:
-    """Select the runtime GGML type for a tensor.
-
-    In GGUF v2+, Conv1d weights are always stored as F16 regardless of
-    the requested type.
-    """
-    if KOKOPOP_GGUF_VERSION < 2:
-        return requested_type
-    if is_conv1d_weight(name):
-        return GGML_TYPE_F16
-    return GGML_TYPE_F32
 
 
 def _is_type_aligned(ggml_type: int, innermost_dim: int) -> bool:
@@ -170,129 +153,106 @@ def _is_type_aligned(ggml_type: int, innermost_dim: int) -> bool:
 def _downgrade_type(ggml_type: int, innermost_dim: int) -> int:
     """Downgrade *ggml_type* if it cannot handle *innermost_dim*.
 
-    Fallback chain:
-        Q5_K / Q6_K → Q8_0 → F16
-        Q8_0        → F16
+    Fallback chain: Q4_K/Q5_K/Q6_K → Q8_0 → F16
     """
     if _is_type_aligned(ggml_type, innermost_dim):
         return ggml_type
-
-    if ggml_type in (GGML_TYPE_Q5_K, GGML_TYPE_Q6_K):
+    if ggml_type in (GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K):
         if _is_type_aligned(GGML_TYPE_Q8_0, innermost_dim):
             return GGML_TYPE_Q8_0
-    if ggml_type == GGML_TYPE_Q8_0:
-        pass
     return GGML_TYPE_F16
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Mixed-quantization type resolution
+# Tiered quantization (kokoro-sm / kokoro-md / kokoro-lg)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def get_tensor_quant_type(logical_name: str, ndim: int) -> int:
-    """Determine the target GGML type for a tensor in mixed quantization.
+def _tier_type(tier: str, logical: str, ndim: int) -> int:
+    """Target GGML type for *logical* in the given tier.
 
-    Returns the quantization type based on the tensor's logical name and
-    dimensionality, following the mixed-quantization scheme defined in
-    QUANTIZATION.md.
+    Conv1d weights are quantizable here because they're stored 2D in the GGUF
+    (innermost dim = IC*K). Block-size downgrade still applies afterwards.
+    The runtime decomposes conv1d into im2col + mul_mat to consume the
+    quantized kernels directly.
     """
-    # 1D tensors (biases, norm params, Snake alpha) → always F32
+    # 1D / biases / norm params → F32
     if ndim <= 1:
         return GGML_TYPE_F32
 
-    # Voice embeddings → always F16
-    if logical_name.startswith("kokopop.voice."):
-        return GGML_TYPE_F16
-
-    # Embedding lookup tables → F32
-    if (".embeddings." in logical_name or ".embedding.weight" in logical_name) and \
-       logical_name.endswith(".weight"):
+    # Snake activation alpha — broadcasted into element-wise math, must
+    # stay full precision (Snake uses sin²(xα)/α which is α-sensitive).
+    if ".alpha" in logical and ".weight" not in logical:
         return GGML_TYPE_F32
 
-    # Snake activation alpha params → F32 (binary ops)
-    if ".alpha" in logical_name and ".weight" not in logical_name:
+    # Voice embedding pack: F16 (used as a row-lookup, no matmul)
+    if logical.startswith("kokopop.voice."):
+        return GGML_TYPE_F16
+
+    # Embedding lookup tables (text_encoder.embedding, ALBERT word/pos embs) → F32
+    if logical.endswith(".weight") and (
+        ".embeddings." in logical or ".embedding.weight" in logical
+    ):
         return GGML_TYPE_F32
 
-    # Conv1d weights → always F16 (required by runtime)
-    if is_conv1d_weight(logical_name):
+    # Harmonic source merge weights and depthwise pool kernels: small, keep F16.
+    if "m_source" in logical or ".pool.weight" in logical:
         return GGML_TYPE_F16
 
-    # AdaIn FC gamma/beta weights in predictor F0/N → Q6_K
-    if (".fc.gamma.weight" in logical_name or ".fc.beta.weight" in logical_name) and \
-       (logical_name.startswith("kokopop.predictor.F0.") or
-        logical_name.startswith("kokopop.predictor.N.")):
-        return GGML_TYPE_Q6_K
-
-    # Vocoder conv_post → F16
-    if "conv_post" in logical_name:
+    # ConvTranspose1d (vocoder upsampling) — runtime keeps it F16.
+    if ".ups." in logical:
         return GGML_TYPE_F16
 
-    # Harmonic source merge → F16
-    if "m_source" in logical_name:
-        return GGML_TYPE_F16
+    # Per-tier mapping of every other 2D+ tensor.
+    if tier == "kokoro-sm":
+        # Aggressive: Q4_K everywhere it fits, Q5_K for prosody/AdaIn FC.
+        if (".fc.gamma.weight" in logical or ".fc.beta.weight" in logical) and (
+            logical.startswith("kokopop.predictor.F0.")
+            or logical.startswith("kokopop.predictor.N.")
+        ):
+            return GGML_TYPE_Q5_K
+        if logical.startswith("kokopop.predictor."):
+            return GGML_TYPE_Q5_K  # prosody-sensitive
+        if "conv_post" in logical:
+            return GGML_TYPE_Q5_K
+        return GGML_TYPE_Q4_K
 
-    # Vocoder generator upsampling → Q8_0
-    if logical_name.startswith("kokopop.decoder.generator.ups."):
-        return GGML_TYPE_Q8_0
-
-    # Vocoder residual blocks → Q8_0
-    if ".generator.resblocks." in logical_name or ".generator.noise_res." in logical_name:
-        return GGML_TYPE_Q8_0
-
-    # ALBERT / BERT → Q5_K (majority), Q6_K for FFN output projection
-    if logical_name.startswith("kokopop.albert.") or \
-       logical_name.startswith("kokopop.bert_encoder."):
-        if "ffn_output" in logical_name:
+    if tier == "kokoro-md":
+        # Balanced: Q5_K majority, Q6_K for FFN out / AdaIn FC, Q8_0 for conv_post.
+        if logical.startswith("kokopop.albert.") or logical.startswith("kokopop.bert_encoder."):
+            return GGML_TYPE_Q6_K if "ffn_output" in logical else GGML_TYPE_Q5_K
+        if (".fc.gamma.weight" in logical or ".fc.beta.weight" in logical) and (
+            logical.startswith("kokopop.predictor.F0.")
+            or logical.startswith("kokopop.predictor.N.")
+        ):
             return GGML_TYPE_Q6_K
+        if "conv_post" in logical:
+            return GGML_TYPE_Q8_0
         return GGML_TYPE_Q5_K
 
-    # Text encoder → Q5_K
-    if logical_name.startswith("kokopop.text_encoder."):
-        return GGML_TYPE_Q5_K
-
-    # Predictor → Q5_K
-    if logical_name.startswith("kokopop.predictor."):
-        return GGML_TYPE_Q5_K
-
-    # Decoder (encode + decode) → Q5_K
-    if logical_name.startswith("kokopop.decoder."):
-        return GGML_TYPE_Q5_K
-
-    # Fallback
-    return GGML_TYPE_F16
+    # tier == "kokoro-lg"
+    # Quality first: Q6_K for everything quantizable, Q8_0 for vocoder.
+    if "conv_post" in logical:
+        return GGML_TYPE_Q8_0
+    if (
+        ".generator." in logical
+        or ".F0_conv." in logical
+        or ".N_conv." in logical
+    ):
+        return GGML_TYPE_Q8_0
+    return GGML_TYPE_Q6_K
 
 
-def resolve_tensor_type(writer, name: str, data: np.ndarray, base_ftype: int) -> int:
-    """Resolve final GGML type for a tensor, respecting quantization scheme.
+def resolve_tensor_type(writer, name: str, data: np.ndarray) -> int:
+    """Resolve final GGML type for a tensor in the writer's tier.
 
-    Also enforces block-size alignment: GGML K-quant types require the
-    innermost dimension to be a multiple of the block size.  If the
-    preferred type can't represent the tensor shape, the type is
-    downgraded (Q5_K/Q6_K → Q8_0 → F16).
+    The tensor's *data* is already in the on-disk layout (conv1d kernels
+    have been reshaped to 2D before this is called), so `data.shape[-1]`
+    is the correct innermost dim for block-size alignment.
     """
-    scheme = writer.quant_scheme
-
-    if scheme == "none":
-        return runtime_tensor_type(name, data, base_ftype)
-
-    if scheme == "mixed":
-        target = get_tensor_quant_type(name, data.ndim)
-    else:
-        # Uniform quantization
-        if data.ndim <= 1:
-            return GGML_TYPE_F32
-        if name.startswith("kokopop.voice."):
-            return GGML_TYPE_F16
-        if is_conv1d_weight(name):
-            return GGML_TYPE_F16
-        target = _QUANT_UNIFORM_MAP.get(scheme, GGML_TYPE_F16)
-
-    # Enforce block-size alignment
+    target = _tier_type(writer.tier, name, data.ndim)
     if data.ndim > 1:
-        innermost = data.shape[-1]
-        target = _downgrade_type(target, innermost)
-
+        target = _downgrade_type(target, data.shape[-1])
     return target
 
 
@@ -460,7 +420,7 @@ class GGUFWriter:
         self.logical_names: list[str] = []
         self.physical_names: list[str] = []
         self.used_tensor_names: set[str] = set()
-        self.quant_scheme: str = "none"
+        self.tier: str = "kokoro-md"
 
     # -- metadata helpers ---------------------------------------------------
 
@@ -478,10 +438,19 @@ class GGUFWriter:
 
     # -- tensor helpers -----------------------------------------------------
 
-    def add_tensor(self, name: str, data, ggml_type: int) -> None:
-        """Queue a tensor for serialization with automatic type resolution."""
+    def add_tensor(self, name: str, data) -> None:
+        """Queue a tensor for serialization with automatic type resolution.
+
+        For regular Conv1d weights of shape [OC, IC, K] the kernel is
+        reshaped to 2D [OC, IC*K] before quantization so the innermost
+        dim is IC*K (typically aligned to a quant block size). The runtime
+        rebuilds the kernel shape via im2col + mul_mat.
+        """
         arr = as_f32(data)
-        final_type = resolve_tensor_type(self, name, arr, ggml_type)
+        if arr.ndim == 3 and is_conv1d_weight(name):
+            oc, ic, k = arr.shape
+            arr = arr.reshape(oc, ic * k)
+        final_type = resolve_tensor_type(self, name, arr)
         physical = self._physical_tensor_name(name)
         self.tensors.append(
             TensorEntry(
@@ -584,46 +553,37 @@ class GGUFWriter:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def split_lstm(name: str, tensor, writer: GGUFWriter, ftype: int) -> None:
+def split_lstm(name: str, tensor, writer: GGUFWriter) -> None:
     """Split an LSTM weight/bias tensor into 4 equal chunks."""
     data = as_f32(tensor)
     chunks = np.split(data, 4, axis=0)
     for idx, chunk in enumerate(chunks):
-        writer.add_tensor(f"{name}.{idx}", chunk, ftype)
+        writer.add_tensor(f"{name}.{idx}", chunk)
 
 
-def add_adain_fc(prefix: str, weight, bias, writer: GGUFWriter, ftype: int) -> None:
+def add_adain_fc(prefix: str, weight, bias, writer: GGUFWriter) -> None:
     """Decompose AdaIn FC weight/bias into gamma and beta branches."""
     w0, w1 = np.split(as_f32(weight), 2, axis=0)
     b0, b1 = np.split(as_f32(bias), 2, axis=0)
-    writer.add_tensor(prefix + ".gamma.weight", w0, ftype)
-    writer.add_tensor(prefix + ".gamma.bias", b0, GGML_TYPE_F32)
-    writer.add_tensor(prefix + ".beta.weight", w1, ftype)
-    writer.add_tensor(prefix + ".beta.bias", b1, GGML_TYPE_F32)
+    writer.add_tensor(prefix + ".gamma.weight", w0)
+    writer.add_tensor(prefix + ".gamma.bias", b0)
+    writer.add_tensor(prefix + ".beta.weight", w1)
+    writer.add_tensor(prefix + ".beta.bias", b1)
 
 
-def add_state_dict(
-    prefix: str,
-    state: dict[str, object],
-    writer: GGUFWriter,
-    ftype: int,
-) -> None:
+def add_state_dict(prefix: str, state: dict[str, object], writer: GGUFWriter) -> None:
     """Process a plain state dict and add tensors to *writer*."""
     for name, tensor in sorted(state.items()):
         if name.endswith("weight_v"):
             continue
         key = f"{prefix}.{name}"
         if "lstm" in name and ("weight_" in name or "bias_" in name):
-            split_lstm(key, tensor, writer, ftype)
+            split_lstm(key, tensor, writer)
             continue
-        writer.add_tensor(
-            key, tensor, ftype if tensor.ndim > 1 else GGML_TYPE_F32
-        )
+        writer.add_tensor(key, tensor)
 
 
-def add_regularized_modules(
-    prefix: str, module, writer: GGUFWriter, ftype: int
-) -> None:
+def add_regularized_modules(prefix: str, module, writer: GGUFWriter) -> None:
     """Process a Module with weight-norm and AdaIn layers."""
     modules = dict(module.named_modules())
     for name, param in sorted(module.named_parameters()):
@@ -635,7 +595,6 @@ def add_regularized_modules(
             writer.add_tensor(
                 f"{prefix}.{base}.weight",
                 weight_norm_value(wn_module),
-                ftype,
             )
             continue
         if name.endswith(".fc.weight"):
@@ -645,17 +604,14 @@ def add_regularized_modules(
                 param,
                 dict(module.named_parameters())[f"{base}.fc.bias"],
                 writer,
-                ftype,
             )
             continue
         if name.endswith(".fc.bias"):
             continue
         if "lstm" in name and ("weight_" in name or "bias_" in name):
-            split_lstm(f"{prefix}.{name}", param, writer, ftype)
+            split_lstm(f"{prefix}.{name}", param, writer)
             continue
-        writer.add_tensor(
-            f"{prefix}.{name}", param, ftype if param.ndim > 1 else GGML_TYPE_F32
-        )
+        writer.add_tensor(f"{prefix}.{name}", param)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -676,7 +632,6 @@ def build_vocab(config: dict) -> list[str]:
 
 
 def convert(args: argparse.Namespace) -> None:
-    ftype = GGML_TYPE_F16 if args.ftype == "f16" else GGML_TYPE_F32
     config_path = hf_hub_download(repo_id=args.repo_id, filename="config.json")
     model_path = hf_hub_download(repo_id=args.repo_id, filename=MODEL_NAME)
     config = json.loads(Path(config_path).read_text())
@@ -689,16 +644,16 @@ def convert(args: argparse.Namespace) -> None:
     voices = [v.strip() for v in args.voices.split(",") if v.strip()]
 
     writer = GGUFWriter(Path(args.output))
-    writer.quant_scheme = args.quant
+    writer.tier = args.tier
 
     # Metadata
     writer.add_u32("kokopop.kokoro.version", KOKOPOP_GGUF_VERSION)
     writer.add_bool("kokopop.mock", False)
     writer.add_u32("kokopop.sample_rate", 24000)
     writer.add_string("kokopop.arch", "kokoro-82m")
-    writer.add_string("kokopop.tensor_layout", "runtime-v2")
+    writer.add_string("kokopop.tensor_layout", "runtime-v3")
     writer.add_string("kokopop.source_repo", args.repo_id)
-    writer.add_string("kokopop.quantization", args.quant)
+    writer.add_string("kokopop.quantization", args.tier)
     writer.add_string_array("tokenizer.ggml.tokens", build_vocab(config))
     writer.add_string_array("kokopop.voices", voices)
 
@@ -710,22 +665,22 @@ def convert(args: argparse.Namespace) -> None:
     writer.add_u32("kokopop.n_mels", int(config["n_mels"]))
 
     # Tensors
-    add_state_dict("kokopop.albert", model.bert.state_dict(), writer, ftype)
-    writer.add_tensor("kokopop.bert_encoder.weight", model.bert_encoder.weight, ftype)
-    writer.add_tensor("kokopop.bert_encoder.bias", model.bert_encoder.bias, GGML_TYPE_F32)
-    add_regularized_modules("kokopop.predictor", model.predictor, writer, ftype)
-    add_regularized_modules("kokopop.text_encoder", model.text_encoder, writer, ftype)
-    add_regularized_modules("kokopop.decoder", model.decoder, writer, ftype)
+    add_state_dict("kokopop.albert", model.bert.state_dict(), writer)
+    writer.add_tensor("kokopop.bert_encoder.weight", model.bert_encoder.weight)
+    writer.add_tensor("kokopop.bert_encoder.bias", model.bert_encoder.bias)
+    add_regularized_modules("kokopop.predictor", model.predictor, writer)
+    add_regularized_modules("kokopop.text_encoder", model.text_encoder, writer)
+    add_regularized_modules("kokopop.decoder", model.decoder, writer)
 
     for voice in voices:
         voice_path = hf_hub_download(
             repo_id=args.repo_id, filename=f"voices/{voice}.pt"
         )
         pack = torch.load(voice_path, weights_only=True).squeeze(1)
-        writer.add_tensor(f"kokopop.voice.{voice}", pack, ftype)
+        writer.add_tensor(f"kokopop.voice.{voice}", pack)
 
     writer.write()
-    print(f"wrote {args.output}")
+    print(f"wrote {args.output} (tier={args.tier})")
 
 
 def parse_args() -> argparse.Namespace:
@@ -735,11 +690,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", required=True, help="output GGUF path")
     parser.add_argument("--repo-id", default=DEFAULT_REPO)
     parser.add_argument("--voices", default=DEFAULT_VOICES)
-    parser.add_argument("--ftype", choices=("f16", "f32"), default="f16")
     parser.add_argument(
-        "--quant", default="f16",
-        choices=("none", "f16", "f32", "q5_k", "q6_k", "q8_0", "mixed"),
-        help="Quantization scheme for the output GGUF",
+        "--tier", default="kokoro-md", choices=VALID_TIERS,
+        help="Quantization tier: sm=small/aggressive, md=balanced, lg=quality",
     )
     return parser.parse_args()
 

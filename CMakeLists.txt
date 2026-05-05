@@ -25,7 +25,7 @@ include(FetchContent)
 FetchContent_Declare(
   ggml
   GIT_REPOSITORY https://github.com/ggml-org/ggml.git
-  GIT_TAG        05adcaee
+  GIT_TAG        ac6f7b44f60fde0091f0b3d99afde48f8c99b13a
   GIT_SHALLOW    TRUE
 )
 FetchContent_MakeAvailable(ggml)

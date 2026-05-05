@@ -382,7 +382,7 @@ bool run_kokoro_generation_probe(
     f0_curve = ggml_cont(ctx, ggml_transpose(ctx, f0_curve));
     f0_curve = add_channel_bias(ctx,
         conv1d(ctx, f0_proj_w,
-            ggml_cont(ctx, ggml_transpose(ctx, f0_curve)), 1, 0, 1),
+            ggml_cont(ctx, ggml_transpose(ctx, f0_curve)), 1, 0, 1, 1),
         f0_proj_b);
     f0_curve = ggml_cont(ctx, ggml_view_1d(ctx, f0_curve, f0_curve->ne[0], 0));
     ggml_set_name(f0_curve, "kokopop_f0_probe");
@@ -401,7 +401,7 @@ bool run_kokoro_generation_probe(
     n_curve = ggml_cont(ctx, ggml_transpose(ctx, n_curve));
     n_curve = add_channel_bias(ctx,
         conv1d(ctx, n_proj_w,
-            ggml_cont(ctx, ggml_transpose(ctx, n_curve)), 1, 0, 1),
+            ggml_cont(ctx, ggml_transpose(ctx, n_curve)), 1, 0, 1, 1),
         n_proj_b);
     n_curve = ggml_cont(ctx, ggml_view_1d(ctx, n_curve, n_curve->ne[0], 0));
     ggml_set_name(n_curve, "kokopop_noise_probe");
@@ -431,8 +431,8 @@ bool run_kokoro_generation_probe(
 
     ggml_tensor * f0_dec_in = ggml_reshape_2d(ctx, f0_curve, f0_curve->ne[0], 1);
     ggml_tensor * n_dec_in = ggml_reshape_2d(ctx, n_curve, n_curve->ne[0], 1);
-    ggml_tensor * f0_dec = add_channel_bias(ctx, conv1d(ctx, f0_conv_w, f0_dec_in, 2, 1, 1), f0_conv_b);
-    ggml_tensor * n_dec = add_channel_bias(ctx, conv1d(ctx, n_conv_w, n_dec_in, 2, 1, 1), n_conv_b);
+    ggml_tensor * f0_dec = add_channel_bias(ctx, conv1d(ctx, f0_conv_w, f0_dec_in, 2, 1, 1, 3), f0_conv_b);
+    ggml_tensor * n_dec = add_channel_bias(ctx, conv1d(ctx, n_conv_w, n_dec_in, 2, 1, 1, 3), n_conv_b);
 
     ggml_tensor * decoder_cur = ggml_concat(
         ctx, ggml_concat(
@@ -447,7 +447,7 @@ bool run_kokoro_generation_probe(
 
     ggml_tensor * asr_res = add_channel_bias(ctx,
         conv1d(ctx, asr_res_w,
-            ggml_cont(ctx, ggml_transpose(ctx, asr)), 1, 0, 1),
+            ggml_cont(ctx, ggml_transpose(ctx, asr)), 1, 0, 1, 1),
         asr_res_b);
     for (int i = 0; i < 4; ++i) {
         decoder_cur = ggml_concat(

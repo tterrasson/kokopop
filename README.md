@@ -39,33 +39,61 @@ cmake --build build
 Requires [uv](https://docs.astral.sh/uv/getting-started/installation/).
 
 ```bash
-uv run python tools/convert_kokoro_to_gguf.py --output models/kokoro.gguf --voices af_heart,ff_siwis,zf_xiaoni,im_nicola --quant mixed
+uv run python tools/convert_kokoro_to_gguf.py \
+  --output models/kokoro.gguf \
+  --voices af_heart,ff_siwis,zf_xiaoni,im_nicola \
+  --tier kokoro-md
 ```
+
+Three tiers are available:
+
+| Tier        | Description                          |
+|-------------|--------------------------------------|
+| `kokoro-sm` | Small / aggressive (Q4_K majority)   |
+| `kokoro-md` | Balanced (Q5_K/Q6_K, ~default)       |
+| `kokoro-lg` | Quality first (Q6_K/Q8_0)            |
 
 ### Usage
 
 Synthesize text to a WAV file:
 
 ```bash
-./kokopop_say --model models/kokoro.gguf --voice af_heart --text "Hello, world!" --out hello.wav
+./kokopop_say \
+  --model models/kokoro.gguf \
+  --voice af_heart \
+  --text "Hello, world!" \
+  --out hello.wav
 ```
 
 Synthesize and play directly (macOS):
 
 ```bash
-./kokopop_say --model models/kokoro.gguf --voice af_heart --text "Hello, world!" --play
+./kokopop_say \
+  --model models/kokoro.gguf \
+  --voice af_heart \
+  --text "Hello, world!" \
+  --play
 ```
 
 Generate audio from phonemes:
 
 ```bash
-./kokopop_say --model models/kokoro.gguf --voice af_heart --phonemes "həˈloʊ wɜrld" --out hello.wav
+./kokopop_say \
+  --model models/kokoro.gguf \
+  --voice af_heart \
+  --phonemes "həˈloʊ wɜrld" \
+  --out hello.wav
 ```
 
 Adjust generation speed:
 
 ```bash
-./kokopop_say --model models/kokoro.gguf --voice af_heart --text "Hello, world!" --speed 1.5 --out fast.wav
+./kokopop_say \
+  --model models/kokoro.gguf \
+  --voice af_heart \
+  --text "Hello, world!" \
+  --speed 1.5 \
+  --out fast.wav
 ```
 
 ### Audio playback
@@ -74,7 +102,11 @@ The `kokopop_play` tool reads raw audio from stdin and plays it via Core Audio (
 
 ```bash
 # Pipe audio from kokopop_say directly to playback
-./kokopop_say --model models/kokoro.gguf --voice af_heart --text "Hello, world!" --play
+./kokopop_say \
+  --model models/kokoro.gguf \
+  --voice af_heart \
+  --text "Hello, world!" \
+  --play
 ```
 
 See `kokopop_play --help` for format options (pcm-f32, pcm-s16, wav).
@@ -85,10 +117,18 @@ The `kokopop_stdio_stream` tool reads JSON commands from stdin and streams TTS a
 
 ```bash
 # Start interactive mode
-./kokopop_stdio_stream --model models/kokoro.gguf --voice af_heart --mode interactive --play
+./kokopop_stdio_stream \
+  --model models/kokoro.gguf \
+  --voice af_heart \
+  --mode interactive \
+  --play
 
 # Feed commands via stdin
-echo '{"text": "Hello from piped input"}' | ./kokopop_stdio_stream --model models/kokoro.gguf --voice af_heart --mode long_form
+echo '{"text": "Hello from piped input"}' | \
+  ./kokopop_stdio_stream \
+    --model models/kokoro.gguf \
+    --voice af_heart \
+    --mode long_form
 ```
 
 ## Library Integration

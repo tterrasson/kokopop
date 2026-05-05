@@ -324,19 +324,20 @@ bool ggml_generator(
         int up_padding;
         int noise_stride;
         int noise_padding;
+        int noise_kernel;
         const char * noise_prefix;
         const char * up_weight;
         const char * up_bias;
     };
     static constexpr StageParams stage_params[2] = {
         {
-            7, 10, 5, 6, 3,
+            7, 10, 5, 6, 3, 12,
             "kokopop.decoder.generator.noise_res.0",
             "kokopop.decoder.generator.ups.0.weight",
             "kokopop.decoder.generator.ups.0.bias"
         },
         {
-            11, 6, 3, 1, 0,
+            11, 6, 3, 1, 0, 1,
             "kokopop.decoder.generator.noise_res.1",
             "kokopop.decoder.generator.ups.1.weight",
             "kokopop.decoder.generator.ups.1.bias"
@@ -365,7 +366,8 @@ bool ggml_generator(
             conv1d(ctx, noise_conv_w[stage], har_t,
                 sp.noise_stride,
                 sp.noise_padding,
-                1),
+                1,
+                sp.noise_kernel),
             noise_conv_b[stage]);
         x_source = graph_generator_resblock(ctx, model, x_source, style_t, sp.noise_prefix, sp.kernel, error);
         if (x_source == nullptr) {
@@ -411,7 +413,8 @@ bool ggml_generator(
             x,
             1,
             3,
-            1),
+            1,
+            7),
         require_tensor(model, "kokopop.decoder.generator.conv_post.bias", error));
     if (!error.empty()) {
         ggml_free(ctx);
