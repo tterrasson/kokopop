@@ -1,6 +1,6 @@
 # kokopop — Standalone Kokoro GGML Runtime
 
-A standalone C++ library and toolkit for running [Kokoro](https://github.com/k2-foundation/kokoro) text-to-speech models in GGUF format, with no Python dependency.
+A standalone C++ library and toolkit for running [Kokoro](https://github.com/hexgrad/kokoro) text-to-speech models in GGUF format, with no Python dependency.
 
 ## Features
 
