@@ -201,6 +201,6 @@ Licensed under the [MIT License](LICENSE).
 
 ## Acknowledgements
 
-- [Kokoro](https://github.com/k2-foundation/kokoro) — Text-to-speech model by K2 Foundation
+- [Kokoro](https://github.com/hexgrad/kokoro) — Text-to-speech model
 - [ggml](https://github.com/ggerganov/ggml) — Tensor library for ML inference
 - [espeak-ng](https://github.com/espeak-ng/espeak-ng) — Speech synthesis engine for phonemization
