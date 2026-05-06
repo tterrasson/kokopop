@@ -234,7 +234,8 @@ if(KOKOPOP_BUILD_TESTS)
     ${CMAKE_CURRENT_SOURCE_DIR}/src/playback
   )
   target_link_libraries(kokopop_tests PRIVATE kokopop doctest::doctest ggml)
-  add_test(NAME kokopop_unit COMMAND kokopop_tests)
+  include(${doctest_SOURCE_DIR}/scripts/cmake/doctest.cmake)
+  doctest_discover_tests(kokopop_tests)
 endif()
 
 option(KOKOPOP_BUILD_BENCH "Build kokopop benchmarks (requires kokoro.gguf)" OFF)
