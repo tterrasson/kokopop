@@ -628,13 +628,9 @@ bool HttpServer::_send_response(int fd, const HttpResponse & res, bool close_con
     if (!write_all(fd, headers)) return false;
     if (!res.body.empty() && !write_all(fd, res.body)) return false;
 
-    if (close_conn) {
-#ifdef _WIN32
-        shutdown(fd, SD_BOTH);
-#else
-        shutdown(fd, SHUT_RDWR);
-#endif
-    }
+    // No shutdown() here — the handler thread loops back to _parse_request
+    // to read the next keep-alive request.  When the client closes its end,
+    // socket_read returns EOF (0) and the loop exits, followed by socket_close().
     return true;
 }
 
