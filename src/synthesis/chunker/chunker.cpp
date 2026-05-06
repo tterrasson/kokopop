@@ -285,8 +285,20 @@ std::vector<Chunk> chunk_text(
     std::vector<Unit> units;
     for (const auto & raw : raw_units) {
         Unit u;
-        if (!make_unit(raw, voice, tokenize_fn, u, error)) {
-            return {};
+        std::string unit_error;
+        if (!make_unit(raw, voice, tokenize_fn, u, unit_error)) {
+            // Tokenization failed (likely exceeds context length) — try force-split
+            // before giving up, so long sentences without punctuation still work.
+            auto split = force_split_unit(raw, voice, config, tokenize_fn, error);
+            if (split.empty()) {
+                std::fprintf(stderr, "[chunker] skipping unit (cannot split): %s\n",
+                             unit_error.c_str());
+                continue;
+            }
+            units.insert(units.end(),
+                        std::make_move_iterator(split.begin()),
+                        std::make_move_iterator(split.end()));
+            continue;
         }
 
         // Step 4: Force-split oversized units
