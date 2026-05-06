@@ -20,13 +20,14 @@ namespace {
 bool generate_chunk(
     kokopop::Model & model,
     const Chunk & chunk,
+    const std::string & voice,
     float speed,
     std::vector<float> & out_audio,
     std::string & error) {
 
     // Synthesize phonemes
     kokopop_audio raw{};
-    if (!synthesize_phonemes(model, chunk.phonemes, "", speed, raw, error)) {
+    if (!synthesize_phonemes(model, chunk.phonemes, voice, speed, raw, error)) {
         return false;
     }
 
@@ -118,7 +119,7 @@ StreamHandle stream_synthesize(
 
                 // Generate raw audio
                 std::vector<float> raw_audio;
-                if (!generate_chunk(*model, chunk, speed, raw_audio, error)) {
+                if (!generate_chunk(*model, chunk, voice_copy, speed, raw_audio, error)) {
                     std::fprintf(stderr, "[kokopop] WARNING chunk[%d]: %s — skipping\n", i, error.c_str());
                     continue;
                 }
@@ -220,7 +221,7 @@ void IncrementalStreamer::flush() {
 
         auto & chunk = chunks[i];
         std::vector<float> raw_audio;
-        if (!generate_chunk(model_, chunk, speed_, raw_audio, error)) {
+        if (!generate_chunk(model_, chunk, voice_, speed_, raw_audio, error)) {
             std::fprintf(stderr, "[kokopop] WARNING chunk[%d]: %s — skipping\n",
                         chunk_counter_, error.c_str());
             continue;

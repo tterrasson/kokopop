@@ -82,7 +82,7 @@ inline std::string write_mock_gguf() {
     put_u64(bytes, 6);
 
     put_kv_u32(bytes, "general.alignment", 32);
-    put_kv_u32(bytes, "kokopop.kokoro.version", 2);
+    put_kv_u32(bytes, "kokopop.kokoro.version", 4);
     put_kv_bool(bytes, "kokopop.mock", true);
     put_kv_u32(bytes, "kokopop.sample_rate", 24000);
     put_kv_str_array(bytes, "tokenizer.ggml.tokens", {"", "a", "b", "c", " ", "ɑ", "ɔ", "ʃ"});
@@ -107,8 +107,8 @@ inline std::string write_mock_gguf() {
 
 inline std::string real_model_path() {
     const char * candidates[] = {
-        "models/kokoro.gguf",
-        "../models/kokoro.gguf",
+        "models/kokoro-md.gguf",
+        "../models/kokoro-md.gguf",
     };
     for (const char * path : candidates) {
         std::ifstream in(path, std::ios::binary);

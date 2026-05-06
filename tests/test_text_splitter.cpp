@@ -75,12 +75,20 @@ TEST_CASE("infer_boundary_type sentence endings") {
     CHECK_EQ(infer_boundary_type("Hello world!"), Boundary::Sentence);
     CHECK_EQ(infer_boundary_type("Hello world?"), Boundary::Sentence);
     CHECK_EQ(infer_boundary_type("Hello world."), Boundary::Sentence);
+    CHECK_EQ(infer_boundary_type("你好。"), Boundary::Sentence);
+    CHECK_EQ(infer_boundary_type("真的吗？"), Boundary::Sentence);
+    CHECK_EQ(infer_boundary_type("太好了！"), Boundary::Sentence);
+    CHECK_EQ(infer_boundary_type("他说：“你好。”"), Boundary::Sentence);
 }
 
 TEST_CASE("infer_boundary_type clause endings") {
     CHECK_EQ(infer_boundary_type("Hello world;"), Boundary::ClauseStrong);
     CHECK_EQ(infer_boundary_type("Hello world,"), Boundary::ClauseWeak);
     CHECK_EQ(infer_boundary_type("Hello world:"), Boundary::ClauseStrong);
+    CHECK_EQ(infer_boundary_type("尽管，"), Boundary::ClauseWeak);
+    CHECK_EQ(infer_boundary_type("苹果、"), Boundary::ClauseWeak);
+    CHECK_EQ(infer_boundary_type("注意："), Boundary::ClauseStrong);
+    CHECK_EQ(infer_boundary_type("第一点；"), Boundary::ClauseStrong);
 }
 
 TEST_CASE("infer_boundary_type paragraph and newline") {
@@ -145,6 +153,22 @@ TEST_CASE("split_sentences multiple types") {
     CHECK_EQ(parts[2], "How?");
 }
 
+TEST_CASE("split_sentences mandarin punctuation") {
+    auto parts = split_sentences("你好。世界！可以吗？当然可以。");
+    CHECK_EQ(parts.size(), 4u);
+    CHECK_EQ(parts[0], "你好。");
+    CHECK_EQ(parts[1], "世界！");
+    CHECK_EQ(parts[2], "可以吗？");
+    CHECK_EQ(parts[3], "当然可以。");
+}
+
+TEST_CASE("split_sentences mandarin closing quotes") {
+    auto parts = split_sentences("他说：“你好。”然后走了。");
+    CHECK_EQ(parts.size(), 2u);
+    CHECK_EQ(parts[0], "他说：“你好。”");
+    CHECK_EQ(parts[1], "然后走了。");
+}
+
 TEST_CASE("split_sentences empty") {
     auto parts = split_sentences("");
     CHECK_EQ(parts.size(), 0u);
@@ -166,6 +190,26 @@ TEST_CASE("split_into_candidate_units basic") {
     CHECK_EQ(units[1], "Goodbye world.");
     CHECK_EQ(units[2], "New para.");
     CHECK_EQ(units[3], "End.");
+}
+
+TEST_CASE("split_into_candidate_units mandarin sentence punctuation") {
+    auto units = split_into_candidate_units("你好。世界！可以吗？当然可以。");
+    CHECK_EQ(units.size(), 4u);
+    CHECK_EQ(units[0], "你好。");
+    CHECK_EQ(units[1], "世界！");
+    CHECK_EQ(units[2], "可以吗？");
+    CHECK_EQ(units[3], "当然可以。");
+}
+
+TEST_CASE("split_into_candidate_units mandarin clauses") {
+    auto units = split_into_candidate_units(
+        "尽管我们每天都在忙着工作和学习，但也不要忘记家人，毕竟生活很美好。");
+    CHECK_EQ(units.size(), 3u);
+    CHECK_EQ(units[0], "尽管我们每天都在忙着工作和学习，");
+    CHECK_EQ(units[1], "但也不要忘记家人，");
+    CHECK_EQ(units[2], "毕竟生活很美好。");
+    CHECK_EQ(infer_boundary_type(units[0]), Boundary::ClauseWeak);
+    CHECK_EQ(infer_boundary_type(units[2]), Boundary::Sentence);
 }
 
 TEST_CASE("split_into_candidate_units decimal dot protected") {
@@ -214,6 +258,23 @@ TEST_CASE("force_split_unit comma delimiter") {
     CHECK_EQ(parts[2], "c");
 }
 
+TEST_CASE("force_split_unit mandarin delimiters") {
+    {
+        auto parts = force_split_unit("第一点；第二点：结论");
+        CHECK_EQ(parts.size(), 3u);
+        CHECK_EQ(parts[0], "第一点；");
+        CHECK_EQ(parts[1], "第二点：");
+        CHECK_EQ(parts[2], "结论");
+    }
+    {
+        auto parts = force_split_unit("前半句，后半句、列表");
+        CHECK_EQ(parts.size(), 3u);
+        CHECK_EQ(parts[0], "前半句，");
+        CHECK_EQ(parts[1], "后半句、");
+        CHECK_EQ(parts[2], "列表");
+    }
+}
+
 TEST_CASE("force_split_unit word split fallback") {
     auto parts = force_split_unit("hello world foo");
     CHECK_EQ(parts.size(), 3u);
@@ -230,6 +291,8 @@ TEST_CASE("text_splitter is_sentence_boundary") {
     CHECK(is_sentence_boundary("Hello!", 5)         == true);
     CHECK(is_sentence_boundary("M<ABBR_DOT>r", 2)  == false);
     CHECK(is_sentence_boundary("3.14", 1)           == false);
+    std::string zh = "你好。";
+    CHECK(is_sentence_boundary(zh, zh.find("。")) == true);
 }
 
 TEST_CASE("text_splitter is_protected_dot") {

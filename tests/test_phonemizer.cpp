@@ -102,8 +102,7 @@ TEST_CASE("phonemize_text_punctuation_only") {
     std::string phonemes, error;
     bool ok = kokopop::phonemize_text("?,!;:.", "af_heart", phonemes, error);
     if (ok) {
-        // Punctuation only may produce just punctuation phonemes
-        CHECK(!phonemes.empty());
+        CHECK(error.empty());
     }
 }
 

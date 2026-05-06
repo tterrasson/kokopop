@@ -2,13 +2,13 @@
 // Mandarin Chinese G2P (Grapheme-to-Phoneme)
 //
 // Pipeline:
-//   text → cn2an(digit→chinese) → map_punctuation() → split_zh_non_zh()
-//     → for each Chinese segment: char → pinyin lookup → pinyin_to_ipa
-//     → for each non-Chinese segment: keep as-is
+//   text → number/date/time normalization → map_punctuation()
+//     → longest-match lexical segmentation + char fallback
+//     → contextual pinyin overrides + tone sandhi → pinyin_to_ipa
 //     → strip combining marks → join → phonemes
 //
-// Ported from misaki.zh.ZHG2P (legacy mode, no jieba).
-// Character-by-character processing — pypinyin works per-character.
+// No runtime dependencies: segmentation and disambiguation use small embedded
+// tables plus deterministic fallback to the generated pinyin dictionary.
 
 #include <string>
 
@@ -21,6 +21,10 @@ namespace kokopop::g2p::zh {
 /// @param[out] error  Error message if conversion fails
 /// @return true on success
 bool g2p_chinese(const std::string & text, std::string & phonemes, std::string & error);
+
+/// Convert Chinese text to normalized TONE3 pinyin after lexical overrides and
+/// tone sandhi. Non-Chinese text and punctuation are preserved for diagnostics.
+bool g2p_chinese_to_pinyin(const std::string & text, std::string & pinyin, std::string & error);
 
 /// Pinyin TONE3 → Kokoro IPA (single syllable).
 /// E.g. "zhi3" → "ꭧɨ↓", "hao4" → "xau̯↘"

@@ -46,8 +46,8 @@ std::string find_model(const char * hint) {
         }
     }
     const char * candidates[] = {
-        "models/kokoro.gguf",
-        "../models/kokoro.gguf",
+        "models/kokoro-md.gguf",
+        "../models/kokoro-md.gguf",
     };
     for (const char * p : candidates) {
         std::ifstream f(p, std::ios::binary);

@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -22,30 +23,74 @@ static bool starts_with(const std::string & s, const std::string & prefix) {
 /* ---- UTF-8 multi-byte character helpers (shared everywhere) ---- */
 
 static bool char_is_ellipsis(const std::string & s, size_t pos) {
-    return pos + 3 < s.size() &&
+    return pos + 2 < s.size() &&
            static_cast<unsigned char>(s[pos]) == 0xE2 &&
            static_cast<unsigned char>(s[pos+1]) == 0x80 &&
            static_cast<unsigned char>(s[pos+2]) == 0xA6;
 }
 
-static bool char_is_right_angle_quote(const std::string & s, size_t pos) {
-    return pos + 1 < s.size() &&
-           static_cast<unsigned char>(s[pos]) == 0xC2 &&
-           static_cast<unsigned char>(s[pos+1]) == 0xBB;
-}
-
 static bool char_is_em_dash(const std::string & s, size_t pos) {
-    return pos + 3 < s.size() &&
+    return pos + 2 < s.size() &&
            static_cast<unsigned char>(s[pos]) == 0xE2 &&
            static_cast<unsigned char>(s[pos+1]) == 0x80 &&
            static_cast<unsigned char>(s[pos+2]) == 0x94;
 }
 
 static bool char_is_en_dash(const std::string & s, size_t pos) {
-    return pos + 3 < s.size() &&
+    return pos + 2 < s.size() &&
            static_cast<unsigned char>(s[pos]) == 0xE2 &&
            static_cast<unsigned char>(s[pos+1]) == 0x80 &&
            static_cast<unsigned char>(s[pos+2]) == 0x93;
+}
+
+static bool matches_at(const std::string & s, size_t pos, const char * utf8) {
+    const size_t n = std::strlen(utf8);
+    return pos + n <= s.size() && s.compare(pos, n, utf8) == 0;
+}
+
+static size_t utf8_char_start_at_or_before_end(const std::string & s) {
+    if (s.empty()) return 0;
+    size_t pos = s.size() - 1;
+    while (pos > 0 &&
+           (static_cast<unsigned char>(s[pos]) & 0xC0) == 0x80) {
+        --pos;
+    }
+    return pos;
+}
+
+static bool char_is_zh_sentence_punct(const std::string & s, size_t pos) {
+    return matches_at(s, pos, "。") ||
+           matches_at(s, pos, "！") ||
+           matches_at(s, pos, "？");
+}
+
+static bool char_is_zh_clause_strong(const std::string & s, size_t pos) {
+    return matches_at(s, pos, "；") ||
+           matches_at(s, pos, "：");
+}
+
+static bool char_is_zh_clause_weak(const std::string & s, size_t pos) {
+    return matches_at(s, pos, "，") ||
+           matches_at(s, pos, "、");
+}
+
+static bool char_is_closing_punctuation(const std::string & s, size_t pos, size_t & len) {
+    const char c = s[pos];
+    if (c == '"' || c == ')' || c == '\'') {
+        len = 1;
+        return true;
+    }
+    const char * closers[] = {
+        "”", "’", "）", "】", "》", "〉", "」", "』", "»",
+    };
+    for (const char * closer : closers) {
+        const size_t n = std::strlen(closer);
+        if (pos + n <= s.size() && s.compare(pos, n, closer) == 0) {
+            len = n;
+            return true;
+        }
+    }
+    return false;
 }
 
 /* ---- 3.2: View-based trim (zero allocation) ---- */
@@ -73,13 +118,19 @@ static Boundary infer_boundary_type_impl(const std::string & text) {
 
     // Walk backwards from end of trimmed, stripping closing punctuation
     while (!trimmed.empty()) {
-        char last_char = trimmed[trimmed.size() - 1];
-        if (last_char == '"' || last_char == ')' || last_char == '\'') {
-            trimmed.remove_suffix(1);
-            trimmed = trim_view(trimmed);
-            if (trimmed.empty()) return Boundary::None;
-        } else if (char_is_right_angle_quote(std::string(trimmed), trimmed.size() - 2)) {
-            trimmed.remove_suffix(2); // » is 2 bytes
+        std::string tmp(trimmed);
+        size_t closer_len = 0;
+        bool found_closer = false;
+        for (size_t back = 1; back <= 4 && back <= tmp.size(); ++back) {
+            const size_t pos = tmp.size() - back;
+            if (char_is_closing_punctuation(tmp, pos, closer_len) &&
+                pos + closer_len == tmp.size()) {
+                found_closer = true;
+                break;
+            }
+        }
+        if (found_closer) {
+            trimmed.remove_suffix(closer_len);
             trimmed = trim_view(trimmed);
             if (trimmed.empty()) return Boundary::None;
         } else {
@@ -90,18 +141,21 @@ static Boundary infer_boundary_type_impl(const std::string & text) {
 
     // Build a temporary std::string only for UTF-8 multi-byte helpers
     std::string str(trimmed);
-    size_t last_pos = str.size() - 1;
+    size_t last_pos = utf8_char_start_at_or_before_end(str);
 
     if (str[last_pos] == '.' || str[last_pos] == '!' ||
-        str[last_pos] == '?' || char_is_ellipsis(str, last_pos)) {
+        str[last_pos] == '?' || char_is_ellipsis(str, last_pos) ||
+        char_is_zh_sentence_punct(str, last_pos)) {
         return Boundary::Sentence;
     }
-    if (str[last_pos] == ';' || str[last_pos] == ':') {
+    if (str[last_pos] == ';' || str[last_pos] == ':' ||
+        char_is_zh_clause_strong(str, last_pos)) {
         return Boundary::ClauseStrong;
     }
     if (str[last_pos] == ',' ||
         char_is_em_dash(str, last_pos) ||
-        char_is_en_dash(str, last_pos)) {
+        char_is_en_dash(str, last_pos) ||
+        char_is_zh_clause_weak(str, last_pos)) {
         return Boundary::ClauseWeak;
     }
     return Boundary::None;
@@ -188,6 +242,7 @@ static std::vector<std::string> split_sentences_internal(
     for (size_t i = 0; i < text.size(); ++i) {
         char c = text[i];
         bool is_boundary = false;
+        size_t boundary_len = 1;
 
         if (c == '.' && !pre_protected[i]) {
             if (i + 1 >= text.size()) {
@@ -207,17 +262,20 @@ static std::vector<std::string> split_sentences_internal(
             is_boundary = true;
         } else if (char_is_ellipsis(text, i)) {
             is_boundary = true;
+            boundary_len = 3;
+        } else if (char_is_zh_sentence_punct(text, i)) {
+            is_boundary = true;
+            boundary_len = 3;
         }
 
         if (is_boundary) {
-            size_t end = i + 1;
-            if (c == '.' && char_is_ellipsis(text, i)) end = i + 3;
+            size_t end = i + boundary_len;
 
             // Include trailing closing quotes/parentheses
-            while (end < text.size() && (text[end] == '"' ||
-                   text[end] == ')' || text[end] == '\'' ||
-                   char_is_right_angle_quote(text, end))) {
-                end += char_is_right_angle_quote(text, end) ? 2 : 1;
+            size_t closer_len = 0;
+            while (end < text.size() &&
+                   char_is_closing_punctuation(text, end, closer_len)) {
+                end += closer_len;
             }
             // Include trailing space
             if (end < text.size() && text[end] == ' ') ++end;
@@ -250,6 +308,7 @@ bool is_protected_dot(const std::string & text, size_t pos) {
 bool is_sentence_boundary(const std::string & text, size_t pos) {
     if (pos >= text.size()) return false;
     char c = text[pos];
+    if (char_is_zh_sentence_punct(text, pos)) return true;
     if (c == '.') return !is_protected_token(text, pos) && (pos + 1 >= text.size() ||
         text[pos+1] == ' ' || text[pos+1] == '"' || text[pos+1] == ')' ||
         (pos + 3 < text.size() && static_cast<unsigned char>(text[pos+1]) == 0xE2 &&
@@ -318,9 +377,12 @@ std::vector<std::string> split_into_candidate_units(const std::string & text) {
     for (const auto & para : paragraphs) {
         auto sentences = split_sentences(para);
         for (const auto & sent : sentences) {
-            std::string s = trim_ascii(sent);
-            if (!s.empty()) {
-                units.push_back(s);
+            auto clauses = split_keep_delimiter(sent, { "；", "：", "，", "、" });
+            for (const auto & clause : clauses) {
+                std::string s = trim_ascii(clause);
+                if (!s.empty()) {
+                    units.push_back(s);
+                }
             }
         }
     }
@@ -328,10 +390,10 @@ std::vector<std::string> split_into_candidate_units(const std::string & text) {
 }
 
 std::vector<std::string> force_split_unit(const std::string & text) {
-    auto strong_parts = split_keep_delimiter(text, { "; ", ": ", ";", ":" });
+    auto strong_parts = split_keep_delimiter(text, { "; ", ": ", ";", ":", "；", "：" });
     if (strong_parts.size() > 1) return strong_parts;
 
-    auto weak_parts = split_keep_delimiter(text, { ", " });
+    auto weak_parts = split_keep_delimiter(text, { ", ", "，", "、" });
     if (weak_parts.size() > 1) return weak_parts;
 
     return split_by_words(text);

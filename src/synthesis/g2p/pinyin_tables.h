@@ -19,15 +19,28 @@
 namespace kokopop::g2p::zh {
 
 // ────────────────────────────────────────────────────────────────────────
-// Tone mapping: digit char → Kokoro tone marker
+// Tone mapping: digit char → Kokoro/misaki tone marker
+//
+// The Kokoro model was trained with misaki's IPA tone markers.
+// These are Unicode Spacing Modifier Letters (U+02E0–U+02FF):
+//   ˥ = U+02E5 (UTF-8: 0xC7 0xA5)
+//   ˧ = U+02E7 (UTF-8: 0xC7 0xA7)
+//   ˩ = U+02E9 (UTF-8: 0xC7 0xA9)
+//
+// Tone contours:
+//   1st (high flat):   ˥
+//   2nd (rising):      ˧˥
+//   3rd (dipping):     ˧˩˧
+//   4th (falling):     ˥˩
+//   5th (neutral):     (empty)
 // ────────────────────────────────────────────────────────────────────────
 inline constexpr std::string_view tone_marker(char tone_digit) {
     switch (tone_digit) {
-        case '1': return "→";   // ˥ — high flat
-        case '2': return "↗";   // ˧˥ — rising
-        case '3': return "↓";   // ˧˩˧ — dipping
-        case '4': return "↘";   // ˥˩ — falling
-        case '5': return "";    // neutral
+        case '1': return "\xC7\xA5";               // ˥
+        case '2': return "\xC7\xA7\xC7\xA5";       // ˧˥
+        case '3': return "\xC7\xA7\xC7\xA9\xC7\xA7"; // ˧˩˧
+        case '4': return "\xC7\xA5\xC7\xA9";       // ˥˩
+        case '5': return "";
         default:  return "";
     }
 }
@@ -36,8 +49,8 @@ inline constexpr std::string_view tone_marker(char tone_digit) {
 // Initial consonants → IPA (first alternative only, most common)
 // ────────────────────────────────────────────────────────────────────────
 struct InitialEntry {
-    std::string_view pinyin;
-    std::string_view ipa;
+    const char * pinyin;
+    const char * ipa;
 };
 
 // Sorted by length descending for matching (zh/ch before single chars)
@@ -83,8 +96,8 @@ inline bool is_z_c_s_initial(std::string_view p) {
 // on the vowel part. apply_tone scans and replaces only the first "0".
 
 struct FinalEntry {
-    std::string_view pinyin;
-    std::string_view ipa;   // IPA with "0" as tone placeholder
+    const char * pinyin;
+    const char * ipa;   // IPA with "0" as tone placeholder
 };
 
 inline constexpr FinalEntry g_finals[] = {
@@ -139,8 +152,8 @@ inline constexpr std::string_view FINAL_I_AFTER_Z_C_S = "ɹ̩0";
 // Syllabic consonants (standalone, no vowel)
 // ────────────────────────────────────────────────────────────────────────
 struct SyllabicEntry {
-    std::string_view pinyin;
-    std::string_view ipa;
+    const char * pinyin;
+    const char * ipa;
 };
 
 inline constexpr SyllabicEntry g_syllabic_consonants[] = {
@@ -155,8 +168,8 @@ inline constexpr SyllabicEntry g_syllabic_consonants[] = {
 // Interjections
 // ────────────────────────────────────────────────────────────────────────
 struct InterjectionEntry {
-    std::string_view pinyin;
-    std::string_view ipa;
+    const char * pinyin;
+    const char * ipa;
 };
 
 inline constexpr InterjectionEntry g_interjections[] = {
