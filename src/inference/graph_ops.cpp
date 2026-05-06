@@ -497,7 +497,28 @@ ggml_tensor * lstm_direction(
         ggml_mul_mat(ctx, w.w_ih_packed, input),
         w.b_ih_packed);
 
-    // --- Pre-allocate output and initialize h, c ---
+    // --- Pre-allocate output buffer and initialize h, c ---
+    //
+    // NOTE on ggml_set_2d in the loop below:
+    // GGML has no fused LSTM primitive, so we express the sequential recurrence
+    // as a graph of per-timestep nodes.  Each iteration emits one ggml_set_2d
+    // that copies h_t into column t of the pre-allocated output buffer.
+    //
+    // Cost: n_steps graph nodes per direction.  Across the full model:
+    //   text_encoder.lstm             → 2 directions
+    //   predictor.text_encoder.lstms → 3 × 2 directions
+    //   predictor.lstm               → 2 directions
+    //   predictor.shared             → 2 directions
+    // Total: 12 × n_steps set_2d calls.  On GPU (Metal) each is a kernel
+    // launch with a potential memory bounce.  This is a known hot spot.
+    //
+    // Ideal fix: a fused LSTM kernel (backend-specific) that runs the
+    // entire recurrence natively and writes the [hidden, n_steps] output
+    // in one pass, eliminating all set_2d nodes.
+    //
+    // Pragmatic fix (applied): output buffer allocated once outside the
+    // loop; columns are written in-place via set_2d.  This avoids
+    // per-iteration buffer reallocation.
     ggml_tensor * output = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, n_steps);
     model.backend->queue_zero_tensor(output);
 
@@ -553,7 +574,10 @@ ggml_tensor * lstm_direction(
 
         h = ggml_mul(ctx, o_gate, ggml_tanh(ctx, c));
 
-        // Write h into column t of the output.
+        // Write h_t into column t of the output buffer.
+        // See the NOTE above on the set_2d performance trade-off.
+        // Keep the assignment: ggml_set_2d creates a graph node that must be
+        // retained for the buffer to be materialized during graph execution.
         output = ggml_set_2d(
             ctx,
             output,
