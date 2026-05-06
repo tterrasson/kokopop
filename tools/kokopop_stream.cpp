@@ -499,15 +499,22 @@ static int run_http_mode(kokopop::Model * model, const std::string & default_voi
         server.stop();
     });
 
+    // Mutex to serialize inference — GGML backend scheduler is not thread-safe.
+    // Multiple concurrent calls to stream_synthesize() on the same model will
+    // corrupt internal graph buffers (ggml_backend_sched).
+    std::mutex synthesis_mutex;
+
     // Setup routes with lambdas that capture model
     server.route("/tts",
-        [model, default_voice, speed, stream_mode](kokopop::HttpRequest & req, kokopop::HttpResponse & res) {
+        [&synthesis_mutex, model, default_voice, speed, stream_mode](kokopop::HttpRequest & req, kokopop::HttpResponse & res) {
             if (req.method != "POST") {
                 res.status_code = 405;
                 res.status_text = "Method Not Allowed";
                 res.set_json_string(json_error("POST required"));
                 return false;
             }
+            // Lock around synthesis to avoid corrupting GGML scheduler buffers
+            std::lock_guard<std::mutex> lock(synthesis_mutex);
             return handle_tts(model, default_voice, speed, stream_mode, req, res);
         });
 
