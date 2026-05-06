@@ -113,22 +113,64 @@ See `kokopop_play --help` for format options (pcm-f32, pcm-s16, wav).
 
 ### Streaming mode
 
-The `kokopop_stdio_stream` tool reads JSON commands from stdin and streams TTS audio to stdout:
+The `kokopop_stream` tool supports two operating modes: **STDIO** (default) and **HTTP server**.
+
+#### STDIO mode (default)
+
+Reads JSON commands from stdin and streams raw audio (float32) to stdout:
 
 ```bash
-# Start interactive mode
-./kokopop_stdio_stream \
-  --model models/kokoro.gguf \
-  --voice af_heart \
-  --mode interactive \
-  --play
-
 # Feed commands via stdin
-echo '{"text": "Hello from piped input"}' | \
-  ./kokopop_stdio_stream \
+echo '{"text": "Hello world", "flush": true}' | \
+  ./kokopop_stream \
     --model models/kokoro.gguf \
     --voice af_heart \
     --mode long_form
+
+# Save full output to WAV
+echo '{"text": "Hello world", "flush": true}' | \
+  ./kokopop_stream \
+    --model models/kokoro.gguf \
+    --voice af_heart \
+    --out output.wav
+```
+
+JSON protocol (one command per line):
+
+| Command | Description |
+|---|---|
+| `{"text": "..."}` | Accumulate text |
+| `{"text": "...", "flush": true}` | Add text and trigger generation |
+| `{"flush": true}` | Generate all accumulated text |
+| `{"stop": true}` | Stop streaming |
+
+#### HTTP server mode
+
+Start a local HTTP server for TTS synthesis:
+
+```bash
+./kokopop_stream \
+  --model models/kokoro.gguf \
+  --voice af_heart \
+  --http \
+  --port 8080
+```
+
+Available endpoints:
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/tts` | `POST` | Synthesize text to WAV audio |
+| `/health` | `GET` | Server health check |
+| `/voices` | `GET` | List available voices |
+
+Example request:
+
+```bash
+curl -X POST http://localhost:8080/tts \
+  -H 'Content-Type: application/json' \
+  -d '{"text": "Hello world", "voice": "ff_siwis", "speed": 1.0}' \
+  -o output.wav
 ```
 
 ## Library Integration
@@ -169,9 +211,9 @@ src/         — Source code
   streaming/ — Streaming generation support
   playback/  — Audio playback (stdout, Core Audio on macOS)
 tools/       — CLI tools
-  kokopop_say          — Synthesize text/phonemes to WAV or play directly
-  kokopop_stdio_stream — JSON-streamed TTS (stdin → stdout)
-  kokopop_play         — Play raw audio from stdin
+  kokopop_say    — Synthesize text/phonemes to WAV or play directly
+  kokopop_stream — JSON-streamed TTS (stdin → stdout) and HTTP server mode
+  kokopop_play   — Play raw audio from stdin
 tests/       — Unit and integration tests
 ```
 
