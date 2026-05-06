@@ -142,11 +142,11 @@ inline constexpr LexemeEntry g_lexicon[] = {
     {"一天", "yi1 tian1"},
     {"一杯", "yi1 bei1"},
 
-    {"不是", "bu4 shi4"},
+    {"不是", "bu2 shi4"},
     {"不好", "bu4 hao3"},
     {"不用", "bu4 yong4"},
-    {"不要", "bu4 yao4"},
-    {"不会", "bu4 hui4"},
+    {"不要", "bu2 yao4"},
+    {"不会", "bu2 hui4"},
 
     {"你好", "ni3 hao3"},
     {"很好", "hen3 hao3"},
@@ -165,7 +165,7 @@ inline constexpr LexemeEntry g_lexicon[] = {
     {"这里", "zhe4 li5"},
     {"那里", "na4 li5"},
     {"东西", "dong1 xi5"},
-    {"朋友", "peng2 you5"},
+    {"朋友", "peng2 you3"},
     {"孩子", "hai2 zi5"},
     {"儿子", "er2 zi5"},
     {"桌子", "zhuo1 zi5"},
@@ -249,13 +249,12 @@ inline constexpr LexemeEntry g_lexicon[] = {
     {"工作", "gong1 zuo4"},
     {"学习", "xue2 xi2"},
     {"學習", "xue2 xi2"},
-    {"但也", "dan4 ye3"},
+
     {"千万", "qian1 wan4"},
     {"千萬", "qian1 wan4"},
     {"忘记", "wang4 ji4"},
     {"忘記", "wang4 ji4"},
-    {"花点", "hua1 dian3"},
-    {"花點", "hua1 dian3"},
+
     {"时间", "shi2 jian1"},
     {"時間", "shi2 jian1"},
     {"陪伴", "pei2 ban4"},
@@ -281,6 +280,80 @@ inline constexpr LexemeEntry g_lexicon[] = {
     {"綁架", "bang3 jia4"},
     {"普通话", "pu3 tong1 hua4"},
     {"普通話", "pu3 tong1 hua4"},
+
+    // Validation phrases: align with Kokoro Python's jieba-style grouping.
+    {"随着", "sui2 zhe5"},
+    {"人工智能", "ren2 gong1 zhi4 neng2"},
+    {"发展", "fa1 zhan3"},
+    {"生活", "sheng1 huo2"},
+    {"方式", "fang1 shi4"},
+    {"发生", "fa1 sheng1"},
+    {"巨大", "ju4 da4"},
+    {"变化", "bian4 hua4"},
+    {"这座", "zhe4 zuo4"},
+    {"古老", "gu3 lao3"},
+    {"城市", "cheng2 shi4"},
+    {"街道", "jie1 dao4"},
+    {"两旁", "liang3 pang2"},
+    {"种满", "zhong3 man3"},
+    {"高大", "gao1 da4"},
+    {"法国梧桐", "fa3 guo2 wu2 tong2"},
+    {"一种", "yi1 zhong3"},
+    {"宁静", "ning2 jing4"},
+    {"感觉", "gan3 jue2"},
+    {"真正", "zhen1 zheng4"},
+    {"友谊", "you3 yi4"},
+    {"不仅", "bu4 jin3"},
+    {"在于", "zai4 yu2"},
+    {"分享", "fen1 xiang3"},
+    {"彼此", "bi3 ci3"},
+    {"遇到困难", "yu4 dao4 kun4 nan2"},
+    {"互相支持", "hu4 xiang1 zhi1 chi2"},
+    {"团队", "tuan2 dui4"},
+    {"合作", "he2 zuo4"},
+    {"项目", "xiang4 mu4"},
+    {"成功", "cheng2 gong1"},
+    {"关键", "guan1 jian4"},
+    {"一位", "yi1 wei4"},
+    {"成员", "cheng2 yuan2"},
+    {"贡献", "gong4 xian4"},
+    {"不可或缺", "bu4 ke3 huo4 que1"},
+    {"无论", "wu2 lun4"},
+    {"前方", "qian2 fang1"},
+    {"道路", "dao4 lu4"},
+    {"多么", "duo1 me5"},
+    {"曲折", "qu1 zhe2"},
+    {"保持", "bao3 chi2"},
+    {"能够", "neng2 gou4"},
+    {"到达", "dao4 da2"},
+    {"梦想", "meng4 xiang3"},
+    {"彼岸", "bi3 an4"},
+
+    // Common phrases with polyphonic characters
+    {"民以食为天", "min2 yi3 shi2 wei2 tian1"},
+    {"中国", "zhong1 guo2"},
+    {"中國", "zhong1 guo2"},
+    {"饮食文化", "yin3 shi2 wen2 hua4"},
+    {"飲食文化", "yin3 shi2 wen2 hua4"},
+    {"博大精深", "bo2 da4 jing1 shen1"},
+    {"不仅", "bu4 jin3"},
+    {"不僅", "bu4 jin3"},
+    {"讲究", "jiang3 jiu1"},
+    {"講究", "jiang3 jiu1"},
+    {"色香味", "se4 xiang1 wei4"},
+    {"俱全", "ju4 quan2"},
+    {"包含", "bao1 han2"},
+    {"丰富", "feng1 fu4"},
+    {"豐富", "feng1 fu4"},
+    {"历史背景", "li4 shi3 bei4 jing3"},
+    {"歷史背景", "li4 shi3 bei4 jing3"},
+    {"哲学思想", "zhe2 xue2 si1 xiang3"},
+    {"哲學思想", "zhe2 xue2 si1 xiang3"},
+    {"包含", "bao1 han2"},
+    {"背景", "bei4 jing3"},
+    {"思想", "si1 xiang3"},
+    {"哲学", "zhe2 xue2"},
+    {"哲學", "zhe2 xue2"},
 };
 
 inline bool starts_with_chars(const std::vector<Utf8Char> & chars,
@@ -593,7 +666,7 @@ inline bool next_syllable(const std::vector<PinyinToken> & tokens,
     return false;
 }
 
-inline void apply_tone_sandhi(std::vector<PinyinToken> & tokens) {
+[[maybe_unused]] inline void apply_tone_sandhi(std::vector<PinyinToken> & tokens) {
     // Third-tone chains: all but the last third tone surface as second tone.
     for (size_t i = 0; i < tokens.size(); ++i) {
         if (!tokens[i].syllable || extract_tone(tokens[i].pinyin) != '3') continue;
@@ -679,7 +752,9 @@ std::vector<PinyinToken> make_pinyin_tokens(const std::string & text) {
         ++i;
     }
 
-    apply_tone_sandhi(tokens);
+    // Kokoro was trained on pypinyin output WITHOUT tone sandhi.
+    // Applying sandhi produces phonemes the model doesn't recognize well.
+    // apply_tone_sandhi(tokens);
     return tokens;
 }
 
@@ -821,12 +896,26 @@ bool g2p_chinese(const std::string & text, std::string & phonemes, std::string &
     error.clear();
 
     std::string result;
+    int prev_group = -2;  // sentinel: no previous group
+    bool prev_was_syllable = false;
+
     for (const auto & token : make_pinyin_tokens(text)) {
         if (token.syllable) {
             std::string ipa = pinyin_to_ipa(token.pinyin);
-            if (!ipa.empty()) append_rendered_part(result, ipa, true);
+            if (ipa.empty()) continue;
+
+            const bool same_group = prev_was_syllable && token.group == prev_group;
+            if (!same_group && !result.empty() && result.back() != ' ') {
+                result.push_back(' ');
+            }
+
+            result.append(ipa);
+            prev_group = token.group;
+            prev_was_syllable = true;
         } else {
             append_rendered_part(result, token.text, false);
+            prev_group = -2;
+            prev_was_syllable = false;
         }
     }
 

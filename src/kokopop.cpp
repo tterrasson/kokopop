@@ -14,6 +14,7 @@
 #include <exception>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 struct kokopop_model {
@@ -40,14 +41,53 @@ bool allocate_audio_from_vector(const std::vector<float> & samples, int sample_r
     return true;
 }
 
+bool ends_with(std::string_view text, std::string_view suffix) {
+    return text.size() >= suffix.size() &&
+           text.substr(text.size() - suffix.size()) == suffix;
+}
+
+void trim_trailing_chunk_punctuation(std::string & phonemes) {
+    auto trim_spaces = [&]() {
+        while (!phonemes.empty() && phonemes.back() == ' ') {
+            phonemes.pop_back();
+        }
+    };
+
+    trim_spaces();
+    for (;;) {
+        bool trimmed = false;
+        if (!phonemes.empty()) {
+            const char c = phonemes.back();
+            if (c == ',' || c == '.' || c == ';' || c == ':' || c == '!' || c == '?') {
+                phonemes.pop_back();
+                trimmed = true;
+            }
+        }
+        if (!trimmed && ends_with(phonemes, "…")) {
+            phonemes.erase(phonemes.size() - std::strlen("…"));
+            trimmed = true;
+        }
+        if (!trimmed && ends_with(phonemes, "—")) {
+            phonemes.erase(phonemes.size() - std::strlen("—"));
+            trimmed = true;
+        }
+        if (!trimmed) {
+            break;
+        }
+        trim_spaces();
+    }
+}
+
 kokopop::ChunkConfig text_synthesis_config_for_voice(const std::string & voice) {
     kokopop::ChunkConfig config = kokopop::make_long_form_config();
     const char lang = voice.empty() ? 'a' : voice[0];
     if (lang == 'z') {
-        config.target_min_tokens = 40;
-        config.target_max_tokens = 110;
-        config.soft_max_tokens = 180;
-        config.first_chunk_target_max_tokens = 110;
+        // Mandarin is more stable when medium-length sentences stay in a
+        // single inference pass instead of being split at clause boundaries.
+        config.target_min_tokens = 80;
+        config.target_max_tokens = 180;
+        config.soft_max_tokens = 260;
+        config.first_chunk_target_max_tokens = 180;
         config.allow_short_first_chunk = true;
         config.comma_pause_ms = 120;
         config.sentence_pause_ms = 260;
@@ -119,8 +159,15 @@ int kokopop_synthesize_text(
     combined.reserve(4096);
     for (size_t i = 0; i < chunks.size(); ++i) {
         auto & chunk = chunks[i];
+        std::string chunk_phonemes = chunk.phonemes;
+        if (!chunk.is_last) {
+            // Chunk pauses are added by postprocess_chunk_audio(), so keeping
+            // punctuation tokens at an intermediate chunk boundary only makes
+            // the model less stable without improving prosody.
+            trim_trailing_chunk_punctuation(chunk_phonemes);
+        }
         kokopop_audio chunk_audio{};
-        if (!kokopop::synthesize_phonemes(*model->impl, chunk.phonemes, voice_s, speed, chunk_audio, error)) {
+        if (!kokopop::synthesize_phonemes(*model->impl, chunk_phonemes, voice_s, speed, chunk_audio, error)) {
             return fail(KOKOPOP_ERROR_INFERENCE, error);
         }
 

@@ -22,8 +22,8 @@ compile_commands.json
 *.bin
 
 # Audio / binary test data
-kmod_mock_test.gguf
-kmod_mock_test.wav
+*.gguf
+*.wav
 
 # Compressed profile data
 profile.json.gz

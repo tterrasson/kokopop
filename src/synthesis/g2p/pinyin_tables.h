@@ -21,25 +21,19 @@ namespace kokopop::g2p::zh {
 // ────────────────────────────────────────────────────────────────────────
 // Tone mapping: digit char → Kokoro/misaki tone marker
 //
-// The Kokoro model was trained with misaki's IPA tone markers.
-// These are Unicode Spacing Modifier Letters (U+02E0–U+02FF):
-//   ˥ = U+02E5 (UTF-8: 0xC7 0xA5)
-//   ˧ = U+02E7 (UTF-8: 0xC7 0xA7)
-//   ˩ = U+02E9 (UTF-8: 0xC7 0xA9)
-//
-// Tone contours:
-//   1st (high flat):   ˥
-//   2nd (rising):      ˧˥
-//   3rd (dipping):     ˧˩˧
-//   4th (falling):     ˥˩
-//   5th (neutral):     (empty)
+// The Kokoro model was trained with misaki's arrow-style tone markers:
+//   → (1st, high flat)   = U+2192 (UTF-8: 0xE2 0x86 0x92)
+//   ↗ (2nd, rising)      = U+2197 (UTF-8: 0xE2 0x86 0x97)
+//   ↓ (3rd, dipping)     = U+2193 (UTF-8: 0xE2 0x86 0x93)
+//   ↘ (4th, falling)     = U+2198 (UTF-8: 0xE2 0x86 0x98)
+//   (empty) (5th, neutral)
 // ────────────────────────────────────────────────────────────────────────
 inline constexpr std::string_view tone_marker(char tone_digit) {
     switch (tone_digit) {
-        case '1': return "\xC7\xA5";               // ˥
-        case '2': return "\xC7\xA7\xC7\xA5";       // ˧˥
-        case '3': return "\xC7\xA7\xC7\xA9\xC7\xA7"; // ˧˩˧
-        case '4': return "\xC7\xA5\xC7\xA9";       // ˥˩
+        case '1': return "\xE2\x86\x92";   // → (arrow right)
+        case '2': return "\xE2\x86\x97";   // ↗ (arrow NE)
+        case '3': return "\xE2\x86\x93";   // ↓ (arrow down)
+        case '4': return "\xE2\x86\x98";   // ↘ (arrow SE)
         case '5': return "";
         default:  return "";
     }
@@ -180,6 +174,7 @@ inline constexpr InterjectionEntry g_interjections[] = {
 
 // ────────────────────────────────────────────────────────────────────────
 // Helper: Apply tone to IPA — replace first "0" with tone marker
+// For neutral tone (empty string), the "0" is simply removed.
 // ────────────────────────────────────────────────────────────────────────
 inline std::string apply_tone(std::string_view ipa_with_placeholder,
                                std::string_view tone) {
@@ -194,7 +189,6 @@ inline std::string apply_tone(std::string_view ipa_with_placeholder,
             result.push_back(ipa_with_placeholder[i]);
         }
     }
-    // If no "0" was found and tone is neutral, return as-is
     return result;
 }
 

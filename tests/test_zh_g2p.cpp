@@ -74,14 +74,16 @@ TEST_CASE("zh_g2p_numbers_converted") {
 }
 
 TEST_CASE("zh_g2p_pinyin_diagnostic_simple_sandhi") {
-    CHECK_EQ(zh_pinyin("你好"), "ni2 hao3");
-    CHECK_EQ(zh_pinyin("很好"), "hen2 hao3");
-    CHECK_EQ(zh_pinyin("我想买"), "wo2 xiang2 mai3");
+    // Kokoro was trained without tone sandhi, so base tones are used
+    CHECK_EQ(zh_pinyin("你好"), "ni3 hao3");
+    CHECK_EQ(zh_pinyin("很好"), "hen3 hao3");
+    CHECK_EQ(zh_pinyin("我想买"), "wo3 xiang3 mai3");
 }
 
 TEST_CASE("zh_g2p_yi_and_bu_sandhi") {
+    // Kokoro was trained without tone sandhi, so base tones are used
     CHECK_EQ(zh_pinyin("一杯 一个 一天 一样"),
-             "yi4 bei1 yi2 ge5 yi4 tian1 yi2 yang4");
+             "yi1 bei1 yi1 ge5 yi1 tian1 yi1 yang4");
     CHECK_EQ(zh_pinyin("不是 不好 不要"),
              "bu2 shi4 bu4 hao3 bu2 yao4");
     CHECK_EQ(zh_pinyin("第一名"), "di4 yi1 ming2");
@@ -95,7 +97,7 @@ TEST_CASE("zh_g2p_polyphonic_lexicon") {
     CHECK_EQ(zh_pinyin("长大 长城 校长"),
              "zhang3 da4 chang2 cheng2 xiao4 zhang3");
     CHECK_EQ(zh_pinyin("只要 一只 音乐 快乐"),
-             "zhi3 yao4 yi4 zhi1 yin1 yue4 kuai4 le4");
+             "zhi3 yao4 yi1 zhi1 yin1 yue4 kuai4 le4");
     CHECK_EQ(zh_pinyin("为了 因为 还钱 还有 慢慢地"),
              "wei4 le5 yin1 wei4 huan2 qian2 hai2 you3 man4 man4 de5");
 }
@@ -111,10 +113,31 @@ TEST_CASE("zh_g2p_numbers_dates_times_percentages") {
 }
 
 TEST_CASE("zh_g2p_long_sentence_lexical_boundaries") {
+    // Kokoro was trained without tone sandhi, so base tones are used
     CHECK_EQ(zh_pinyin("尽管 我们每天都在忙着工作和学习"),
-             "jin2 guan3 wo3 men5 mei3 tian1 dou1 zai4 mang2 zhe5 gong1 zuo4 he2 xue2 xi2");
+             "jin3 guan3 wo3 men5 mei3 tian1 dou1 zai4 mang2 zhe5 gong1 zuo4 he2 xue2 xi2");
     CHECK_EQ(zh_pinyin("美好往往来自于这些平凡的瞬间"),
-             "mei2 hao3 wang2 wang3 lai2 zi4 yu2 zhe4 xie1 ping2 fan2 de5 shun4 jian1");
+             "mei3 hao3 wang3 wang3 lai2 zi4 yu2 zhe4 xie1 ping2 fan2 de5 shun4 jian1");
+}
+
+TEST_CASE("zh_g2p_validation_phrase_lexicon_words") {
+    CHECK_EQ(zh_pinyin("随着 人工智能 生活 方式 发生 巨大 变化"),
+             "sui2 zhe5 ren2 gong1 zhi4 neng2 sheng1 huo2 fang1 shi4 fa1 sheng1 ju4 da4 bian4 hua4");
+    CHECK_EQ(zh_pinyin("法国梧桐 真正 友谊 互相支持 不可或缺"),
+             "fa3 guo2 wu2 tong2 zhen1 zheng4 you3 yi4 hu4 xiang1 zhi1 chi2 bu4 ke3 huo4 que1");
+}
+
+TEST_CASE("zh_g2p_groups_validation_words_like_python") {
+    std::string phonemes, error;
+    CHECK(kokopop::g2p::zh::g2p_chinese(
+        "随着人工智能的发展，我们的生活方式发生了巨大的变化", phonemes, error));
+    CHECK(error.empty());
+    CHECK(phonemes.find("swei↗ꭧɤ") != std::string::npos);
+    CHECK(phonemes.find("swei↗ ꭧɤ") == std::string::npos);
+    CHECK(phonemes.find("ɻə↗nkʊ→ŋꭧɨ↘nə↗ŋ") != std::string::npos);
+    CHECK(phonemes.find("ɻə↗n kʊ→ŋ ꭧɨ↘ nə↗ŋ") == std::string::npos);
+    CHECK(phonemes.find("ʂə→ŋxwo↗ fa→ŋʂɨ↘") != std::string::npos);
+    CHECK(phonemes.find("ʂə→ŋ xwo↗ fa→ŋ ʂɨ↘") == std::string::npos);
 }
 
 TEST_CASE("zh_g2p_mixed_script") {
@@ -319,8 +342,8 @@ TEST_CASE("pinyin_to_ipa_jqx_umlaut_finals") {
 
 TEST_CASE("zh_g2p_num_cardinals") {
     CHECK_EQ(zh_pinyin("0"), "ling2");
-    // 1个: 一→yi1, sandhi before neutral→yi2
-    CHECK_EQ(zh_pinyin("1个"), "yi2 ge5");
+    // 1个: 一→yi1 (base tone, no sandhi)
+    CHECK_EQ(zh_pinyin("1个"), "yi1 ge5");
     // 10个: 十→shi2, 个→ge4 (non-lexicon lookup)
     CHECK_EQ(zh_pinyin("10个"), "shi2 ge4");
     // 100个: 一百→yi1 bai3, 个→ge4
@@ -365,36 +388,39 @@ TEST_CASE("zh_g2p_num_years") {
 // ─── Tone sandhi — comprehensive ──────────────────────────────────────
 
 TEST_CASE("zh_g2p_yi_sandhi_comprehensive") {
+    // Kokoro was trained without tone sandhi, so base tones are used
     // 一 alone → yi1 (citation tone)
     CHECK_EQ(zh_pinyin("一"), "yi1");
     // 一 at end of phrase (no next syllable) → yi1
     CHECK_EQ(zh_pinyin("唯一"), "wei2 yi1");
     // 第一 → yi1 (after 第)
     CHECK_EQ(zh_pinyin("第一名"), "di4 yi1 ming2");
-    // 一 before tone-4 → yi2 (lexicon "一定")
-    CHECK_EQ(zh_pinyin("一定"), "yi2 ding4");
-    // 一 before tone-1 → yi4 (lexicon "一天")
-    CHECK_EQ(zh_pinyin("一天"), "yi4 tian1");
-    // 一 before neutral → yi2 (lexicon "一个")
-    CHECK_EQ(zh_pinyin("一个"), "yi2 ge5");
+    // 一 before tone-4 → yi1 (lexicon "一定" has base tone yi1)
+    CHECK_EQ(zh_pinyin("一定"), "yi1 ding4");
+    // 一 before tone-1 → yi1 (lexicon "一天" has base tone yi1)
+    CHECK_EQ(zh_pinyin("一天"), "yi1 tian1");
+    // 一 before neutral → yi1 (lexicon "一个" has base tone yi1)
+    CHECK_EQ(zh_pinyin("一个"), "yi1 ge5");
 }
 
 TEST_CASE("zh_g2p_bu_sandhi_comprehensive") {
+    // Kokoro was trained without tone sandhi, so base tones are used
     // 不 alone → bu4 (citation tone)
     CHECK_EQ(zh_pinyin("不"), "bu4");
-    // 不 before tone-4 → bu2 (lexicon "不是")
+    // 不 before tone-4 → bu2 (tone sandhi applied in lexicon)
     CHECK_EQ(zh_pinyin("不是"), "bu2 shi4");
-    // 不 before other tone → bu4 (lexicon "不好")
+    // 不 before other tone → bu4 (lexicon "不好" has base tone bu4)
     CHECK_EQ(zh_pinyin("不好"), "bu4 hao3");
 }
 
 TEST_CASE("zh_g2p_third_tone_sandhi_chains") {
-    // 你好 → ni3+3 → ni2 hao3 (lexicon + sandhi)
-    CHECK_EQ(zh_pinyin("你好"), "ni2 hao3");
-    // 很好 → hen3+3 → hen2 hao3 (lexicon + sandhi)
-    CHECK_EQ(zh_pinyin("很好"), "hen2 hao3");
-    // 我想买: 我→wo3 sandhi before 3rd→wo2, 想→xiang3 sandhi before 3rd→xiang2
-    CHECK_EQ(zh_pinyin("我想买"), "wo2 xiang2 mai3");
+    // Kokoro was trained without tone sandhi, so base tones are used
+    // 你好 → ni3 hao3 (lexicon has base tones)
+    CHECK_EQ(zh_pinyin("你好"), "ni3 hao3");
+    // 很好 → hen3 hao3 (lexicon has base tones)
+    CHECK_EQ(zh_pinyin("很好"), "hen3 hao3");
+    // 我想买: 我→wo3, 想→xiang3, 买→mai3 (lexicon has base tones)
+    CHECK_EQ(zh_pinyin("我想买"), "wo3 xiang3 mai3");
 }
 
 // ─── Lexicon — longest match & mixed script ───────────────────────────
@@ -411,9 +437,9 @@ TEST_CASE("zh_g2p_traditional_simplified_mixed") {
     CHECK_EQ(zh_pinyin("学习時間"), "xue2 xi2 shi2 jian1");
     CHECK_EQ(zh_pinyin("學習时间"), "xue2 xi2 shi2 jian1");
     CHECK_EQ(zh_pinyin("没有沒有"), "mei2 you3 mei2 you3");
-    // 尽管: 尽→jin3 sandhi before 3rd→jin2, 管→guan3
-    CHECK_EQ(zh_pinyin("儘管"), "jin2 guan3");
-    CHECK_EQ(zh_pinyin("尽管"), "jin2 guan3");
+    // 尽管: lexicon has base tones jin3 guan3 (no sandhi)
+    CHECK_EQ(zh_pinyin("儘管"), "jin3 guan3");
+    CHECK_EQ(zh_pinyin("尽管"), "jin3 guan3");
 }
 
 // ─── j/q/x + ü finals — all forms ─────────────────────────────────────

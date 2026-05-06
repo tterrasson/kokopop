@@ -247,3 +247,36 @@ TEST_CASE("real_model_audio_finite") {
         CHECK(std::isfinite(sample));
     }
 }
+
+TEST_CASE("real_model_mandarin_multichunk_text_synthesis_stable") {
+    kokopop_model_options options{};
+    options.n_threads = 4;
+    options.backend = KOKOPOP_BACKEND_CPU;
+
+    kokopop_model * model = nullptr;
+    CHECK_EQ(kokopop_model_load(real_model_path().c_str(), &options, &model), KOKOPOP_OK);
+    REQUIRE(model != nullptr);
+
+    kokopop_audio audio{};
+    CHECK_EQ(
+        kokopop_synthesize_text(
+            model,
+            "真正的友谊不仅在于分享快乐，更在于能在彼此遇到困难时互相支持。",
+            "zf_xiaoni",
+            1.0f,
+            &audio),
+        KOKOPOP_OK);
+    CHECK(audio.samples != nullptr);
+    CHECK(audio.n_samples > 0);
+    bool all_finite = true;
+    for (size_t i = 0; i < audio.n_samples; ++i) {
+        if (!std::isfinite(audio.samples[i])) {
+            all_finite = false;
+            break;
+        }
+    }
+    CHECK(all_finite);
+
+    kokopop_audio_free(&audio);
+    kokopop_model_free(model);
+}
