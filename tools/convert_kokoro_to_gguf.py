@@ -78,7 +78,7 @@ _GGML_BLOCK_SIZES: dict[int, int] = {
     GGML_TYPE_F32: 1,
 }
 
-VALID_TIERS = ("kokoro-sm", "kokoro-md", "kokoro-lg")
+VALID_TIERS = ("kokoro-md", "kokoro-lg")
 
 # Patterns indicating a regular Conv1d weight (gets reshape [OC,IC,K] -> [OC,IC*K]).
 # The runtime calls `conv1d()` with these — they MUST all be reshaped to 2D so
@@ -164,7 +164,7 @@ def _downgrade_type(ggml_type: int, innermost_dim: int) -> int:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Tiered quantization (kokoro-sm / kokoro-md / kokoro-lg)
+# Tiered quantization (kokoro-md / kokoro-lg)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -204,19 +204,6 @@ def _tier_type(tier: str, logical: str, ndim: int) -> int:
         return GGML_TYPE_F16
 
     # Per-tier mapping of every other 2D+ tensor.
-    if tier == "kokoro-sm":
-        # Aggressive: Q4_K everywhere it fits, Q5_K for prosody/AdaIn FC.
-        if (".fc.gamma.weight" in logical or ".fc.beta.weight" in logical) and (
-            logical.startswith("kokopop.predictor.F0.")
-            or logical.startswith("kokopop.predictor.N.")
-        ):
-            return GGML_TYPE_Q5_K
-        if logical.startswith("kokopop.predictor."):
-            return GGML_TYPE_Q5_K  # prosody-sensitive
-        if "conv_post" in logical:
-            return GGML_TYPE_Q5_K
-        return GGML_TYPE_Q4_K
-
     if tier == "kokoro-md":
         # Balanced: Q5_K majority, Q6_K for FFN out / AdaIn FC, Q8_0 for conv_post.
         if logical.startswith("kokopop.albert.") or logical.startswith("kokopop.bert_encoder."):
@@ -707,7 +694,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--voices", default=DEFAULT_VOICES)
     parser.add_argument(
         "--tier", default="kokoro-md", choices=VALID_TIERS,
-        help="Quantization tier: sm=small/aggressive, md=balanced, lg=quality",
+        help="Quantization tier: md=balanced, lg=quality",
     )
     return parser.parse_args()
 

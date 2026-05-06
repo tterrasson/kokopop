@@ -45,11 +45,10 @@ uv run python tools/convert_kokoro_to_gguf.py \
   --tier kokoro-md
 ```
 
-Three tiers are available:
+Two tiers are available:
 
 | Tier        | Description                          |
 |-------------|--------------------------------------|
-| `kokoro-sm` | Small / aggressive (Q4_K majority)   |
 | `kokoro-md` | Balanced (Q5_K/Q6_K, ~default)       |
 | `kokoro-lg` | Quality first (Q6_K/Q8_0)            |
 
