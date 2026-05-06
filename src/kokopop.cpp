@@ -13,6 +13,7 @@
 #include <cstring>
 #include <exception>
 #include <memory>
+#include <cstdio>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -44,6 +45,56 @@ bool allocate_audio_from_vector(const std::vector<float> & samples, int sample_r
 bool ends_with(std::string_view text, std::string_view suffix) {
     return text.size() >= suffix.size() &&
            text.substr(text.size() - suffix.size()) == suffix;
+}
+
+bool zh_text_trace_enabled(const std::string & voice) {
+    const char * enabled = std::getenv("KOKOPOP_ZH_TEXT_TRACE");
+    return enabled != nullptr && enabled[0] != '\0' &&
+           !voice.empty() && voice[0] == 'z';
+}
+
+const char * boundary_name(kokopop::Boundary boundary) {
+    switch (boundary) {
+        case kokopop::Boundary::None: return "none";
+        case kokopop::Boundary::ClauseWeak: return "clause_weak";
+        case kokopop::Boundary::ClauseStrong: return "clause_strong";
+        case kokopop::Boundary::Sentence: return "sentence";
+        case kokopop::Boundary::Newline: return "newline";
+        case kokopop::Boundary::Paragraph: return "paragraph";
+    }
+    return "unknown";
+}
+
+std::string trailing_punctuation(std::string_view text) {
+    static constexpr std::string_view kCandidates[] = {
+        "…", "—", ",", ".", ";", ":", "!", "?"
+    };
+    for (std::string_view candidate : kCandidates) {
+        if (ends_with(text, candidate)) {
+            return std::string(candidate);
+        }
+    }
+    return {};
+}
+
+void log_zh_chunk_trace(const kokopop::Chunk & chunk,
+                        std::string_view synthesized_phonemes,
+                        size_t index,
+                        size_t total) {
+    const std::string raw_trailing = trailing_punctuation(chunk.phonemes);
+    const std::string synth_trailing = trailing_punctuation(synthesized_phonemes);
+    std::fprintf(stderr,
+                 "[kokopop][zh-trace] chunk[%zu/%zu] tokens=%d boundary=%s first=%d last=%d\n",
+                 index + 1, total, chunk.n_tokens, boundary_name(chunk.boundary_after),
+                 chunk.is_first ? 1 : 0, chunk.is_last ? 1 : 0);
+    std::fprintf(stderr, "[kokopop][zh-trace]   text: %s\n", chunk.text.c_str());
+    std::fprintf(stderr, "[kokopop][zh-trace]   phonemes(raw): %s\n", chunk.phonemes.c_str());
+    std::fprintf(stderr, "[kokopop][zh-trace]   phonemes(run): %.*s\n",
+                 static_cast<int>(synthesized_phonemes.size()), synthesized_phonemes.data());
+    std::fprintf(stderr,
+                 "[kokopop][zh-trace]   trailing(raw)=%s trailing(run)=%s\n",
+                 raw_trailing.empty() ? "<none>" : raw_trailing.c_str(),
+                 synth_trailing.empty() ? "<none>" : synth_trailing.c_str());
 }
 
 void trim_trailing_chunk_punctuation(std::string & phonemes) {
@@ -154,6 +205,7 @@ int kokopop_synthesize_text(
     if (chunks.empty()) {
         return fail(KOKOPOP_ERROR_INFERENCE, error.empty() ? "text chunker produced no chunks" : error);
     }
+    const bool trace_zh = zh_text_trace_enabled(voice_s);
 
     std::vector<float> combined;
     combined.reserve(4096);
@@ -165,6 +217,9 @@ int kokopop_synthesize_text(
             // punctuation tokens at an intermediate chunk boundary only makes
             // the model less stable without improving prosody.
             trim_trailing_chunk_punctuation(chunk_phonemes);
+        }
+        if (trace_zh) {
+            log_zh_chunk_trace(chunk, chunk_phonemes, i, chunks.size());
         }
         kokopop_audio chunk_audio{};
         if (!kokopop::synthesize_phonemes(*model->impl, chunk_phonemes, voice_s, speed, chunk_audio, error)) {
