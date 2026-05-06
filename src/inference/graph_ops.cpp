@@ -2,12 +2,7 @@
 
 #include "core/constants.h"
 
-#include <algorithm>
-#include <cmath>
 #include <cstring>
-#include <limits>
-#include <numeric>
-#include <new>
 
 namespace kokopop {
 
@@ -157,58 +152,10 @@ ggml_tensor * maybe_upsample_nearest(ggml_context * ctx, ggml_tensor * x, bool u
 // ---------------------------------------------------------------------------
 // Snake1D activation:  x + sin²(x · α) / α
 //
-// 8.3 — Single-pass custom kernel (CPU).
-//       Replaces three separate ggml ops (sin + div + sqr + add + mul)
-//       with one element-wise kernel.  Falls back to the standard graph
-//       when the custom op is not available (e.g. Metal backend).
+// Implemented with native GGML ops (ggml_sin, ggml_mul, ggml_div, ggml_add)
+// so the graph can run on any backend including Metal.  Trained α values are
+// strictly positive, so division by zero does not occur in practice.
 // ---------------------------------------------------------------------------
-
-namespace {
-
-static void snake1d_kernel(
-    struct ggml_tensor * dst,
-    const struct ggml_tensor * x,
-    const struct ggml_tensor * alpha,
-    int ith, int nth, void *) {
-    const int64_t ne0 = x->ne[0];
-    const int64_t ne1 = x->ne[1];
-    const int64_t total = ne0 * ne1;
-    const size_t  row_stride_x     = x->nb[1]     / sizeof(float);
-    const size_t  row_stride_alpha = alpha->nb[1] / sizeof(float);
-
-    const float * __restrict x_data    = static_cast<const float *>(x->data);
-    const float * __restrict alpha_data = static_cast<const float *>(alpha->data);
-    float * __restrict dst_data    = static_cast<float *>(dst->data);
-
-    // alpha may be [1, T] — one value per column.
-    const bool alpha_per_col = (alpha->ne[0] == 1);
-
-    // Manual work partitioning (no ggml_compute_task_init in stock ggml).
-    const int64_t chunk = (total + nth - 1) / nth;
-    const int64_t start = chunk * ith;
-    const int64_t end   = std::min(start + chunk, total);
-    for (int64_t idx = start; idx < end; ++idx) {
-        const int64_t i0 = idx % ne0;
-        const int64_t i1 = idx / ne0;
-
-        const float xi = x_data[i0 + i1 * row_stride_x];
-        const float alpha_val = alpha_per_col
-            ? alpha_data[i1 * row_stride_alpha]   // alpha[0, i1]  (broadcast column)
-            : alpha_data[i0 + i1 * row_stride_alpha];
-
-        float result;
-        if (std::abs(alpha_val) > 1e-6f) {
-            const float s = std::sin(xi * alpha_val);
-            result = xi + (s * s) / alpha_val;
-        } else {
-            // α ≈ 0:  sin²(x·α)/α → 0 by L'Hôpital (derivative of sin² at 0 is 0)
-            result = xi;
-        }
-        dst_data[idx] = result;
-    }
-}
-
-} // anonymous namespace
 
 ggml_tensor * graph_snake1d(
     ggml_context * ctx,
@@ -226,11 +173,11 @@ ggml_tensor * graph_snake1d(
         return nullptr;
     }
 
-    // 8.3 — Custom single-pass kernel.
-    //       ggml_repeat creates the broadcasted alpha matching x's shape,
-    //       then the kernel computes x + sin²(x·α)/α in one element-wise pass.
-    ggml_tensor * a = ggml_repeat(ctx, alpha_2d, x);
-    return ggml_map_custom2(ctx, x, a, snake1d_kernel, GGML_N_TASKS_MAX, nullptr);
+    ggml_tensor * a  = ggml_repeat(ctx, alpha_2d, x);   // broadcast α to x's shape
+    ggml_tensor * xa = ggml_mul(ctx, x, a);              // x * α
+    ggml_tensor * s  = ggml_sin(ctx, xa);                // sin(x * α)
+    ggml_tensor * s2 = ggml_mul(ctx, s, s);              // sin²(x * α)
+    return ggml_add(ctx, x, ggml_div(ctx, s2, a));       // x + sin²(x·α) / α
 }
 
 ggml_tensor * graph_snake1d(
