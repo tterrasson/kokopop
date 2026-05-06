@@ -473,7 +473,7 @@ ggml_tensor * lstm_direction(
         w_ih[g] = lstm_gate_tensor(ctx, model, prefix + ".weight_ih_l0" + suffix, g, error);
         w_hh[g] = lstm_gate_tensor(ctx, model, prefix + ".weight_hh_l0" + suffix, g, error);
         b_ih[g] = lstm_gate_bias(ctx, model, prefix + ".bias_ih_l0" + suffix, g, error);
-        b_hh[g] = lstm_gate_bias(ctx, model, prefix + ".bias_ih_l0" + suffix, g, error);
+        b_hh[g] = lstm_gate_bias(ctx, model, prefix + ".bias_hh_l0" + suffix, g, error);
     }
     if (!error.empty()) {
         return nullptr;
