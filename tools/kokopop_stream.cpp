@@ -494,6 +494,11 @@ static int run_http_mode(kokopop::Model * model, const std::string & default_voi
                          const std::string & bind_addr, int port) {
     kokopop::HttpServer server;
 
+    // Register shutdown callback so SIGINT/SIGTERM calls server.stop()
+    kokopop::HttpServer::set_shutdown_callback([&server]() {
+        server.stop();
+    });
+
     // Setup routes with lambdas that capture model
     server.route("/tts",
         [model, default_voice, speed, stream_mode](kokopop::HttpRequest & req, kokopop::HttpResponse & res) {
@@ -529,20 +534,6 @@ static int run_http_mode(kokopop::Model * model, const std::string & default_voi
 // ============================================================================
 // Main
 // ============================================================================
-
-static volatile std::atomic<bool> g_running{true};
-
-#ifdef _WIN32
-#include <signal.h>
-static void signal_handler(int) {
-    g_running.store(false);
-}
-#else
-#include <csignal>
-static void signal_handler(int) {
-    g_running.store(false);
-}
-#endif
 
 int main(int argc, char ** argv) {
     std::string model_path;
@@ -619,19 +610,6 @@ int main(int argc, char ** argv) {
 
     std::fprintf(stderr, "[kokopop] Model loaded, sample_rate=%d, threads=%d\n",
                 model->sample_rate, threads);
-
-    // Setup signal handler for graceful shutdown
-#ifdef _WIN32
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
-#else
-    struct sigaction sa{};
-    sa.sa_handler = signal_handler;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;
-    sigaction(SIGINT, &sa, nullptr);
-    sigaction(SIGTERM, &sa, nullptr);
-#endif
 
     if (http_mode) {
         std::fprintf(stderr, "[kokopop] Starting HTTP server on %s:%d\n", http_bind.c_str(), http_port);

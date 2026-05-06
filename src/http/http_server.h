@@ -76,6 +76,11 @@ public:
     // Signal the server to stop (can be called from another thread)
     void stop();
 
+    // Register a global shutdown callback.
+    // Useful for calling stop() from a signal handler.
+    using ShutdownCallback = std::function<void()>;
+    static void set_shutdown_callback(ShutdownCallback cb);
+
     // Wait until the server has stopped
     void join();
 

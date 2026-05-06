@@ -20,9 +20,16 @@
   #include <errno.h>
   #include <fcntl.h>
   #include <csignal>
+  #include <signal.h>
 #endif
 
 namespace {
+
+// ---------------------------------------------------------------------------
+// Graceful shutdown callback (called from signal handler)
+// ---------------------------------------------------------------------------
+
+static std::function<void()> g_http_shutdown_callback;
 
 // ---------------------------------------------------------------------------
 // Limits / constants
@@ -61,6 +68,18 @@ void init_platform() {
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
     sigaction(SIGPIPE, &sa, nullptr);
+
+    // Handle SIGINT (Ctrl+C) and SIGTERM for graceful shutdown
+    // Call the user-provided shutdown callback (e.g. server.stop())
+    sa.sa_handler = +[](int) {
+        if (g_http_shutdown_callback) {
+            g_http_shutdown_callback();
+        }
+    };
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
 }
 #endif
 
@@ -302,6 +321,10 @@ void HttpServer::stop() {
         socket_close(_server_fd);
         _server_fd = -1;
     }
+}
+
+void HttpServer::set_shutdown_callback(ShutdownCallback cb) {
+    g_http_shutdown_callback = std::move(cb);
 }
 
 void HttpServer::join() {
