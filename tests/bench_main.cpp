@@ -60,7 +60,9 @@ std::string find_model(const char * hint) {
 
 void usage(const char * argv0) {
     std::fprintf(stderr,
-        "usage: %s [--model PATH] [--phonemes IPA] [--repeat N] [--voice NAME] [--threads N] [--iters N]\n"
+        "usage: %s [--model PATH] [--backend cpu|metal] [--phonemes IPA] [--repeat N] "
+        "[--voice NAME] [--threads N] [--iters N]\n"
+        "  --backend cpu|metal  force inference backend (default: auto)\n"
         "  --repeat N  repeat the phoneme string N times (multiplies token count)\n",
         argv0);
 }
@@ -104,6 +106,7 @@ int main(int argc, char ** argv) {
     int          threads     = 0;           // 0 = auto
     int          iters       = 5;
     int          repeat      = 1;
+    int          backend     = KOKOPOP_BACKEND_AUTO; // 0 = auto
 
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
@@ -119,6 +122,17 @@ int main(int argc, char ** argv) {
             threads = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--iters") == 0 && i + 1 < argc) {
             iters = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--backend") == 0 && i + 1 < argc) {
+            const char * b = argv[++i];
+            if (std::strcmp(b, "cpu") == 0) {
+                backend = KOKOPOP_BACKEND_CPU;
+            } else if (std::strcmp(b, "metal") == 0) {
+                backend = KOKOPOP_BACKEND_METAL;
+            } else {
+                std::fprintf(stderr, "[BENCH] unknown backend: %s (expected cpu|metal)\n", b);
+                usage(argv[0]);
+                return 2;
+            }
         } else {
             usage(argv[0]);
             return 2;
@@ -151,7 +165,9 @@ int main(int argc, char ** argv) {
     }
     std::printf("[BENCH] voice    : %s\n", voice);
     std::printf("[BENCH] threads  : %d (hw=%d)\n", threads, hw);
-    std::printf("[BENCH] iters    : %d\n\n", iters);
+    std::printf("[BENCH] iters    : %d\n", iters);
+    std::printf("[BENCH] backend  : %s\n\n", backend == KOKOPOP_BACKEND_CPU ? "cpu"
+                                         : backend == KOKOPOP_BACKEND_METAL ? "metal" : "auto");
 
     ggml_log_set(null_log, nullptr);
 
@@ -162,6 +178,7 @@ int main(int argc, char ** argv) {
         model.reset();
         kokopop_model_options opts{};
         opts.n_threads = threads;
+        opts.backend   = backend;
         std::string err;
         const int64_t t0 = now_us();
         if (!kokopop::load_model_from_gguf(model_path, &opts, model, err)) {
@@ -230,6 +247,7 @@ int main(int argc, char ** argv) {
         kokopop_model * pub_model = nullptr;
         kokopop_model_options opts{};
         opts.n_threads = threads;
+        opts.backend   = backend;
 
         // Cold start: load + first inference
         const int64_t t_cold0 = now_us();

@@ -34,6 +34,21 @@ ggml_tensor * add_channel_bias(ggml_context * ctx, ggml_tensor * x, ggml_tensor 
     return ggml_add(ctx, x, bias);
 }
 
+// conv1d dispatch:
+//
+// - F16 weights → native ggml_conv_1d (reshape 2D→3D first)
+// - Quantized weights → im2col + mul_mat (keeps weight quantized)
+//
+// Do NOT use ggml_cast(ctx, quantized_weight, GGML_TYPE_F16) here.
+// Runtime graph dequantization hits unsupported dup/cast paths on Metal
+// and can abort in ggml_compute_forward_dup. If you want F16 for small
+// convs, export those weights as F16 in the GGUF (see Option A below).
+//
+// Future options for small-conv optimization:
+//   A. Export small convs as F16 in GGUF (simplest, most robust).
+//   B. Pre-dequantize at load time into a separate F16 tensor constant.
+//   C. Stay quantized everywhere and optimize im2col later.
+
 ggml_tensor * conv1d(
     ggml_context * ctx, ggml_tensor * weight, ggml_tensor * input,
     int stride, int padding, int dilation, int kernel_size) {
@@ -41,26 +56,24 @@ ggml_tensor * conv1d(
     const bool kernel_is_3d = (weight->ne[2] > 1) ||
                               (weight->ne[0] == kernel_size);
 
-    // Path A: 3D (legacy) or F16 — route through ggml_conv_1d directly.
-    // For 2D F16, reshape view back to 3D first.
+    // Path A: 3D (legacy) — route through ggml_conv_1d directly.
     if (kernel_is_3d) {
         return ggml_conv_1d(ctx, weight, input, stride, padding, dilation);
     }
+
+    const int64_t ick = weight->ne[0];
+    const int64_t oc  = weight->ne[1];
+    GGML_ASSERT(ick % kernel_size == 0);
+    const int64_t ic = ick / kernel_size;
+
+    // Safe F16 path: only when the tensor is already F16.
     if (weight->type == GGML_TYPE_F16) {
-        const int64_t ick = weight->ne[0];
-        const int64_t oc  = weight->ne[1];
-        const int64_t ic  = ick / kernel_size;
         ggml_tensor * w3d = ggml_reshape_3d(ctx, weight, kernel_size, ic, oc);
         return ggml_conv_1d(ctx, w3d, input, stride, padding, dilation);
     }
 
     // Path B: 2D quantized — direct im2col + mul_mat with the quantized
     // weight as first operand of mul_mat (hits the quantized vec_dot kernel).
-    const int64_t ick = weight->ne[0];
-    const int64_t oc  = weight->ne[1];
-    GGML_ASSERT(ick % kernel_size == 0);
-    const int64_t ic = ick / kernel_size;
-
     ggml_tensor * shape_proxy = ggml_new_tensor_3d(
         ctx, GGML_TYPE_F16, kernel_size, ic, oc);
     ggml_tensor * im2col = ggml_im2col(
@@ -70,6 +83,8 @@ ggml_tensor * conv1d(
 
     const int64_t ol = im2col->ne[1];
     const int64_t n  = im2col->ne[2];
+    GGML_ASSERT(ol > 0);
+
     ggml_tensor * im2col_2d = ggml_reshape_2d(ctx, im2col, ick, ol * n);
 
     ggml_tensor * out = ggml_mul_mat(ctx, weight, im2col_2d);
@@ -651,6 +666,14 @@ ggml_tensor * text_encoder(
         return nullptr;
     }
     ggml_tensor * cur = ggml_get_rows(ctx, emb, token_ids);
+    // Layout per CNN block: [ch, time] → T+cont → [time, ch] → conv1d → [time', ch'] → T+cont → [ch', time']
+    // The outer transpose+cont is required because ggml_norm normalizes over axis 0
+    // (per-token layer norm needs [channel, time]), while conv1d expects [time, channel].
+    // On GPU each ggml_cont() materializes a copy → 6 extra copies per forward pass.
+    // TODO: pick a stable layout ([ch, time] or [time, ch]) and either:
+    //   - transpose the norm weights instead of cur, or
+    //   - pre-transpose the conv weights at model load time,
+    //   - or write a fused conv1d+layer_norm kernel that avoids layout switches.
     for (int i = 0; i < 3; ++i) {
         const std::string prefix = "kokopop.text_encoder.cnn." + std::to_string(i);
         ggml_tensor * conv_w = require_tensor(model, (prefix + ".0.weight").c_str(), error);
