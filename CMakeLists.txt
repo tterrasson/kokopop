@@ -42,6 +42,14 @@ set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 FetchContent_MakeAvailable(doctest)
 unset(CMAKE_POLICY_VERSION_MINIMUM)
 
+FetchContent_Declare(
+  yyjson
+  GIT_REPOSITORY https://github.com/ibireme/yyjson.git
+  GIT_TAG        0.12.0
+  GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(yyjson)
+
 find_package(Threads REQUIRED)
 
 find_package(PkgConfig QUIET)
@@ -189,9 +197,27 @@ if(KOKOPOP_BUILD_TOOLS)
   )
   target_link_libraries(kokopop_say PRIVATE kokopop)
 
-  # Streaming tool
-  add_executable(kokopop_stdio_stream tools/kokopop_stdio_stream.cpp)
-  target_include_directories(kokopop_stdio_stream PRIVATE
+  add_executable(kokopop_probe tools/kokopop_probe.cpp)
+  target_include_directories(kokopop_probe PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/model
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/inference
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/synthesis
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/synthesis/chunker
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/synthesis/g2p
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/audio
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/backend
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/streaming
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/playback
+    $<BUILD_INTERFACE:${ggml_SOURCE_DIR}/include>
+  )
+  target_link_libraries(kokopop_probe PRIVATE kokopop)
+
+  # Streaming tool (stdio + HTTP server)
+  add_executable(kokopop_stream tools/kokopop_stream.cpp src/http/http_server.cpp)
+  target_include_directories(kokopop_stream PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/src/core
     ${CMAKE_CURRENT_SOURCE_DIR}/src/model
@@ -202,10 +228,11 @@ if(KOKOPOP_BUILD_TOOLS)
     ${CMAKE_CURRENT_SOURCE_DIR}/src/backend
     ${CMAKE_CURRENT_SOURCE_DIR}/src/streaming
     ${CMAKE_CURRENT_SOURCE_DIR}/src/playback
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/http
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     $<BUILD_INTERFACE:${ggml_SOURCE_DIR}/include>
   )
-  target_link_libraries(kokopop_stdio_stream PRIVATE kokopop)
+  target_link_libraries(kokopop_stream PRIVATE kokopop yyjson)
 
   # Audio playback tool
   add_executable(kokopop_play tools/kokopop_play.cpp)
