@@ -29,7 +29,7 @@ namespace {
 void usage(const char * argv0) {
     std::fputs("usage: ", stderr);
     std::fputs(argv0, stderr);
-    std::fputs("--model kokoro.gguf --voice ff_siwis "
+    std::fputs(" --model kokoro.gguf --voice ff_siwis "
         "[--speed 1.0] [--mode interactive|long_form] [--threads N]\n"
         "       [--out out.wav]\n"
         "\n"
