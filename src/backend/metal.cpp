@@ -322,13 +322,13 @@ public:
         if (std::getenv("KOKOPOP_METAL_OP_TRACE") != nullptr) {
             ggml_backend_sched_set_eval_callback(sched_, eval_trace_cb, sched_);
         }
-        // No ggml_backend_sched_reserve: it causes a double split_graph
-        // that invalidates tensor copies and corrupts Metal→CPU weight
-        // copies during compute (silent audio). The internal allocator
-        // (ggml-backend.cpp:1509-1535) does its own reserve on the first
-        // alloc or when the graph changes; the overhead is negligible here
-        // (galloc total ~ 40 MiB on Kokoro).
         pin_graph_cpu_fallbacks(graph);
+        // Reserve AFTER pin_graph_cpu_fallbacks so that the split_graph
+        // inside reserve sees the same node→backend assignments as the
+        // split_graph inside alloc_graph below.  Calling reserve before
+        // pinning creates stale copy tensors that get invalidated by the
+        // 2nd split_graph (silent audio symptom).
+        ggml_backend_sched_reserve(sched_, graph);
         const bool ok = ggml_backend_sched_alloc_graph(sched_, graph);
         if (ok) {
             log_sched_sizes("alloc");
