@@ -553,12 +553,27 @@ class GGUFWriter:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def split_lstm(name: str, tensor, writer: GGUFWriter) -> None:
-    """Split an LSTM weight/bias tensor into 4 equal chunks."""
+def pack_lstm(name: str, tensor, writer: GGUFWriter) -> None:
+    """Write an LSTM weight/bias tensor in PyTorch packed format.
+
+    PyTorch stores LSTM weights as [4*hidden, input_size] (weight_ih)
+    and [4*hidden, hidden] (weight_hh) with gate order [i=0, f=1, g=2, o=3]
+    along axis 0.
+
+    The GGUF writer reverses dims (shape[::-1]) so the on-disk layout
+    becomes:
+      - w_ih: ne[0]=input_size, ne[1]=4*hidden
+      - w_hh: ne[0]=hidden,   ne[1]=4*hidden
+    which is exactly what ggml_mul_mat expects.
+
+    Biases stay as [4*hidden] — gate order [i, f, g, o] preserved.
+
+    Produces keys:
+        weight_ih_l0, weight_hh_l0, bias_ih_l0, bias_hh_l0
+        weight_ih_l0_reverse, weight_hh_l0_reverse, …
+    """
     data = as_f32(tensor)
-    chunks = np.split(data, 4, axis=0)
-    for idx, chunk in enumerate(chunks):
-        writer.add_tensor(f"{name}.{idx}", chunk)
+    writer.add_tensor(name, data)
 
 
 def add_adain_fc(prefix: str, weight, bias, writer: GGUFWriter) -> None:
@@ -578,7 +593,7 @@ def add_state_dict(prefix: str, state: dict[str, object], writer: GGUFWriter) ->
             continue
         key = f"{prefix}.{name}"
         if "lstm" in name and ("weight_" in name or "bias_" in name):
-            split_lstm(key, tensor, writer)
+            pack_lstm(key, tensor, writer)
             continue
         writer.add_tensor(key, tensor)
 
@@ -609,7 +624,7 @@ def add_regularized_modules(prefix: str, module, writer: GGUFWriter) -> None:
         if name.endswith(".fc.bias"):
             continue
         if "lstm" in name and ("weight_" in name or "bias_" in name):
-            split_lstm(f"{prefix}.{name}", param, writer)
+            pack_lstm(f"{prefix}.{name}", param, writer)
             continue
         writer.add_tensor(f"{prefix}.{name}", param)
 

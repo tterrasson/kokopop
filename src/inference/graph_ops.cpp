@@ -386,71 +386,87 @@ ggml_tensor * graph_generator_resblock(
 
 // ---------------------------------------------------------------------------
 // LSTM
-//
-// 8.2 — Gate tensor splitting.
-//        lstm_gate_tensor / lstm_gate_bias split 4-gate-packed weight
-//        matrices into per-gate views.  Split views are cached in
-//        model.tensor_cache (keyed by "name.gate_index") so that
-//        repeated calls (forward + backward directions) reuse the
-//        same views without re-splitting.
-//        In lstm_direction, ALL gate lookups happen BEFORE the time-step
-//        loop — the n_steps × 4 gate computations never hit the hash map.
-//
-// 8.1 — Output pre-allocation.
-//        lstm_direction pre-allocates the full output tensor
-//        [hidden × n_steps] and writes each step's hidden state to the
-//        correct column via ggml_set_2d.  This replaces the O(n²)
-//        ggml_concat chain (each concat copies ALL previous columns)
-//        with O(n) direct column writes (each write touches only
-//        `hidden` floats).
 // ---------------------------------------------------------------------------
 
 ggml_tensor * col_view(ggml_context * ctx, ggml_tensor * x, int64_t index) {
     return ggml_view_2d(ctx, x, x->ne[0], 1, x->nb[1], index * x->nb[1]);
 }
 
-ggml_tensor * lstm_gate_tensor(
-    ggml_context * ctx,
-    Model & model,
-    const std::string & name,
-    int gate,
-    std::string & error) {
-    ggml_tensor * split = model.cached_tensor(name + "." + std::to_string(gate));
-    if (split != nullptr) {
-        return split;
-    }
-    ggml_tensor * raw = require_tensor(model, name.c_str(), error);
-    if (raw == nullptr) {
-        return nullptr;
-    }
-    if (raw->ne[1] % 4 != 0) {
-        error = "invalid unsplit LSTM tensor shape: " + name;
-        return nullptr;
-    }
-    const int64_t gate_rows = raw->ne[1] / 4;
-    return ggml_view_2d(ctx, raw, raw->ne[0], gate_rows, raw->nb[1], gate * gate_rows * raw->nb[1]);
-}
+struct LstmWeights {
+    ggml_tensor * w_ih_packed = nullptr;  // [input_size, 4*hidden]
+    ggml_tensor * w_hh_packed = nullptr;  // [hidden, 4*hidden]
+    ggml_tensor * b_ih_packed = nullptr;  // [4*hidden]
+    ggml_tensor * b_hh_packed = nullptr;  // [4*hidden]
 
-ggml_tensor * lstm_gate_bias(
-    ggml_context * ctx,
+    int64_t hidden = 0;
+};
+
+static LstmWeights load_lstm_weights(
     Model & model,
-    const std::string & name,
-    int gate,
+    const std::string & prefix,
+    bool reverse,
     std::string & error) {
-    ggml_tensor * split = model.cached_tensor(name + "." + std::to_string(gate));
-    if (split != nullptr) {
-        return split;
+    LstmWeights w;
+
+    const std::string suffix = reverse ? "_reverse" : "";
+
+    const std::string name_w_ih = prefix + ".weight_ih_l0" + suffix;
+    const std::string name_w_hh = prefix + ".weight_hh_l0" + suffix;
+    const std::string name_b_ih = prefix + ".bias_ih_l0" + suffix;
+    const std::string name_b_hh = prefix + ".bias_hh_l0" + suffix;
+
+    w.w_ih_packed = require_tensor(model, name_w_ih.c_str(), error);
+    w.w_hh_packed = require_tensor(model, name_w_hh.c_str(), error);
+    w.b_ih_packed = require_tensor(model, name_b_ih.c_str(), error);
+    w.b_hh_packed = require_tensor(model, name_b_hh.c_str(), error);
+
+    if (!error.empty()) {
+        return w;
     }
-    ggml_tensor * raw = require_tensor(model, name.c_str(), error);
-    if (raw == nullptr) {
-        return nullptr;
+
+    if (w.w_ih_packed == nullptr ||
+        w.w_hh_packed == nullptr ||
+        w.b_ih_packed == nullptr ||
+        w.b_hh_packed == nullptr) {
+        error = "missing packed LSTM tensors for: " + prefix;
+        return w;
     }
-    if (raw->ne[0] % 4 != 0) {
-        error = "invalid unsplit LSTM bias shape: " + name;
-        return nullptr;
+
+    if (w.w_hh_packed->ne[1] % 4 != 0) {
+        error = "invalid packed LSTM weight_hh shape: " + name_w_hh;
+        return w;
     }
-    const int64_t gate_rows = raw->ne[0] / 4;
-    return ggml_view_1d(ctx, raw, gate_rows, gate * gate_rows * raw->nb[0]);
+
+    if (w.w_ih_packed->ne[1] % 4 != 0) {
+        error = "invalid packed LSTM weight_ih shape: " + name_w_ih;
+        return w;
+    }
+
+    if (w.b_ih_packed->ne[0] % 4 != 0) {
+        error = "invalid packed LSTM bias_ih shape: " + name_b_ih;
+        return w;
+    }
+
+    if (w.b_hh_packed->ne[0] % 4 != 0) {
+        error = "invalid packed LSTM bias_hh shape: " + name_b_hh;
+        return w;
+    }
+
+    const int64_t hidden_from_w_hh = w.w_hh_packed->ne[1] / 4;
+    const int64_t hidden_from_w_ih = w.w_ih_packed->ne[1] / 4;
+    const int64_t hidden_from_b_ih = w.b_ih_packed->ne[0] / 4;
+    const int64_t hidden_from_b_hh = w.b_hh_packed->ne[0] / 4;
+
+    if (hidden_from_w_hh != hidden_from_w_ih ||
+        hidden_from_w_hh != hidden_from_b_ih ||
+        hidden_from_w_hh != hidden_from_b_hh) {
+        error = "inconsistent packed LSTM hidden size for: " + prefix;
+        return w;
+    }
+
+    w.hidden = hidden_from_w_hh;
+
+    return w;
 }
 
 ggml_tensor * lstm_direction(
@@ -461,29 +477,27 @@ ggml_tensor * lstm_direction(
     bool reverse,
     int64_t n_steps,
     std::string & error) {
-    const char * suffix = reverse ? "_reverse" : "";
-
-    // 8.2 — Gate lookups outside the loop.  Split views are cached
-    //       so forward/backward directions reuse the same tensors.
-    ggml_tensor * w_ih[4]{};
-    ggml_tensor * w_hh[4]{};
-    ggml_tensor * b_ih[4]{};
-    ggml_tensor * b_hh[4]{};
-    for (int g = 0; g < 4; ++g) {
-        w_ih[g] = lstm_gate_tensor(ctx, model, prefix + ".weight_ih_l0" + suffix, g, error);
-        w_hh[g] = lstm_gate_tensor(ctx, model, prefix + ".weight_hh_l0" + suffix, g, error);
-        b_ih[g] = lstm_gate_bias(ctx, model, prefix + ".bias_ih_l0" + suffix, g, error);
-        b_hh[g] = lstm_gate_bias(ctx, model, prefix + ".bias_hh_l0" + suffix, g, error);
-    }
-    if (!error.empty()) {
+    LstmWeights w = load_lstm_weights(model, prefix, reverse, error);
+    if (!error.empty() || w.hidden == 0) {
         return nullptr;
     }
 
-    const int64_t hidden = w_hh[0]->ne[1];
+    const int64_t hidden = w.hidden;
 
-    // 8.1 — Pre-allocate the full output tensor [hidden × n_steps]
-    //       and write each hidden state to its column via ggml_set_2d.
-    //       This avoids the O(n²) memory copies from ggml_concat.
+    // --- Pre-compute W_ih * input + b_ih for the entire sequence ---
+    //
+    // input:       [input_size, n_steps]
+    // w_ih_packed: [input_size, 4 * hidden]
+    //
+    // Result:
+    // pre_input_gates_packed: [4 * hidden, n_steps]
+    //
+    // This replaces T small matmuls (W_ih * x_t) with a single large one.
+    ggml_tensor * pre_input_gates_packed = ggml_add(ctx,
+        ggml_mul_mat(ctx, w.w_ih_packed, input),
+        w.b_ih_packed);
+
+    // --- Pre-allocate output and initialize h, c ---
     ggml_tensor * output = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, n_steps);
     model.backend->queue_zero_tensor(output);
 
@@ -491,33 +505,63 @@ ggml_tensor * lstm_direction(
     ggml_tensor * c = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, 1);
     model.backend->queue_zero_tensor(h);
     model.backend->queue_zero_tensor(c);
+
     for (int64_t step = 0; step < n_steps; ++step) {
         const int64_t t = reverse ? n_steps - 1 - step : step;
-        ggml_tensor * x_t = col_view(ctx, input, t);
 
-        // Compute LSTM gates — h and c carry over between iterations.
-        ggml_tensor * gates[4]{};
-        for (int g = 0; g < 4; ++g) {
-            gates[g] = ggml_add(ctx,
-                ggml_add(ctx, ggml_mul_mat(ctx, w_ih[g], x_t), b_ih[g]),
-                ggml_add(ctx, ggml_mul_mat(ctx, w_hh[g], h), b_hh[g]));
-        }
-        ggml_tensor * i_gate = ggml_sigmoid(ctx, gates[0]);
-        ggml_tensor * f_gate = ggml_sigmoid(ctx, gates[1]);
-        ggml_tensor * g_gate = ggml_tanh(ctx, gates[2]);
-        ggml_tensor * o_gate = ggml_sigmoid(ctx, gates[3]);
-        c = ggml_add(ctx, ggml_mul(ctx, f_gate, c), ggml_mul(ctx, i_gate, g_gate));
+        // pre_gates_t: [4 * hidden, 1]
+        ggml_tensor * pre_gates_t = col_view(ctx, pre_input_gates_packed, t);
+
+        // recurrent_gates: [4 * hidden, 1]
+        ggml_tensor * recurrent_gates = ggml_add(ctx,
+            ggml_mul_mat(ctx, w.w_hh_packed, h),
+            w.b_hh_packed);
+
+        // combined:
+        // [W_ii x_t + b_ii + W_hi h + b_hi,
+        //  W_if x_t + b_if + W_hf h + b_hf,
+        //  W_ig x_t + b_ig + W_hg h + b_hg,
+        //  W_io x_t + b_io + W_ho h + b_ho]
+        ggml_tensor * combined = ggml_add(ctx, pre_gates_t, recurrent_gates);
+
+        // combined is [4 * hidden, 1].
+        // The 4 gates are concatenated along axis 0.
+        //
+        // ggml_view_2d(ctx, src, ne0, ne1, nb1, offset)
+        // - ne0    = gate size = hidden
+        // - ne1    = 1 column
+        // - nb1    = column stride of the source tensor
+        // - offset = start of the gate along axis 0
+        const size_t nb0 = combined->nb[0];
+        const size_t nb1 = combined->nb[1];
+
+        ggml_tensor * i_gate = ggml_sigmoid(ctx,
+            ggml_view_2d(ctx, combined, hidden, 1, nb1, 0));
+
+        ggml_tensor * f_gate = ggml_sigmoid(ctx,
+            ggml_view_2d(ctx, combined, hidden, 1, nb1, hidden * nb0));
+
+        ggml_tensor * g_gate = ggml_tanh(ctx,
+            ggml_view_2d(ctx, combined, hidden, 1, nb1, 2 * hidden * nb0));
+
+        ggml_tensor * o_gate = ggml_sigmoid(ctx,
+            ggml_view_2d(ctx, combined, hidden, 1, nb1, 3 * hidden * nb0));
+
+        c = ggml_add(ctx,
+            ggml_mul(ctx, f_gate, c),
+            ggml_mul(ctx, i_gate, g_gate));
+
         h = ggml_mul(ctx, o_gate, ggml_tanh(ctx, c));
 
-        // 8.1 — Write h to column t of the pre-allocated output.
-        //       ggml_set_2d(dst, src, nb1, offset_bytes):
-        //         nb1    = row stride of the destination (bytes)
-        //         offset = byte offset for column t
+        // Write h into column t of the output.
         output = ggml_set_2d(
-            ctx, output, h,
+            ctx,
+            output,
+            h,
             output->nb[1],
             static_cast<size_t>(t) * output->nb[1]);
     }
+
     return output;
 }
 
@@ -602,8 +646,8 @@ ggml_tensor * text_encoder(
         return nullptr;
     }
     return ggml_mul_mat(ctx,
-    ggml_cont(ctx, ggml_transpose(ctx, cur)),
-    ggml_cont(ctx, ggml_transpose(ctx, duration_mask)));
+        ggml_cont(ctx, ggml_transpose(ctx, cur)),
+        ggml_cont(ctx, ggml_transpose(ctx, duration_mask)));
 }
 
 } // namespace kokopop
