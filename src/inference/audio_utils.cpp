@@ -207,11 +207,13 @@ CpuTensor cpu_harmonic_stft(Model & model, const std::vector<float> & f0, int64_
 
     // GPU path: dispatch the DFT kernel when the Metal STFT state is available.
 #ifdef KOKOPOP_HAS_METAL
-    if (auto * stft = static_cast<MetalStftState *>(model.backend->metal_stft_kernel())) {
-        metal_stft_compute(stft, source.data(), har_data.data(),
-                           static_cast<int>(n_samples),
-                           static_cast<int>(target_frames));
-        return CpuTensor{22, target_frames, std::move(har_data)};
+    if (model.backend != nullptr) {
+        if (auto * stft = static_cast<MetalStftState *>(model.backend->metal_stft_kernel())) {
+            metal_stft_compute(stft, source.data(), har_data.data(),
+                            static_cast<int>(n_samples),
+                            static_cast<int>(target_frames));
+            return CpuTensor{22, target_frames, std::move(har_data)};
+        }
     }
 #endif
 
@@ -257,12 +259,14 @@ bool cpu_istft(Model & model, const CpuTensor & post, std::vector<float> & out) 
     }
 
 #ifdef KOKOPOP_HAS_METAL
-    if (auto * stft = static_cast<MetalStftState *>(model.backend->metal_stft_kernel())) {
-        out.resize(static_cast<size_t>(out_len));
-        metal_istft_compute(stft, post.data.data(), out.data(),
-                            static_cast<int>(n_frames),
-                            static_cast<int>(out_len));
-        return !out.empty();
+    if (model.backend != nullptr) {
+        if (auto * stft = static_cast<MetalStftState *>(model.backend->metal_stft_kernel())) {
+            out.resize(static_cast<size_t>(out_len));
+            metal_istft_compute(stft, post.data.data(), out.data(),
+                                static_cast<int>(n_frames),
+                                static_cast<int>(out_len));
+            return !out.empty();
+        }
     }
 #endif
 
