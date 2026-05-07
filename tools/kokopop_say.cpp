@@ -16,10 +16,11 @@ namespace {
 void usage(const char * argv0) {
     std::fprintf(stderr,
         "usage: %s --model kokoro.gguf --voice ff_siwis (--text TEXT | --phonemes PHONEMES) "
-        "[--out out.wav | --play] [--speed 1.0] [--threads N]\n"
+        "[--out out.wav | --play] [--speed 1.0] [--threads N] [--backend cpu|metal]\n"
         "\n"
         "  --out out.wav   Write audio to a WAV file\n"
-        "  --play          Play audio directly (mutually exclusive with --out)\n",
+        "  --play          Play audio directly (mutually exclusive with --out)\n"
+        "  --backend       Use CPU or Metal backend (default: auto)\n",
         argv0);
 }
 
@@ -42,6 +43,7 @@ int main(int argc, char ** argv) {
     bool play = false;
     float speed = 1.0f;
     int threads = std::min(4, static_cast<int>(std::thread::hardware_concurrency()));
+    int backend = KOKOPOP_BACKEND_AUTO;
 
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--model") == 0) {
@@ -82,6 +84,17 @@ int main(int argc, char ** argv) {
             const char * v = arg_value(i, argc, argv);
             if (!v) { usage(argv[0]); return 2; }
             threads = std::stoi(v);
+        } else if (std::strcmp(argv[i], "--backend") == 0) {
+            const char * v = arg_value(i, argc, argv);
+            if (!v) { usage(argv[0]); return 2; }
+            if (std::strcmp(v, "cpu") == 0) {
+                backend = KOKOPOP_BACKEND_CPU;
+            } else if (std::strcmp(v, "metal") == 0) {
+                backend = KOKOPOP_BACKEND_METAL;
+            } else {
+                std::fprintf(stderr, "error: invalid backend '%s' (use 'cpu' or 'metal')\n", v);
+                return 2;
+            }
         } else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
             usage(argv[0]);
             return 0;
@@ -98,6 +111,7 @@ int main(int argc, char ** argv) {
 
     kokopop_model_options options{};
     options.n_threads = threads;
+    options.backend = backend;
     kokopop_model * model = nullptr;
     int rc = kokopop_model_load(model_path.c_str(), &options, &model);
     if (rc != KOKOPOP_OK) {
