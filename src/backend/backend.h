@@ -93,6 +93,10 @@ struct Backend {
     // Used by graph_ops::lstm_direction to fill LstmCustomParams::metal_kernel.
     virtual void * metal_lstm_kernel() const { return nullptr; }
 
+    // Return the Metal STFT kernel handle cast to void* (null for CPU backend).
+    // Used by cpu_harmonic_stft to dispatch the DFT on the GPU.
+    virtual void * metal_stft_kernel() const { return nullptr; }
+
     // ---- Context sizing ----
 
     // Memory bytes needed for a generation scratch context.

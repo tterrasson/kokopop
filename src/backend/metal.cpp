@@ -1,5 +1,7 @@
 #include "metal.h"
 #include "metal_lstm.h"
+#include "metal_stft.h"
+#include "core/constants.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -85,6 +87,7 @@ class MetalBackend : public Backend {
     ggml_backend_t cpu_backend_ = nullptr;
     ggml_backend_sched_t sched_ = nullptr;
     MetalLstmKernelState * lstm_kernel_ = nullptr;
+    MetalStftState       * stft_kernel_ = nullptr;
     size_t sched_capacity_ = 0;
     const char * active_label_ = nullptr;
     int n_input_tokens_ = 0;
@@ -310,6 +313,7 @@ public:
             }
         } else {
             lstm_kernel_ = metal_lstm_create();
+            stft_kernel_ = metal_stft_create(KOKOPOP_STFT_N, KOKOPOP_STFT_HOP);
         }
     }
 
@@ -321,6 +325,10 @@ public:
         if (lstm_kernel_) {
             metal_lstm_destroy(lstm_kernel_);
             lstm_kernel_ = nullptr;
+        }
+        if (stft_kernel_) {
+            metal_stft_destroy(stft_kernel_);
+            stft_kernel_ = nullptr;
         }
         if (metal_backend_) {
             ggml_backend_free(metal_backend_);
@@ -471,6 +479,10 @@ public:
 
     void * metal_lstm_kernel() const override {
         return lstm_kernel_;
+    }
+
+    void * metal_stft_kernel() const override {
+        return stft_kernel_;
     }
 
     ggml_backend_buffer_type_t weight_buffer_type() const override {

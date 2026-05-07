@@ -2,6 +2,10 @@
 
 #include "core/constants.h"
 
+#ifdef KOKOPOP_HAS_METAL
+#include "backend/metal_stft.h"
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -200,6 +204,16 @@ CpuTensor cpu_harmonic_stft(Model & model, const std::vector<float> & f0, int64_
         har_data.resize(har_size);
     }
     std::fill(har_data.begin(), har_data.begin() + static_cast<ptrdiff_t>(har_size), 0.0f);
+
+    // GPU path: dispatch the DFT kernel when the Metal STFT state is available.
+#ifdef KOKOPOP_HAS_METAL
+    if (auto * stft = static_cast<MetalStftState *>(model.backend->metal_stft_kernel())) {
+        metal_stft_compute(stft, source.data(), har_data.data(),
+                           static_cast<int>(n_samples),
+                           static_cast<int>(target_frames));
+        return CpuTensor{22, target_frames, std::move(har_data)};
+    }
+#endif
 
     const float * window = hann_window_20();
     const StftTwiddles & tw = stft_twiddles();
