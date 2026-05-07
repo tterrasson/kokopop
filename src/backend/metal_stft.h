@@ -35,4 +35,19 @@ void metal_stft_compute(
     int              n_samples,
     int              target_frames);
 
+// Compute the inverse STFT on the GPU.
+//
+//   post   : [22 * n_frames] float — same layout as the input to cpu_istft:
+//              log-magnitude : post[k * n_frames + frame]  for k = 0..n_fft/2
+//              phase         : post[(k + n_fft/2+1) * n_frames + frame]
+//   output : [out_len] float — normalized audio samples in [-1, 1]
+//
+// Three Metal passes: IDFT per (frame, n) → overlap-add → normalize+clamp.
+void metal_istft_compute(
+    MetalStftState * state,
+    const float    * post,
+    float          * output,
+    int              n_frames,
+    int              out_len);
+
 #endif // KOKOPOP_HAS_METAL

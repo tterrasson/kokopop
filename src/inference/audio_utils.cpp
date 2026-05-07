@@ -249,6 +249,22 @@ bool cpu_istft(Model & model, const CpuTensor & post, std::vector<float> & out) 
         return true;
     }
     const int64_t padded_len = n_fft + hop * (n_frames - 1);
+    const int64_t center_pad = n_fft / 2;
+    const int64_t out_len = std::max<int64_t>(0, padded_len - 2 * center_pad);
+    if (out_len <= 0) {
+        out.clear();
+        return true;
+    }
+
+#ifdef KOKOPOP_HAS_METAL
+    if (auto * stft = static_cast<MetalStftState *>(model.backend->metal_stft_kernel())) {
+        out.resize(static_cast<size_t>(out_len));
+        metal_istft_compute(stft, post.data.data(), out.data(),
+                            static_cast<int>(n_frames),
+                            static_cast<int>(out_len));
+        return !out.empty();
+    }
+#endif
 
     // 7.3 — Reuse pre-allocated accumulator and denominator buffers.
     std::vector<float> & y = model.tmp_istft_y_f32;
@@ -284,17 +300,7 @@ bool cpu_istft(Model & model, const CpuTensor & post, std::vector<float> & out) 
             denom[static_cast<size_t>(dst)] += window[n] * window[n];
         }
     }
-    const int64_t center_pad = n_fft / 2;
-    const int64_t out_len = std::max<int64_t>(0, padded_len - 2 * center_pad);
-    if (out_len <= 0) {
-        out.clear();
-        return true;
-    }
-    if (static_cast<size_t>(out_len) > out.size()) {
-        out.resize(static_cast<size_t>(out_len));
-    } else {
-        out.resize(static_cast<size_t>(out_len));
-    }
+    out.resize(static_cast<size_t>(out_len));
     for (int64_t i = 0; i < out_len; ++i) {
         const int64_t src = i + center_pad;
         float v = y[static_cast<size_t>(src)];
