@@ -131,10 +131,10 @@ ggml_tensor * ada_layer_norm(
         return nullptr;
     }
     ggml_tensor * gamma = linear(ctx, gw, gb, style);
-    ggml_tensor * beta = linear(ctx, bw, bb, style);
-    ggml_tensor * one = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
-    model.backend->queue_f32_tensor(one, 1.0f);
-    return ggml_add(ctx, ggml_mul(ctx, ggml_norm(ctx, x, 1e-5f), ggml_add(ctx, gamma, one)), beta);
+    ggml_tensor * beta  = linear(ctx, bw, bb, style);
+    ggml_tensor * normed = ggml_norm(ctx, x, 1e-5f);
+    // norm(x)*(1+gamma)+beta == norm(x) + norm(x)*gamma + beta
+    return ggml_add(ctx, ggml_add(ctx, normed, ggml_mul(ctx, normed, gamma)), beta);
 }
 
 ggml_tensor * adain_1d(

@@ -72,6 +72,7 @@ public:
 
     void clear_pending_inits() override {
         pending_inits_.clear();
+        pending_inits_.reserve(64);
     }
 
     void queue_tensor_data(ggml_tensor * tensor, const void * data, size_t size) override {
@@ -98,8 +99,13 @@ public:
         if (tensor == nullptr) {
             return;
         }
-        std::vector<float> data(static_cast<size_t>(ggml_nelements(tensor)), value);
-        queue_tensor_data(tensor, data.data(), data.size() * sizeof(float));
+        const size_t n = static_cast<size_t>(ggml_nelements(tensor));
+        PendingInit init;
+        init.tensor = tensor;
+        init.bytes.resize(n * sizeof(float));
+        std::fill(reinterpret_cast<float *>(init.bytes.data()),
+                  reinterpret_cast<float *>(init.bytes.data()) + n, value);
+        pending_inits_.push_back(std::move(init));
     }
 
     bool apply_pending_inits() override {
@@ -184,7 +190,7 @@ public:
     }
 
     size_t frontend_context_bytes() const override {
-        return backend_mib(64);
+        return backend_mib(4);
     }
 };
 
