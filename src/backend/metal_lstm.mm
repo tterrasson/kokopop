@@ -64,20 +64,26 @@ kernel void kokopop_lstm_fused(
 
         // First H threads update c and h for their hidden unit.
         if (tid < H) {
-            float i_gate = 1.0f / (1.0f + exp(-g_shm[tid]));
-            float f_gate = 1.0f / (1.0f + exp(-g_shm[H + tid]));
-            float g_gate = tanh(g_shm[2u*H + tid]);
-            float o_gate = 1.0f / (1.0f + exp(-g_shm[3u*H + tid]));
-            float c_new  = f_gate * c_shm[tid] + i_gate * g_gate;
-            // Clip cell state to [-50, 50]: tanh(±50) == ±1.0 in float32, so
-            // this doesn't affect output precision but prevents 0*Inf=NaN when
-            // f_gate underflows to 0 after cell-state overflow.
+            float x_i = clamp(g_shm[tid],        -80.0f, 80.0f);
+            float x_f = clamp(g_shm[H + tid],    -80.0f, 80.0f);
+            float x_g = clamp(g_shm[2u*H + tid], -80.0f, 80.0f);
+            float x_o = clamp(g_shm[3u*H + tid], -80.0f, 80.0f);
+
+            float i_gate = 1.0f / (1.0f + precise::exp(-x_i));
+            float f_gate = 1.0f / (1.0f + precise::exp(-x_f));
+            float g_gate = precise::tanh(x_g);
+            float o_gate = 1.0f / (1.0f + precise::exp(-x_o));
+
+            float c_new = f_gate * c_shm[tid] + i_gate * g_gate;
             c_new = clamp(c_new, -50.0f, 50.0f);
-            float h_new  = o_gate * tanh(c_new);
+
+            float h_new = o_gate * precise::tanh(c_new);
+
             c_shm[tid] = c_new;
             h_shm[tid] = h_new;
             output[tid + H * t] = h_new;
         }
+
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
@@ -140,11 +146,10 @@ MetalLstmKernelState * metal_lstm_create() {
 
     NSError * err = nil;
     NSString * src = [NSString stringWithUTF8String:kLstmShaderSrc];
-    MTLCompileOptions * opts = [MTLCompileOptions new];
-    opts.fastMathEnabled = NO;
-    id<MTLLibrary> lib = [s->device newLibraryWithSource:src
-                                                 options:opts
-                                                   error:&err];
+    id<MTLLibrary> lib = [
+        s->device newLibraryWithSource:src options:nil error:&err
+    ];
+
     if (!lib) {
         fprintf(stderr, "[metal_lstm] shader compile error: %s\n",
                 [[err localizedDescription] UTF8String]);
