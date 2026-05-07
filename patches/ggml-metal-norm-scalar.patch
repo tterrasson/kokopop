@@ -1,0 +1,14 @@
+diff --git a/src/ggml-metal/ggml-metal-device.cpp b/src/ggml-metal/ggml-metal-device.cpp
+index d211bf7..23eb083 100644
+--- a/src/ggml-metal/ggml-metal-device.cpp
++++ b/src/ggml-metal/ggml-metal-device.cpp
+@@ -1619,7 +1619,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_norm(ggml_metal_
+     char name[256];
+
+     const char * suffix = "";
+-    if (op->ne[0] % 4 == 0) {
++    // Disable float4 path for GGML_OP_NORM: the vectorized kernel produces
++    // corrupted values for certain input patterns (e.g. comma-containing phrases).
++    if (op->op != GGML_OP_NORM && op->ne[0] % 4 == 0) {
+         suffix = "_4";
+     }

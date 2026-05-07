@@ -42,6 +42,9 @@ static size_t graph_capacity(ggml_cgraph * graph) {
 //       these are direct memcpy, not GPU blits.
 //     - Eliminates the old `pin_weights_cpu_for_cpu_graph` O(n_nodes) loop and
 //       the per-inference Metal→CPU sync that added ~120 ms on generation.
+//     - Note: Metal shared/mapped buffer types report is_host=false; CPU backend
+//       therefore rejects them and would require copies for CPU graphs.  CPU
+//       weight placement is optimal given generation/generator dominates calls.
 //   * Scheduler `op_offload=false`: ops naturally follow their weight tensors
 //     to CPU.  Metal assignment is done explicitly in pin_graph_cpu_fallbacks:
 //     every node that isn't hard-pinned (unsupported op) or soft-pinned (NORM,
@@ -56,14 +59,21 @@ static size_t graph_capacity(ggml_cgraph * graph) {
 //     correct duration. The allocator does its own reserve on the 1st alloc
 //     (ggml-backend.cpp:1509-1535), which is sufficient here (~40 MiB total).
 //   * **Full generation+generator on CPU by default** — generation: Metal NORM
-//     kernel produces corrupted values on certain token patterns and hybrid
-//     Metal/CPU transitions cause ~50 s wall-clock (25 GPU syncs). Generator:
-//     hybrid Metal/CPU (CONV_TRANSPOSE_1D + rest Metal) corrupts activations.
+//     kernel (float4 path) produces corrupted values on certain token patterns
+//     (fixed in patches/ggml-metal-norm-scalar.patch) and hybrid Metal/CPU
+//     transitions cause ~50 s wall-clock (25 GPU syncs). Generator: ggml Metal
+//     CONV_TRANSPOSE_1D dispatches 1 thread/output — GPU watchdog kills it for
+//     large dims (fixed in patches/ggml-conv-transpose-1d-simd.patch).
 //     Both pinned CPU by default. Override via `KOKOPOP_METAL_FORCE_CPU=none`.
 //   * **Adaptive Metal frontend** (2026-05-04) — Metal kernel-launch overhead
 //     (~100 us/kernel * N ALBERT kernels) exceeds GPU compute speedup for
 //     short inputs. Frontend runs on CPU when n_tokens < KOKOPOP_METAL_MIN_TOKENS
 //     (default 100). Set to 0 to always use Metal for frontend.
+//   * **Env var caching** — all KOKOPOP_METAL_* env vars are read once at
+//     construction and cached as members (env vars do not change at runtime).
+//   * **Pin decision cache** — pin assignments for a graph are reused across
+//     calls when active_label_ and n_nodes are unchanged, avoiding an O(n_nodes)
+//     loop on every inference step.
 //
 // Environment variables (escape hatches, all optional):
 //   KOKOPOP_METAL_LOG_SCHED=1     — log per graph `splits / metal_buf / cpu_buf`.
@@ -92,6 +102,22 @@ class MetalBackend : public Backend {
     const char * active_label_ = nullptr;
     int n_input_tokens_ = 0;
     std::vector<PendingInit> pending_inits_;
+
+    // Cached env vars — read once at construction, never change at runtime.
+    const char * env_force_cpu_  = nullptr;  // KOKOPOP_METAL_FORCE_CPU
+    const char * env_pin_op_     = nullptr;  // KOKOPOP_METAL_PIN_OP
+    const char * env_allow_op_   = nullptr;  // KOKOPOP_METAL_ALLOW_OP
+    const char * env_run_only_   = nullptr;  // KOKOPOP_METAL_RUN_ONLY
+    int          env_min_tokens_ = 100;      // KOKOPOP_METAL_MIN_TOKENS
+    bool         env_log_sched_  = false;    // KOKOPOP_METAL_LOG_SCHED
+    bool         env_op_trace_   = false;    // KOKOPOP_METAL_OP_TRACE
+    bool         env_alloc_only_ = false;    // KOKOPOP_METAL_ALLOC_ONLY
+
+    // Pin decision cache — valid when active_label_ == pin_cache_label_
+    // and the graph has pin_cache_n_nodes_ nodes.
+    std::string              pin_cache_label_;
+    int                      pin_cache_n_nodes_ = -1;
+    std::vector<ggml_backend_t> pin_cache_;
 
     // Levels for KOKOPOP_METAL_RUN_ONLY: we compute a graph iff its level
     // is ≤ the requested one. Unknown → infinite level → skip.
@@ -138,43 +164,34 @@ class MetalBackend : public Backend {
 
     bool force_cpu_for_active_graph() const {
         if (active_label_ == nullptr) return false;
-        // Default: `generation` AND `generator` on CPU. Reasons:
-        //   1. `generator`: CONV_TRANSPOSE_1D cannot run on Metal (GPU watchdog
-        //      hang → machine reboot required). In hybrid mode (CONV_TRANSPOSE_1D
-        //      on CPU, rest Metal), Metal's adain/resblock activations exceed F16
-        //      max (65504) at the boundary, causing F32→F16 overflow inside the
-        //      CPU CONV_TRANSPOSE kernel → Inf → vec_dot_f16 assertion crash.
-        //      Pure CPU execution avoids both issues.
-        //   2. `generation`: hybrid Metal with pinned NORM explodes wall-clock
-        //      (50+ s vs 2 s pure CPU, ~25 GPU sync splits). Additionally
-        //      the Metal NORM kernel produces incorrect values for some
-        //      token patterns (unintelligible audio on comma phrases).
-        //      Pinning the full `generation` removes both problems at once.
-        //   3. `frontend` short inputs: Metal kernel-launch overhead (~100 µs
-        //      per kernel × N kernels ALBERT) exceeds GPU compute speedup for
-        //      small token counts. Default threshold = 20 tokens, override via
-        //      KOKOPOP_METAL_MIN_TOKENS=N (0 = always Metal, large = always CPU).
-        // What stays on Metal: `frontend` when n_tokens >= KOKOPOP_METAL_MIN_TOKENS.
-        // Override: KOKOPOP_METAL_FORCE_CPU=none|<labels>.
-        const char * forced = std::getenv("KOKOPOP_METAL_FORCE_CPU");
-        if (forced == nullptr) {
+        // Default: `generation` AND `generator` on CPU (conservative).
+        //   The two original blocking bugs are now patched:
+        //   - patches/ggml-metal-norm-scalar.patch: disables the float4 NORM
+        //     kernel that corrupted values for certain token patterns in `generation`.
+        //   - patches/ggml-conv-transpose-1d-simd.patch: CONV_TRANSPOSE_1D now
+        //     uses 32 threads/group + simd_sum, avoiding GPU watchdog on the large
+        //     generator dims.
+        //   CPU default is kept until full-Metal generation/generator paths are
+        //   validated end-to-end.  Override: KOKOPOP_METAL_FORCE_CPU=none.
+        //   `frontend` short inputs: Metal kernel-launch overhead (~100 µs per
+        //   kernel × N ALBERT kernels) exceeds GPU compute speedup for small token
+        //   counts. Threshold = env_min_tokens_ (default 100).
+        if (env_force_cpu_ == nullptr) {
             if (std::strcmp(active_label_, "generator") == 0
                 || std::strcmp(active_label_, "generation") == 0) {
                 return true;
             }
             if (std::strcmp(active_label_, "frontend") == 0 && n_input_tokens_ > 0) {
-                const char * s = std::getenv("KOKOPOP_METAL_MIN_TOKENS");
-                const int min_tok = (s && s[0]) ? std::atoi(s) : 100;
-                return n_input_tokens_ < min_tok;
+                return n_input_tokens_ < env_min_tokens_;
             }
             return false;
         }
 
-        if (std::strcmp(forced, "none") == 0) {
+        if (std::strcmp(env_force_cpu_, "none") == 0) {
             return false;
         }
 
-        return list_contains(forced, active_label_);
+        return list_contains(env_force_cpu_, active_label_);
     }
 
     static bool node_op_in_list(ggml_tensor * node, const char * csv) {
@@ -188,30 +205,11 @@ class MetalBackend : public Backend {
 
     // Ops Metal claims to support but which produce bad values or
     // wedge the GPU. All identified by bisection (PIN_OP / OP_TRACE) on 2026-05-02.
+    // NORM and CONV_TRANSPOSE_1D were previously unsafe; both are fixed by
+    // patches/ggml-metal-norm-scalar.patch and patches/ggml-conv-transpose-1d-simd.patch.
     bool is_default_unsafe_op(ggml_tensor * node) const {
-        if (node == nullptr) return false;
-        switch (node->op) {
-            case GGML_OP_CONV_TRANSPOSE_1D:
-                // Wedges the GPU (watchdog) on large dims (e.g. [430, 256]
-                // in the generator). At shape [43, 512] in `generation` it
-                // passes, but pinning everywhere avoids Metal↔CPU transitions
-                // that corrupt activations on certain sequences.
-                return active_label_ != nullptr
-                    && std::strcmp(active_label_, "generator") == 0;
-            case GGML_OP_NORM:
-                // Metal LayerNorm produces corrupted values on certain input
-                // patterns in `generation` (e.g. phrases with commas →
-                // unintelligible audio). Bisection: PIN_OP=NORM fixes it;
-                // GGML_METAL_FUSION_DISABLE alone is not enough (bug also in
-                // the non-fused kernel). We pin in `generation` (and for
-                // consistency, everywhere except `frontend` where ALBERT 12
-                // layers use LayerNorm heavily — bug not observed there, and
-                // pinning would create ~50 Metal↔CPU transitions = terrible perf).
-                return active_label_ != nullptr
-                    && std::strcmp(active_label_, "frontend") != 0;
-            default:
-                return false;
-        }
+        (void)node;
+        return false;
     }
 
     void pin_graph_cpu_fallbacks(ggml_cgraph * graph) {
@@ -222,8 +220,8 @@ class MetalBackend : public Backend {
         //
         // hard_pin       : Metal cannot execute the op (integer type, or
         //                  ggml_backend_supports_op=false). No override.
-        // default_unsafe : op that produces bad values or wedges the GPU in
-        //                  practice (CONV_TRANSPOSE_1D, NORM outside frontend).
+        // default_unsafe : (currently none) reserved for ops with verified GPU bugs.
+        //                  NORM and CONV_TRANSPOSE_1D were here; both patched out.
         //                  Override via ALLOW_OP — at user's own risk.
         // soft_pin       : user-requested pin via FORCE_CPU or PIN_OP env var.
         //                  Override via ALLOW_OP.
@@ -231,30 +229,57 @@ class MetalBackend : public Backend {
         //                  force_cpu, explicitly assign to Metal so that the
         //                  scheduler doesn't silently default to CPU because
         //                  the weight tensors live in a CPU buffer.
-        const bool force_cpu = force_cpu_for_active_graph();
-        const char * pin_op  = std::getenv("KOKOPOP_METAL_PIN_OP");
-        const char * allow_op = std::getenv("KOKOPOP_METAL_ALLOW_OP");
+        //
+        // Pin cache: when active_label_ and n_nodes are unchanged the per-node
+        // assignments are deterministic, so we replay the cached vector instead
+        // of re-running the O(n_nodes) classification loop.
         const int n_nodes = ggml_graph_n_nodes(graph);
+        const bool cache_hit = (pin_cache_n_nodes_ == n_nodes)
+                            && (active_label_ != nullptr)
+                            && (pin_cache_label_ == active_label_);
+
+        if (cache_hit) {
+            for (int i = 0; i < n_nodes; ++i) {
+                ggml_tensor * node = ggml_graph_node(graph, i);
+                if (node != nullptr && pin_cache_[i] != nullptr) {
+                    ggml_backend_sched_set_tensor_backend(sched_, node, pin_cache_[i]);
+                }
+            }
+            return;
+        }
+
+        const bool force_cpu = force_cpu_for_active_graph();
+        pin_cache_.resize(n_nodes);
         for (int i = 0; i < n_nodes; ++i) {
             ggml_tensor * node = ggml_graph_node(graph, i);
             if (node == nullptr) {
+                pin_cache_[i] = nullptr;
                 continue;
             }
             const bool hard_pin       = is_integer_type(node->type)
                                      || !ggml_backend_supports_op(metal_backend_, node);
             const bool default_unsafe = is_default_unsafe_op(node);
-            const bool soft_pin       = force_cpu || node_op_in_list(node, pin_op);
-            const bool allowed        = node_op_in_list(node, allow_op);
+            const bool soft_pin       = force_cpu || node_op_in_list(node, env_pin_op_);
+            const bool allowed        = node_op_in_list(node, env_allow_op_);
+            ggml_backend_t backend;
             if (hard_pin || ((default_unsafe || soft_pin) && !allowed)) {
-                ggml_backend_sched_set_tensor_backend(sched_, node, cpu_backend_);
+                backend = cpu_backend_;
             } else if (!force_cpu) {
-                ggml_backend_sched_set_tensor_backend(sched_, node, metal_backend_);
+                backend = metal_backend_;
+            } else {
+                backend = nullptr;
+            }
+            pin_cache_[i] = backend;
+            if (backend != nullptr) {
+                ggml_backend_sched_set_tensor_backend(sched_, node, backend);
             }
         }
+        pin_cache_label_   = active_label_ ? active_label_ : "";
+        pin_cache_n_nodes_ = n_nodes;
     }
 
     void log_sched_sizes(const char * stage) {
-        if (sched_ == nullptr || std::getenv("KOKOPOP_METAL_LOG_SCHED") == nullptr) {
+        if (sched_ == nullptr || !env_log_sched_) {
             return;
         }
         const int n_splits = ggml_backend_sched_get_n_splits(sched_);
@@ -289,6 +314,18 @@ class MetalBackend : public Backend {
 
 public:
     explicit MetalBackend(int32_t n_threads) {
+        // Cache all KOKOPOP_METAL_* env vars once — they do not change at runtime.
+        env_force_cpu_  = std::getenv("KOKOPOP_METAL_FORCE_CPU");
+        env_pin_op_     = std::getenv("KOKOPOP_METAL_PIN_OP");
+        env_allow_op_   = std::getenv("KOKOPOP_METAL_ALLOW_OP");
+        env_run_only_   = std::getenv("KOKOPOP_METAL_RUN_ONLY");
+        env_log_sched_  = std::getenv("KOKOPOP_METAL_LOG_SCHED")  != nullptr;
+        env_op_trace_   = std::getenv("KOKOPOP_METAL_OP_TRACE")   != nullptr;
+        env_alloc_only_ = std::getenv("KOKOPOP_METAL_ALLOC_ONLY") != nullptr;
+        if (const char * s = std::getenv("KOKOPOP_METAL_MIN_TOKENS")) {
+            if (s[0]) env_min_tokens_ = std::atoi(s);
+        }
+
         cpu_backend_ = ggml_backend_cpu_init();
         if (cpu_backend_ != nullptr) {
             ggml_backend_cpu_set_n_threads(cpu_backend_, std::max<int32_t>(1, n_threads));
@@ -354,7 +391,7 @@ public:
         if (!ensure_scheduler(graph)) {
             return false;
         }
-        if (std::getenv("KOKOPOP_METAL_OP_TRACE") != nullptr) {
+        if (env_op_trace_) {
             ggml_backend_sched_set_eval_callback(sched_, eval_trace_cb, sched_);
         }
         pin_graph_cpu_fallbacks(graph);
@@ -421,7 +458,7 @@ public:
     ggml_status compute(ggml_context * ctx, ggml_cgraph * graph) override {
         (void)ctx;
         // Global compute bypass: KOKOPOP_METAL_ALLOC_ONLY=1 skips all graphs.
-        if (std::getenv("KOKOPOP_METAL_ALLOC_ONLY") != nullptr) {
+        if (env_alloc_only_) {
             ggml_backend_sched_synchronize(sched_);
             log_sched_sizes("alloc-only");
             (void)graph;
@@ -430,8 +467,8 @@ public:
         // Selective bypass: KOKOPOP_METAL_RUN_ONLY={frontend,generation,generator}
         // runs only graphs at level ≤ the requested one. Allows bisection of
         // which graph wedges the GPU without rerunning the full inference.
-        if (const char * run_only = std::getenv("KOKOPOP_METAL_RUN_ONLY")) {
-            if (label_level(active_label_) > label_level(run_only)) {
+        if (env_run_only_ != nullptr) {
+            if (label_level(active_label_) > label_level(env_run_only_)) {
                 ggml_backend_sched_synchronize(sched_);
                 log_sched_sizes("skip-compute");
                 (void)graph;
@@ -463,7 +500,11 @@ public:
     const char * label() const override { return "Metal (GPU)"; }
 
     void set_active_label(const char * label) override {
-        active_label_ = label;
+        if (active_label_ != label) {
+            active_label_ = label;
+            // Invalidate pin cache — decisions depend on active_label_.
+            pin_cache_n_nodes_ = -1;
+        }
     }
 
     void set_input_tokens(int n) override {

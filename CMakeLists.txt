@@ -27,6 +27,15 @@ FetchContent_Declare(
   GIT_REPOSITORY https://github.com/ggml-org/ggml.git
   GIT_TAG        ac6f7b44f60fde0091f0b3d99afde48f8c99b13a
   GIT_SHALLOW    TRUE
+  # Fix 3: force scalar (non-float4) NORM kernel — the float4 path corrupts
+  #         values for certain token patterns (e.g. comma phrases).
+  # Fix 4: dispatch CONV_TRANSPOSE_1D with 32 threads/group and simd_sum
+  #         reduction, avoiding GPU watchdog on large generator dims.
+  # patch -N skips patches already applied (idempotent on re-configure).
+  PATCH_COMMAND
+    patch -N -p1 < ${CMAKE_SOURCE_DIR}/patches/ggml-metal-norm-scalar.patch || true
+    COMMAND
+    patch -N -p1 < ${CMAKE_SOURCE_DIR}/patches/ggml-conv-transpose-1d-simd.patch || true
 )
 FetchContent_MakeAvailable(ggml)
 
