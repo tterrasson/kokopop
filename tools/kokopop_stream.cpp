@@ -30,7 +30,7 @@ void usage(const char * argv0) {
     std::fputs("usage: ", stderr);
     std::fputs(argv0, stderr);
     std::fputs(" --model kokoro.gguf --voice ff_siwis "
-        "[--speed 1.0] [--mode interactive|long_form] [--threads N]\n"
+        "[--speed 1.0] [--mode interactive|long_form] [--threads N] [--backend cpu|metal]\n"
         "       [--out out.wav]\n"
         "\n"
         "stdio mode (default):\n"
@@ -54,6 +54,7 @@ void usage(const char * argv0) {
         "  --mode MODE     interactive (default) or long_form\n"
         "  --out PATH      Save full audio to WAV file (stdio mode)\n"
         "  --threads N     Number of threads (default: min(4, hw_concurrency))\n"
+        "  --backend       Use CPU or Metal backend (default: auto)\n"
         "  --http          Run in HTTP server mode\n"
         "  --port N        HTTP server port (default: 8080)\n"
         "  --bind ADDR     HTTP server bind address (default: 127.0.0.1)\n"
@@ -257,6 +258,11 @@ static int run_stdio_mode(kokopop::Model * model, const std::string & default_vo
         }
 
         yyjson_val * root = yyjson_doc_get_root(doc);
+        if (!yyjson_is_obj(root)) {
+            std::fprintf(stderr, "[kokopop] JSON is not an object\n");
+            yyjson_doc_free(doc);
+            continue;
+        }
 
         // Extract fields using yyjson
         // Note: strings from yyjson are owned by the doc, so copy them before freeing
@@ -377,6 +383,13 @@ bool handle_tts(kokopop::Model * model, const std::string & default_voice,
     }
 
     yyjson_val * root = yyjson_doc_get_root(doc);
+    if (!yyjson_is_obj(root)) {
+        res.status_code = 400;
+        res.status_text = "Bad Request";
+        res.set_json_string(json_error("JSON is not an object"));
+        yyjson_doc_free(doc);
+        return false;
+    }
 
     // Extract fields
     const char * text = yyjson_get_str(yyjson_obj_get(root, "text"));
@@ -386,7 +399,7 @@ bool handle_tts(kokopop::Model * model, const std::string & default_voice,
     // Speed
     float speed = default_speed;
     yyjson_val * speed_val = yyjson_obj_get(root, "speed");
-    if (speed_val && !yyjson_is_null(speed_val)) {
+    if (speed_val && !yyjson_is_null(speed_val) && yyjson_is_num(speed_val)) {
         speed = (float)yyjson_get_num(speed_val);
     }
 
@@ -549,38 +562,72 @@ int main(int argc, char ** argv) {
     std::string mode_str = "interactive";
     std::string out_path;
     int threads = std::min(4, static_cast<int>(std::thread::hardware_concurrency()));
+    int backend = KOKOPOP_BACKEND_AUTO;
 
     // HTTP mode
     bool http_mode = false;
     int http_port = 8080;
     std::string http_bind = "127.0.0.1";
 
-    for (int i = 1; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--model") == 0) {
-            model_path = arg_value(i, argc, argv);
-        } else if (std::strcmp(argv[i], "--voice") == 0) {
-            voice = arg_value(i, argc, argv);
-        } else if (std::strcmp(argv[i], "--speed") == 0) {
-            speed = std::stof(arg_value(i, argc, argv));
-        } else if (std::strcmp(argv[i], "--mode") == 0) {
-            mode_str = arg_value(i, argc, argv);
-        } else if (std::strcmp(argv[i], "--out") == 0) {
-            out_path = arg_value(i, argc, argv);
-        } else if (std::strcmp(argv[i], "--threads") == 0) {
-            threads = std::stoi(arg_value(i, argc, argv));
-        } else if (std::strcmp(argv[i], "--http") == 0) {
-            http_mode = true;
-        } else if (std::strcmp(argv[i], "--port") == 0) {
-            http_port = std::stoi(arg_value(i, argc, argv));
-        } else if (std::strcmp(argv[i], "--bind") == 0) {
-            http_bind = arg_value(i, argc, argv);
-        } else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
-            usage(argv[0]);
-            return 0;
-        } else {
-            usage(argv[0]);
-            return 2;
+    try {
+        for (int i = 1; i < argc; ++i) {
+            if (std::strcmp(argv[i], "--model") == 0) {
+                const char * v = arg_value(i, argc, argv);
+                if (!v) { usage(argv[0]); return 2; }
+                model_path = v;
+            } else if (std::strcmp(argv[i], "--voice") == 0) {
+                const char * v = arg_value(i, argc, argv);
+                if (!v) { usage(argv[0]); return 2; }
+                voice = v;
+            } else if (std::strcmp(argv[i], "--speed") == 0) {
+                const char * v = arg_value(i, argc, argv);
+                if (!v) { usage(argv[0]); return 2; }
+                speed = std::stof(v);
+            } else if (std::strcmp(argv[i], "--mode") == 0) {
+                const char * v = arg_value(i, argc, argv);
+                if (!v) { usage(argv[0]); return 2; }
+                mode_str = v;
+            } else if (std::strcmp(argv[i], "--out") == 0) {
+                const char * v = arg_value(i, argc, argv);
+                if (!v) { usage(argv[0]); return 2; }
+                out_path = v;
+            } else if (std::strcmp(argv[i], "--threads") == 0) {
+                const char * v = arg_value(i, argc, argv);
+                if (!v) { usage(argv[0]); return 2; }
+                threads = std::stoi(v);
+            } else if (std::strcmp(argv[i], "--backend") == 0) {
+                const char * v = arg_value(i, argc, argv);
+                if (!v) { usage(argv[0]); return 2; }
+                if (std::strcmp(v, "cpu") == 0) {
+                    backend = KOKOPOP_BACKEND_CPU;
+                } else if (std::strcmp(v, "metal") == 0) {
+                    backend = KOKOPOP_BACKEND_METAL;
+                } else {
+                    std::fprintf(stderr, "error: invalid backend '%s' (use 'cpu' or 'metal')\n", v);
+                    return 2;
+                }
+            } else if (std::strcmp(argv[i], "--http") == 0) {
+                http_mode = true;
+            } else if (std::strcmp(argv[i], "--port") == 0) {
+                const char * v = arg_value(i, argc, argv);
+                if (!v) { usage(argv[0]); return 2; }
+                http_port = std::stoi(v);
+            } else if (std::strcmp(argv[i], "--bind") == 0) {
+                const char * v = arg_value(i, argc, argv);
+                if (!v) { usage(argv[0]); return 2; }
+                http_bind = v;
+            } else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
+                usage(argv[0]);
+                return 0;
+            } else {
+                usage(argv[0]);
+                return 2;
+            }
         }
+    } catch (const std::exception & e) {
+        std::fprintf(stderr, "error: invalid numeric argument: %s\n", e.what());
+        usage(argv[0]);
+        return 2;
     }
 
     if (model_path.empty() || voice.empty()) {
@@ -601,6 +648,7 @@ int main(int argc, char ** argv) {
     std::fprintf(stderr, "[kokopop] Loading model: %s\n", model_path.c_str());
     kokopop_model_options options{};
     options.n_threads = threads;
+    options.backend = backend;
     kokopop_model * model_c = nullptr;
     int rc = kokopop_model_load(model_path.c_str(), &options, &model_c);
     if (rc != KOKOPOP_OK) {
