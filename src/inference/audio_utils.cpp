@@ -221,16 +221,25 @@ CpuTensor cpu_harmonic_stft(Model & model, const std::vector<float> & f0, int64_
     const StftTwiddles & tw = stft_twiddles();
     const int64_t center_pad = n_fft / 2;
     for (int64_t frame = 0; frame < target_frames; ++frame) {
+        // Precompute windowed samples once per frame (shared across all k bins).
+        float ws[n_fft]{};
+        const int64_t first = frame * hop - center_pad;
+        if (first >= 0 && first + n_fft <= n_samples) {
+            for (int n = 0; n < n_fft; ++n)
+                ws[n] = source[static_cast<size_t>(first + n)] * window[n];
+        } else {
+            for (int n = 0; n < n_fft; ++n) {
+                const int64_t src_i = first + n;
+                if (src_i >= 0 && src_i < n_samples)
+                    ws[n] = source[static_cast<size_t>(src_i)] * window[n];
+            }
+        }
         for (int k = 0; k <= n_fft / 2; ++k) {
             float real = 0.0f;
             float imag = 0.0f;
             for (int n = 0; n < n_fft; ++n) {
-                const int64_t src_i = frame * hop + n - center_pad;
-                const float sample = (src_i >= 0 && src_i < n_samples)
-                    ? source[static_cast<size_t>(src_i)] * window[n]
-                    : 0.0f;
-                real += sample * tw.c[k][n];
-                imag -= sample * tw.s[k][n];
+                real += ws[n] * tw.c[k][n];
+                imag -= ws[n] * tw.s[k][n];
             }
             har_data[static_cast<size_t>(k * target_frames + frame)] = std::sqrt(real * real + imag * imag);
             har_data[static_cast<size_t>((k + n_fft / 2 + 1) * target_frames + frame)] = std::atan2(imag, real);
@@ -284,34 +293,45 @@ bool cpu_istft(Model & model, const CpuTensor & post, std::vector<float> & out) 
     std::fill(denom.begin(), denom.begin() + static_cast<ptrdiff_t>(pad_size), 0.0f);
     const float * window = hann_window_20();
     const StftTwiddles & tw = stft_twiddles();
+
+    // Precompute window² once — same for every frame.
+    static float win_sq[n_fft];
+    static bool win_sq_init = false;
+    if (!win_sq_init) {
+        for (int n = 0; n < n_fft; ++n) win_sq[n] = window[n] * window[n];
+        win_sq_init = true;
+    }
+
     for (int64_t frame = 0; frame < n_frames; ++frame) {
-        float real[11]{};
-        float imag[11]{};
+        float real[n_fft / 2 + 1]{};
+        float imag[n_fft / 2 + 1]{};
         for (int k = 0; k <= n_fft / 2; ++k) {
             const float mag = std::exp(std::clamp(post.at(k, frame), -20.0f, 8.0f));
-            const float ph = std::sin(post.at(k + n_fft / 2 + 1, frame));
-            real[k] = mag * std::cos(ph);
-            imag[k] = mag * std::sin(ph);
+            // ph = sin(stored_phase) ∈ [-1,1] ⊂ (-π/2,π/2) → cos(ph) always positive.
+            const float sin_ph = std::sin(post.at(k + n_fft / 2 + 1, frame));
+            const float cos_ph = std::sqrt(std::max(0.0f, 1.0f - sin_ph * sin_ph));
+            real[k] = mag * cos_ph;
+            imag[k] = mag * sin_ph;
         }
         for (int n = 0; n < n_fft; ++n) {
-            float sample = real[0] + real[n_fft / 2] * ((n % 2) == 0 ? 1.0f : -1.0f);
+            // (n%2)==0 ? 1:-1  →  1 - 2*(n&1), no branch
+            float sample = real[0] + real[n_fft / 2] * static_cast<float>(1 - 2 * (n & 1));
             for (int k = 1; k < n_fft / 2; ++k) {
                 sample += 2.0f * (real[k] * tw.c[k][n] - imag[k] * tw.s[k][n]);
             }
-            sample /= static_cast<float>(n_fft);
+            sample *= (1.0f / static_cast<float>(n_fft));
             const int64_t dst = frame * hop + n;
-            y[static_cast<size_t>(dst)] += sample * window[n];
-            denom[static_cast<size_t>(dst)] += window[n] * window[n];
+            y[static_cast<size_t>(dst)]     += sample * window[n];
+            denom[static_cast<size_t>(dst)] += win_sq[n];
         }
     }
     out.resize(static_cast<size_t>(out_len));
     for (int64_t i = 0; i < out_len; ++i) {
         const int64_t src = i + center_pad;
-        float v = y[static_cast<size_t>(src)];
-        if (denom[static_cast<size_t>(src)] > 1e-8f) {
-            v /= denom[static_cast<size_t>(src)];
-        }
-        out[static_cast<size_t>(i)] = std::clamp(v, -1.0f, 1.0f);
+        const float d = denom[static_cast<size_t>(src)];
+        out[static_cast<size_t>(i)] = std::clamp(
+            d > 1e-8f ? y[static_cast<size_t>(src)] / d : 0.0f,
+            -1.0f, 1.0f);
     }
     return !out.empty();
 }

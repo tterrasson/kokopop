@@ -190,7 +190,7 @@ public:
     }
 
     size_t frontend_context_bytes() const override {
-        return backend_mib(4);
+        return backend_mib(16);
     }
 };
 
