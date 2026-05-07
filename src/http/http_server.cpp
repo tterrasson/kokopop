@@ -604,8 +604,17 @@ bool HttpServer::_send_response(int fd, const HttpResponse & res, bool close_con
         oss << key << ": " << val << "\r\n";
     }
 
-    // If Content-Length header wasn't explicitly set, add it
-    if (res.headers.find("content-length") == res.headers.end()) {
+    // If Content-Length header wasn't explicitly set, add it (case-insensitive check)
+    bool has_content_length = false;
+    for (auto & [k, v] : res.headers) {
+        std::string lower_k = k;
+        std::transform(lower_k.begin(), lower_k.end(), lower_k.begin(), ::tolower);
+        if (lower_k == "content-length") {
+            has_content_length = true;
+            break;
+        }
+    }
+    if (!has_content_length) {
         oss << "Content-Length: " << res.body.size() << "\r\n";
     }
 
