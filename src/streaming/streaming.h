@@ -61,7 +61,69 @@ struct StreamHandle {
 };
 
 // ---------------------------------------------------------------------------
-// Full streaming synthesis
+// Two-phase synthesis API (for interleaving / async scheduling)
+// ---------------------------------------------------------------------------
+
+/// Prepared synthesis plan — output of the chunking/phonemization phase.
+/// This struct contains everything needed for inference: chunks with
+/// phonemes + tokens, voice name, speed, and post-processing config.
+///
+/// Thread-safety: once constructed, this struct is read-only and can be
+/// safely shared across threads.  The only non-const operation is
+/// clear_chunk_data() which is intended to be called after a chunk has
+/// been inferred to free memory.
+struct SynthesisPlan {
+    std::vector<Chunk> chunks;
+    std::string voice;
+    float speed;
+    StreamMode mode;
+    ChunkConfig config;
+
+    /// Estimate total output samples (rough: 0.035s per token / speed)
+    size_t estimated_total_samples(int sample_rate) const;
+};
+
+/// Phase 1 — Prepare a synthesis plan.
+///
+/// This function performs chunking, phonemization and tokenization.
+/// It does NOT touch the GGML backend scheduler, so it is safe to call
+/// concurrently from multiple threads (eSpeak-ng has its own internal
+/// mutex, and model->tokenize_phonemes() is read-only).
+///
+/// Returns an empty plan on error (error string set).
+SynthesisPlan prepare_synthesis(
+    Model & model,
+    const std::string & text,
+    const std::string & voice,
+    float speed,
+    StreamMode mode,
+    std::string & error);
+
+/// Phase 2 — Infer a single chunk of audio.
+///
+/// This function calls into the GGML backend (synthesize_phonemes +
+/// postprocessing + crossfade).  It is NOT thread-safe: only one call
+/// to infer_chunk() should be active at a time across all requests.
+///
+/// Parameters:
+///   plan       — prepared synthesis plan (read-only)
+///   chunk_idx  — index of the chunk to infer (0-based)
+///   prev_tail  — tail samples from the previous chunk (for crossfade).
+///                Pass empty vector for the first chunk.
+///   out_tail   — output: tail samples from this chunk for the next crossfade.
+///                Only populated if crossfade_ms > 0.
+///
+/// Returns the processed audio samples on success, empty vector on error.
+std::vector<float> infer_chunk(
+    Model & model,
+    const SynthesisPlan & plan,
+    int chunk_idx,
+    const std::vector<float> & prev_tail,
+    std::vector<float> & out_tail,
+    std::string & error);
+
+// ---------------------------------------------------------------------------
+// Full streaming synthesis (backward-compatible wrapper)
 // ---------------------------------------------------------------------------
 
 StreamHandle stream_synthesize(

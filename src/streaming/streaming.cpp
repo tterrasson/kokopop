@@ -13,41 +13,137 @@
 namespace kokopop {
 
 // ---------------------------------------------------------------------------
-// Internal: generate a single chunk of audio
+// SynthesisPlan helpers
 // ---------------------------------------------------------------------------
-namespace {
 
-bool generate_chunk(
-    kokopop::Model & model,
-    const Chunk & chunk,
+size_t SynthesisPlan::estimated_total_samples(int sample_rate) const {
+    // Rough estimate: ~0.035s per token at speed 1.0
+    size_t total_tokens = 0;
+    for (const auto & chunk : chunks) {
+        total_tokens += static_cast<size_t>(chunk.n_tokens);
+    }
+    const double duration_s = static_cast<double>(total_tokens) * 0.035 / speed;
+    return static_cast<size_t>(duration_s * sample_rate);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1 — prepare_synthesis (chunking + phonemization)
+// ---------------------------------------------------------------------------
+
+SynthesisPlan prepare_synthesis(
+    Model & model,
+    const std::string & text,
     const std::string & voice,
     float speed,
-    std::vector<float> & out_audio,
-    std::string & error) {
+    StreamMode mode,
+    std::string & error)
+{
+    SynthesisPlan plan;
 
-    // Synthesize phonemes
+    // Select config
+    plan.config = (mode == StreamMode::Interactive)
+        ? make_interactive_config()
+        : make_long_form_config();
+
+    // Tokenize function wrapper
+    TokenizeFn tokenize_fn = [&model](const std::string & phonemes,
+                                       std::vector<uint32_t> & ids,
+                                       std::string & err) -> bool {
+        return model.tokenize_phonemes(phonemes, ids, err);
+    };
+
+    // Chunk the text
+    plan.chunks = chunk_text(text, voice, plan.config, tokenize_fn, error);
+    if (plan.chunks.empty()) {
+        return plan;
+    }
+
+    plan.voice = voice;
+    plan.speed = speed;
+    plan.mode = mode;
+
+    std::fprintf(stderr, "[kokopop] prepared: %zu chunks, %s mode\n",
+                plan.chunks.size(),
+                (mode == StreamMode::Interactive) ? "interactive" : "long_form");
+
+    return plan;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2 — infer_chunk (single chunk inference + postprocessing)
+// ---------------------------------------------------------------------------
+
+std::vector<float> infer_chunk(
+    Model & model,
+    const SynthesisPlan & plan,
+    int chunk_idx,
+    const std::vector<float> & prev_tail,
+    std::vector<float> & out_tail,
+    std::string & error)
+{
+    if (chunk_idx < 0 || chunk_idx >= static_cast<int>(plan.chunks.size())) {
+        error = "chunk index out of range";
+        return {};
+    }
+
+    const auto & chunk = plan.chunks[chunk_idx];
+
+    std::fprintf(stderr, "[kokopop] chunk[%d/%zu]: %d tokens, phonemes=%zu chars\n",
+                chunk_idx, plan.chunks.size(),
+                chunk.n_tokens, chunk.phonemes.size());
+
+    // --- Synthesize raw audio ---
     kokopop_audio raw{};
-    if (!synthesize_phonemes(model, chunk.phonemes, voice, speed, raw, error)) {
-        return false;
+    if (!synthesize_phonemes(model, chunk.phonemes, plan.voice, plan.speed, raw, error)) {
+        return {};
     }
 
     if (raw.n_samples == 0) {
         kokopop_audio_free(&raw);
         error = "synthesis produced no audio";
-        return false;
+        return {};
     }
 
     // Copy to vector for postprocessing
-    out_audio.assign(raw.samples, raw.samples + raw.n_samples);
+    std::vector<float> raw_audio(raw.n_samples);
+    std::copy(raw.samples, raw.samples + raw.n_samples, raw_audio.begin());
     kokopop_audio_free(&raw);
 
-    return true;
+    std::fprintf(stderr, "[kokopop] chunk[%d] synthesized: %zu samples (%.1fms)\n",
+                chunk_idx, raw_audio.size(),
+                (double)raw_audio.size() / model.sample_rate * 1000.0);
+
+    // --- Post-process ---
+    auto processed = postprocess_chunk_audio(
+        raw_audio, chunk, chunk_idx,
+        static_cast<int>(plan.chunks.size()),
+        plan.config, model.sample_rate);
+
+    // --- Crossfade with previous chunk ---
+    if (!prev_tail.empty() && !processed.empty()) {
+        auto crossed = apply_crossfade_smart(
+            prev_tail, processed,
+            chunk.boundary_after,
+            plan.config.crossfade_ms,
+            model.sample_rate);
+        processed = std::move(crossed);
+    }
+
+    // --- Save tail for next crossfade ---
+    out_tail.clear();
+    const int crossfade_samples = (plan.config.crossfade_ms * model.sample_rate) / 1000;
+    if (!processed.empty() && crossfade_samples > 0) {
+        size_t tail_start = processed.size() > static_cast<size_t>(crossfade_samples)
+            ? processed.size() - crossfade_samples
+            : 0;
+        out_tail.assign(processed.begin() + tail_start, processed.end());
+    }
+
+    return processed;
 }
 
-} // namespace
-
 // ---------------------------------------------------------------------------
-// Full streaming synthesis
+// Full streaming synthesis (backward-compatible wrapper)
 // ---------------------------------------------------------------------------
 
 StreamHandle stream_synthesize(
@@ -82,74 +178,33 @@ StreamHandle stream_synthesize(
     handle.thread = std::make_shared<std::thread>(
         [model = &model, text_copy, voice_copy, cb_shared, state_shared,
          speed, mode, user_data]() {
-            // Select config
-            ChunkConfig config = (mode == StreamMode::Interactive)
-                ? make_interactive_config()
-                : make_long_form_config();
 
-            // Tokenize function wrapper
-            TokenizeFn tokenize_fn = [model](const std::string & phonemes,
-                                           std::vector<uint32_t> & ids,
-                                           std::string & error) -> bool {
-                return model->tokenize_phonemes(phonemes, ids, error);
-            };
-
-            // Chunk the text
+            // Phase 1: prepare
             std::string error;
-            auto chunks = chunk_text(text_copy, voice_copy, config, tokenize_fn, error);
-            if (chunks.empty()) {
+            auto plan = prepare_synthesis(*model, text_copy, voice_copy, speed, mode, error);
+            if (plan.chunks.empty()) {
+                std::fprintf(stderr, "[kokopop] prepare_synthesis failed: %s\n", error.c_str());
                 state_shared->done.store(true);
                 return;
             }
 
-            // Generate audio for each chunk
-            std::vector<float> prev_tail; // for crossfade
-            const int crossfade_samples = (config.crossfade_ms * model->sample_rate) / 1000;
+            // Phase 2: infer each chunk
+            std::vector<float> prev_tail;
 
-            std::fprintf(stderr, "[kokopop] streaming: %zu chunks total\n", chunks.size());
-
-            for (int i = 0; i < static_cast<int>(chunks.size()); ++i) {
+            for (int i = 0; i < static_cast<int>(plan.chunks.size()); ++i) {
                 if (state_shared->stopped.load()) break;
 
-                auto & chunk = chunks[i];
+                std::vector<float> out_tail;
+                auto processed = infer_chunk(
+                    *model, plan, i, prev_tail, out_tail, error);
 
-                std::fprintf(stderr, "[kokopop] chunk[%d/%d]: %d tokens, phonemes=%zu chars\n",
-                            i, static_cast<int>(chunks.size()),
-                            chunk.n_tokens, chunk.phonemes.size());
-
-                // Generate raw audio
-                std::vector<float> raw_audio;
-                if (!generate_chunk(*model, chunk, voice_copy, speed, raw_audio, error)) {
-                    std::fprintf(stderr, "[kokopop] WARNING chunk[%d]: %s — skipping\n", i, error.c_str());
+                if (processed.empty()) {
+                    std::fprintf(stderr, "[kokopop] WARNING chunk[%d]: %s — skipping\n",
+                                i, error.c_str());
                     continue;
                 }
 
-                std::fprintf(stderr, "[kokopop] chunk[%d] synthesized: %zu samples (%.1fms)\n",
-                            i, raw_audio.size(),
-                            (double)raw_audio.size() / model->sample_rate * 1000.0);
-
-                // Post-process
-                auto processed = postprocess_chunk_audio(
-                    raw_audio, chunk, i, static_cast<int>(chunks.size()),
-                    config, model->sample_rate);
-
-                // Apply crossfade with previous chunk
-                if (!prev_tail.empty() && !processed.empty()) {
-                    auto crossed = apply_crossfade_smart(
-                        prev_tail, processed,
-                        chunk.boundary_after,
-                        config.crossfade_ms,
-                        model->sample_rate);
-                    processed = std::move(crossed);
-                }
-
-                // Save tail for next crossfade
-                if (!processed.empty() && crossfade_samples > 0) {
-                    size_t tail_start = processed.size() > static_cast<size_t>(crossfade_samples)
-                        ? processed.size() - crossfade_samples
-                        : 0;
-                    prev_tail.assign(processed.begin() + tail_start, processed.end());
-                }
+                prev_tail = std::move(out_tail);
 
                 // Call callback
                 bool continue_streaming = (*cb_shared)(
@@ -199,54 +254,33 @@ void IncrementalStreamer::flush() {
     std::string text = std::move(buffer_);
     buffer_.clear();
 
-    ChunkConfig config = (mode_ == StreamMode::Interactive)
-        ? make_interactive_config()
-        : make_long_form_config();
-
-    TokenizeFn tokenize_fn = [&](const std::string & phonemes,
-                                   std::vector<uint32_t> & ids,
-                                   std::string & error) -> bool {
-        return model_.tokenize_phonemes(phonemes, ids, error);
-    };
-
+    // Phase 1: prepare
     std::string error;
-    auto chunks = chunk_text(text, voice_, config, tokenize_fn, error);
-    if (chunks.empty()) return;
+    auto plan = prepare_synthesis(model_, text, voice_, speed_, mode_, error);
+    if (plan.chunks.empty()) {
+        if (!error.empty()) {
+            std::fprintf(stderr, "[kokopop] prepare error: %s\n", error.c_str());
+        }
+        return;
+    }
 
+    // Phase 2: infer each chunk
     std::vector<float> prev_tail;
-    const int crossfade_samples = (config.crossfade_ms * model_.sample_rate) / 1000;
 
-    for (int i = 0; i < static_cast<int>(chunks.size()); ++i) {
+    for (int i = 0; i < static_cast<int>(plan.chunks.size()); ++i) {
         if (stopped_.load()) break;
 
-        auto & chunk = chunks[i];
-        std::vector<float> raw_audio;
-        if (!generate_chunk(model_, chunk, voice_, speed_, raw_audio, error)) {
+        std::vector<float> out_tail;
+        auto processed = infer_chunk(
+            model_, plan, i, prev_tail, out_tail, error);
+
+        if (processed.empty()) {
             std::fprintf(stderr, "[kokopop] WARNING chunk[%d]: %s — skipping\n",
                         chunk_counter_, error.c_str());
             continue;
         }
 
-        auto processed = postprocess_chunk_audio(
-            raw_audio, chunk, chunk_counter_,
-            chunk_counter_ + static_cast<int>(chunks.size()),
-            config, model_.sample_rate);
-
-        if (!prev_tail.empty() && !processed.empty()) {
-            auto crossed = apply_crossfade_smart(
-                prev_tail, processed,
-                chunk.boundary_after,
-                config.crossfade_ms,
-                model_.sample_rate);
-            processed = std::move(crossed);
-        }
-
-        if (!processed.empty() && crossfade_samples > 0) {
-            size_t tail_start = processed.size() > static_cast<size_t>(crossfade_samples)
-                ? processed.size() - crossfade_samples
-                : 0;
-            prev_tail.assign(processed.begin() + tail_start, processed.end());
-        }
+        prev_tail = std::move(out_tail);
 
         callback_(processed.data(), processed.size(), chunk_counter_, user_data_);
         ++chunk_counter_;

@@ -102,6 +102,18 @@ std::vector<Chunk> chunk_text(
     std::string & error);
 
 // ---------------------------------------------------------------------------
+// Memory management helpers
+// ---------------------------------------------------------------------------
+
+/// Free the internal data of a chunk after it has been inferred.
+/// This releases the phonemes string and tokens vector to reduce memory
+/// usage during long streaming sessions.  The n_tokens and boundary_after
+/// fields are preserved for diagnostic purposes.
+///
+/// Call this AFTER infer_chunk() has completed for the given chunk.
+void clear_chunk_data(Chunk & chunk);
+
+// ---------------------------------------------------------------------------
 // Boundary helpers
 // ---------------------------------------------------------------------------
 bool is_strong_boundary(Boundary b);

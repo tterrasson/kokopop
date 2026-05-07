@@ -431,4 +431,24 @@ std::vector<Chunk> chunk_text(
     return chunks;
 }
 
+// ---------------------------------------------------------------------------
+// Memory management
+// ---------------------------------------------------------------------------
+
+void clear_chunk_data(Chunk & chunk) {
+    // Free phonemes and tokens (largest memory consumers)
+    // Use shrink_to_fit to actually release memory back to the system
+    chunk.phonemes.clear();
+    {
+        std::string empty;
+        empty.swap(chunk.phonemes);
+    }
+    chunk.tokens.clear();
+    {
+        std::vector<uint32_t> empty;
+        empty.swap(chunk.tokens);
+    }
+    // Keep n_tokens and boundary_after for diagnostics
+}
+
 } // namespace kokopop

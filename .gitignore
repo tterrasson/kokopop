@@ -32,6 +32,7 @@ profile.json.gz
 .vscode/settings.json
 .vscode/c_cpp_properties.json
 .vscode/*.code-snippets
+.pi
 
 # Claude AI
 .claude/settings.local.json

@@ -120,6 +120,11 @@ set(_kokopop_streaming_sources
   src/streaming/streaming.cpp
 )
 
+# STDIO streaming module
+set(_kokopop_stdio_sources
+  src/stdio/stdio_stream.cpp
+)
+
 # Playback module
 set(_kokopop_playback_sources
   src/playback/playback_stdout.cpp
@@ -140,6 +145,7 @@ add_library(kokopop
   ${_kokopop_synthesis_sources}
   ${_kokopop_audio_sources}
   ${_kokopop_streaming_sources}
+  ${_kokopop_stdio_sources}
   ${_kokopop_playback_sources}
   src/kokopop.cpp
 )
@@ -150,6 +156,7 @@ target_include_directories(kokopop
     $<INSTALL_INTERFACE:include>
   PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    $<BUILD_INTERFACE:${yyjson_SOURCE_DIR}/src>
     ${CMAKE_CURRENT_SOURCE_DIR}/src/core
     ${CMAKE_CURRENT_SOURCE_DIR}/src/model
     ${CMAKE_CURRENT_SOURCE_DIR}/src/inference
@@ -159,6 +166,7 @@ target_include_directories(kokopop
     ${CMAKE_CURRENT_SOURCE_DIR}/src/audio
     ${CMAKE_CURRENT_SOURCE_DIR}/src/backend
     ${CMAKE_CURRENT_SOURCE_DIR}/src/streaming
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/stdio
     ${CMAKE_CURRENT_SOURCE_DIR}/src/playback
     ${KOKOPOP_ESPEAK_INCLUDE_DIRS}
 )
@@ -168,6 +176,7 @@ target_link_libraries(kokopop
     ggml
     Threads::Threads
     ${KOKOPOP_ESPEAK_LIBRARIES}
+    yyjson
 )
 
 if(APPLE AND KOKOPOP_HAS_COREAUDIO)
@@ -222,7 +231,12 @@ if(KOKOPOP_BUILD_TOOLS)
   target_link_libraries(kokopop_probe PRIVATE kokopop)
 
   # Streaming tool (stdio + HTTP server)
-  add_executable(kokopop_stream tools/kokopop_stream.cpp src/http/http_server.cpp)
+  add_executable(kokopop_stream
+    tools/kokopop_stream.cpp
+    src/http/http_server.cpp
+    src/http/async_server.cpp
+    src/http/synthesis_scheduler.cpp
+  )
   target_include_directories(kokopop_stream PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/src/core
@@ -233,6 +247,7 @@ if(KOKOPOP_BUILD_TOOLS)
     ${CMAKE_CURRENT_SOURCE_DIR}/src/audio
     ${CMAKE_CURRENT_SOURCE_DIR}/src/backend
     ${CMAKE_CURRENT_SOURCE_DIR}/src/streaming
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/stdio
     ${CMAKE_CURRENT_SOURCE_DIR}/src/playback
     ${CMAKE_CURRENT_SOURCE_DIR}/src/http
     ${CMAKE_CURRENT_SOURCE_DIR}/include

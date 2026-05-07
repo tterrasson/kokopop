@@ -158,6 +158,8 @@ def main():
     parser.add_argument("--total", type=int, default=50,
                         help="Total requests to send")
     parser.add_argument("--voice", default="af_heart")
+    parser.add_argument("--repeat", type=int, default=1,
+                        help="Repeat each sample text N times to artificially lengthen it")
     parser.add_argument("--sequential", action="store_true",
                         help="Run sequentially (no concurrency)")
     args = parser.parse_args()
@@ -174,7 +176,7 @@ def main():
     # Build request list
     requests_to_send = []
     for i in range(args.total):
-        text = SAMPLE_TEXTS[i % len(SAMPLE_TEXTS)]
+        text = SAMPLE_TEXTS[i % len(SAMPLE_TEXTS)] * args.repeat
         # Vary speed a bit
         requests_to_send.append({
             "idx": i,

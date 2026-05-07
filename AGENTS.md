@@ -22,7 +22,7 @@ src/
   playback/       Stdout + Core Audio (macOS) playback
 tools/
   kokopop_say              Synthesize text → WAV or play directly
-  kokopop_stdio_stream     JSON-streamed TTS (stdin → stdout)
+  kokopop_stream           STDIO streaming (stdin → stdout) + async HTTP server
   kokopop_play             Play raw audio from stdin
   convert_kokoro_to_gguf.py  Export Kokoro PyTorch model → GGUF
   export_pinyin_dict.py      Generate pinyin dictionary for zh_g2p
@@ -60,8 +60,21 @@ cmake --build build
 # Synthesize text to WAV
 ./build/kokopop_say --model models/kokoro-md.gguf --voice af_heart --text "Hello!" --out hello.wav
 
-# Streaming (JSON on stdin → audio on stdout)
-echo '{"text": "Hello!"}' | ./build/kokopop_stdio_stream --model models/kokoro-md.gguf --voice af_heart --mode long_form
+# STDIO streaming (JSON on stdin → audio on stdout)
+echo '{"text": "Hello!"}' | ./build/kokopop_stream --model models/kokoro-md.gguf --voice af_heart --mode long_form
+
+# HTTP server mode (async)
+./build/kokopop_stream --model models/kokoro-md.gguf --voice af_heart --http --port 8080
+
+# /tts — stream raw PCM float32 (default)
+curl -X POST http://localhost:8080/tts \
+  -H 'Content-Type: application/json' \
+  -d '{"text": "Hello!", "voice": "af_heart"}' -o out.raw
+
+# /tts — receive a complete WAV file
+curl -X POST http://localhost:8080/tts \
+  -H 'Content-Type: application/json' \
+  -d '{"text": "Hello!", "voice": "af_heart", "format": "wav"}' -o out.wav
 ```
 
 ### Tests

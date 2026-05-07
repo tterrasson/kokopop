@@ -45,6 +45,8 @@ uv run python tools/convert_kokoro_to_gguf.py \
   --tier kokoro-md
 ```
 
+> **Note:** The Kokoro PyTorch model is automatically downloaded from [Hugging Face](https://huggingface.co/hexgrad/Kokoro-82M) on first run.
+
 Two tiers are available:
 
 | Tier        | Description                          |
@@ -112,7 +114,7 @@ See `kokopop_play --help` for format options (pcm-f32, pcm-s16, wav).
 
 ### Streaming mode
 
-The `kokopop_stream` tool supports two operating modes: **STDIO** (default) and **HTTP server**.
+The `kokopop_stream` tool supports two operating modes: **STDIO** (default) and **HTTP server** (async, event-driven).
 
 #### STDIO mode (default)
 
@@ -126,7 +128,7 @@ echo '{"text": "Hello world", "flush": true}' | \
     --voice af_heart \
     --mode long_form
 
-# Save full output to WAV
+# Save full output to WAV (accumulates all chunks, writes WAV on exit)
 echo '{"text": "Hello world", "flush": true}' | \
   ./kokopop_stream \
     --model models/kokoro.gguf \
@@ -143,9 +145,9 @@ JSON protocol (one command per line):
 | `{"flush": true}` | Generate all accumulated text |
 | `{"stop": true}` | Stop streaming |
 
-#### HTTP server mode
+#### HTTP server mode (async)
 
-Start a local HTTP server for TTS synthesis:
+Start an async, event-driven HTTP server for TTS synthesis. Uses `poll()` for non-blocking I/O with a `SynthesisScheduler` for round-robin chunk interleaving across concurrent requests:
 
 ```bash
 ./kokopop_stream \
@@ -155,22 +157,84 @@ Start a local HTTP server for TTS synthesis:
   --port 8080
 ```
 
+**Options:**
+
+| Option | Default | Description |
+|---|---|---|
+| `--http` | — | Run in HTTP server mode |
+| `--port N` | `8080` | Server port |
+| `--bind ADDR` | `127.0.0.1` | Bind address |
+
 Available endpoints:
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/tts` | `POST` | Synthesize text to WAV audio |
+| `/tts` | `POST` | Synthesize text to audio — PCM float32 stream or complete WAV file |
 | `/health` | `GET` | Server health check |
-| `/voices` | `GET` | List available voices |
+| `/voices` | `GET` | Voice info (model does not expose voice list) |
 
-Example request:
+Example requests:
 
 ```bash
+# Stream raw PCM float32 (default) — chunked transfer encoding
 curl -X POST http://localhost:8080/tts \
   -H 'Content-Type: application/json' \
   -d '{"text": "Hello world", "voice": "ff_siwis", "speed": 1.0}' \
+  -o output.raw
+
+# Convert PCM to WAV with ffmpeg:
+ffmpeg -f f32le -ar 24000 -ac 1 -i output.raw output.wav
+
+# Request a complete WAV file directly (buffered server-side)
+curl -X POST http://localhost:8080/tts \
+  -H 'Content-Type: application/json' \
+  -d '{"text": "Hello world", "voice": "ff_siwis", "format": "wav"}' \
   -o output.wav
 ```
+
+Request body fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `text` | string | **Required** — text to synthesize |
+| `voice` | string | Override default voice (e.g., `ff_siwis`) |
+| `speed` | float | Synthesis speed (default: from CLI `--speed`) |
+| `mode` | string | `interactive` (default) or `long_form` |
+| `format` | string | `pcm` (default) — raw float32 stream; `wav` — complete WAV file |
+
+#### Python client (`tools/tts_client.py`)
+
+A minimal Python client is provided. It requires no third-party packages.
+
+```bash
+# Start the server first
+./kokopop_stream --model models/kokoro.gguf --voice ff_siwis --http --port 8080
+
+# Stream PCM and play in real time (requires ffplay)
+uv run python tools/tts_client.py "Hello world" | \
+  ffplay -f f32le -ar 24000 -ac 1 -nodisp -
+
+# Stream PCM and save as WAV (client-side conversion)
+uv run python tools/tts_client.py "Hello world" --out hello.wav
+
+# Receive a complete WAV file from the server
+uv run python tools/tts_client.py "Hello world" --format wav --out hello.wav
+
+# Override voice and speed
+uv run python tools/tts_client.py "Bonjour le monde" \
+  --voice ff_siwis --speed 1.2 --format wav --out bonjour.wav
+```
+
+All options:
+
+| Option | Default | Description |
+|---|---|---|
+| `--url` | `http://127.0.0.1:8080/tts` | Server URL |
+| `--voice` | server default | Voice name |
+| `--speed` | `1.0` | Speed multiplier |
+| `--mode` | `interactive` | `interactive` or `long_form` |
+| `--format` | `pcm` | `pcm` (float32 stream) or `wav` (complete file) |
+| `--out` | — | Output file; if omitted, raw bytes go to stdout |
 
 ## Library Integration
 
@@ -211,7 +275,7 @@ src/         — Source code
   playback/  — Audio playback (stdout, Core Audio on macOS)
 tools/       — CLI tools
   kokopop_say    — Synthesize text/phonemes to WAV or play directly
-  kokopop_stream — JSON-streamed TTS (stdin → stdout) and HTTP server mode
+  kokopop_stream — STDIO streaming (stdin → stdout) and async HTTP server
   kokopop_play   — Play raw audio from stdin
 tests/       — Unit and integration tests
 ```
