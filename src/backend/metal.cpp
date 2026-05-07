@@ -1,4 +1,5 @@
 #include "metal.h"
+#include "metal_lstm.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -39,8 +40,12 @@ static size_t graph_capacity(ggml_cgraph * graph) {
 //       these are direct memcpy, not GPU blits.
 //     - Eliminates the old `pin_weights_cpu_for_cpu_graph` O(n_nodes) loop and
 //       the per-inference Metal→CPU sync that added ~120 ms on generation.
-//   * Scheduler `op_offload=false`: with CPU weights, op_offload=true would
-//     place all CPU-sourced ops on CPU, defeating Metal for the frontend.
+//   * Scheduler `op_offload=false`: ops naturally follow their weight tensors
+//     to CPU.  Metal assignment is done explicitly in pin_graph_cpu_fallbacks:
+//     every node that isn't hard-pinned (unsupported op) or soft-pinned (NORM,
+//     CONV_TRANSPOSE_1D, force_cpu stage) is assigned to Metal with
+//     ggml_backend_sched_set_tensor_backend.  This gives precise control
+//     without relying on the scheduler's heuristic offload path.
 //   * **NO `ggml_backend_sched_reserve`** — the reserve-then-alloc combo
 //     triggers two consecutive `split_graph` calls; tensor copies created
 //     in the 1st are freed by the `ggml_free(sched->ctx)` of the 2nd, and
@@ -79,6 +84,7 @@ class MetalBackend : public Backend {
     ggml_backend_t metal_backend_ = nullptr;
     ggml_backend_t cpu_backend_ = nullptr;
     ggml_backend_sched_t sched_ = nullptr;
+    MetalLstmKernelState * lstm_kernel_ = nullptr;
     size_t sched_capacity_ = 0;
     const char * active_label_ = nullptr;
     int n_input_tokens_ = 0;
@@ -130,9 +136,12 @@ class MetalBackend : public Backend {
     bool force_cpu_for_active_graph() const {
         if (active_label_ == nullptr) return false;
         // Default: `generation` AND `generator` on CPU. Reasons:
-        //   1. `generator`: in hybrid mode (CONV_TRANSPOSE_1D pinned +
-        //      rest Metal), activation Metal↔CPU transitions corrupt
-        //      values (audio "mush" on Bonjour).
+        //   1. `generator`: CONV_TRANSPOSE_1D cannot run on Metal (GPU watchdog
+        //      hang → machine reboot required). In hybrid mode (CONV_TRANSPOSE_1D
+        //      on CPU, rest Metal), Metal's adain/resblock activations exceed F16
+        //      max (65504) at the boundary, causing F32→F16 overflow inside the
+        //      CPU CONV_TRANSPOSE kernel → Inf → vec_dot_f16 assertion crash.
+        //      Pure CPU execution avoids both issues.
         //   2. `generation`: hybrid Metal with pinned NORM explodes wall-clock
         //      (50+ s vs 2 s pure CPU, ~25 GPU sync splits). Additionally
         //      the Metal NORM kernel produces incorrect values for some
@@ -203,12 +212,22 @@ class MetalBackend : public Backend {
     }
 
     void pin_graph_cpu_fallbacks(ggml_cgraph * graph) {
-        // hard_pin       : Metal cannot execute the op (integer, or
+        // Explicit two-way assignment: every node is pinned to either Metal
+        // or CPU.  This is required because the scheduler uses op_offload=false
+        // (ops follow their weight tensors to CPU by default), so without
+        // explicit Metal assignment the frontend would run entirely on CPU.
+        //
+        // hard_pin       : Metal cannot execute the op (integer type, or
         //                  ggml_backend_supports_op=false). No override.
-        // default_unsafe : op that wedges in practice (CONV_TRANSPOSE_1D).
-        //                  Override via ALLOW_OP — at the risk of wedging.
-        // soft_pin       : user-requested pin via FORCE_CPU/PIN_OP.
+        // default_unsafe : op that produces bad values or wedges the GPU in
+        //                  practice (CONV_TRANSPOSE_1D, NORM outside frontend).
+        //                  Override via ALLOW_OP — at user's own risk.
+        // soft_pin       : user-requested pin via FORCE_CPU or PIN_OP env var.
         //                  Override via ALLOW_OP.
+        // metal_assign   : when none of the above apply AND the graph is not
+        //                  force_cpu, explicitly assign to Metal so that the
+        //                  scheduler doesn't silently default to CPU because
+        //                  the weight tensors live in a CPU buffer.
         const bool force_cpu = force_cpu_for_active_graph();
         const char * pin_op  = std::getenv("KOKOPOP_METAL_PIN_OP");
         const char * allow_op = std::getenv("KOKOPOP_METAL_ALLOW_OP");
@@ -225,6 +244,8 @@ class MetalBackend : public Backend {
             const bool allowed        = node_op_in_list(node, allow_op);
             if (hard_pin || ((default_unsafe || soft_pin) && !allowed)) {
                 ggml_backend_sched_set_tensor_backend(sched_, node, cpu_backend_);
+            } else if (!force_cpu) {
+                ggml_backend_sched_set_tensor_backend(sched_, node, metal_backend_);
             }
         }
     }
@@ -287,6 +308,8 @@ public:
                 ggml_backend_free(cpu_backend_);
                 cpu_backend_ = nullptr;
             }
+        } else {
+            lstm_kernel_ = metal_lstm_create();
         }
     }
 
@@ -294,6 +317,10 @@ public:
         if (sched_) {
             ggml_backend_sched_free(sched_);
             sched_ = nullptr;
+        }
+        if (lstm_kernel_) {
+            metal_lstm_destroy(lstm_kernel_);
+            lstm_kernel_ = nullptr;
         }
         if (metal_backend_) {
             ggml_backend_free(metal_backend_);
@@ -323,12 +350,12 @@ public:
             ggml_backend_sched_set_eval_callback(sched_, eval_trace_cb, sched_);
         }
         pin_graph_cpu_fallbacks(graph);
-        // Reserve AFTER pin_graph_cpu_fallbacks so that the split_graph
-        // inside reserve sees the same node→backend assignments as the
-        // split_graph inside alloc_graph below.  Calling reserve before
-        // pinning creates stale copy tensors that get invalidated by the
-        // 2nd split_graph (silent audio symptom).
-        ggml_backend_sched_reserve(sched_, graph);
+        // Do NOT call ggml_backend_sched_reserve here: reserve() calls
+        // ggml_backend_sched_reset() at the end, which clears all backend IDs
+        // back to -1 — erasing the Metal/CPU assignments just made above.
+        // alloc_graph → alloc_splits handles reservation internally when it
+        // detects backend_ids_changed=1 (first Metal run), using the IDs that
+        // split_graph preserved from pin_graph_cpu_fallbacks.
         const bool ok = ggml_backend_sched_alloc_graph(sched_, graph);
         if (ok) {
             log_sched_sizes("alloc");
@@ -433,6 +460,17 @@ public:
 
     void set_input_tokens(int n) override {
         n_input_tokens_ = n;
+    }
+
+    void preload_lstm_whh(const std::string & key,
+                          const float * w_hh_f32, int H, int four_H) override {
+        if (lstm_kernel_) {
+            metal_lstm_preload_whh(lstm_kernel_, key.c_str(), w_hh_f32, H, four_H);
+        }
+    }
+
+    void * metal_lstm_kernel() const override {
+        return lstm_kernel_;
     }
 
     ggml_backend_buffer_type_t weight_buffer_type() const override {

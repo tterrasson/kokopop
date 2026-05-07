@@ -349,6 +349,24 @@ void Model::preload_tensor_cache() {
             cache_adain_resblk(p);
         }
     }
+
+    // Dequantize all LSTM w_hh tensors (Q5_K → F32) for the fused LSTM kernel.
+    // Iterates the full tensor map once; only matches "weight_hh_l0" entries.
+    // On Metal, also uploads each matrix into a persistent MTLBuffer via the backend.
+    lstm_w_hh_f32.clear();
+    for (const auto & kv : tensors) {
+        const std::string & name = kv.first;
+        if (name.find("weight_hh_l0") == std::string::npos) continue;
+        ggml_tensor * t = kv.second;
+        if (t == nullptr) continue;
+        std::vector<float> f32;
+        if (tensor_to_f32(*backend, t, f32)) {
+            const int H      = static_cast<int>(t->ne[0]);
+            const int four_H = static_cast<int>(t->ne[1]);
+            backend->preload_lstm_whh(name, f32.data(), H, four_H);
+            lstm_w_hh_f32.emplace(name, std::move(f32));
+        }
+    }
 }
 
 ggml_tensor * Model::cached_tensor(const std::string & logical_name) const {

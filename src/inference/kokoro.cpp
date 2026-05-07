@@ -8,6 +8,7 @@
 #include <cstring>
 #include <limits>
 #include <new>
+#include <ggml.h>
 #include <numeric>
 #include <thread>
 
@@ -187,6 +188,11 @@ bool run_kokoro_frontend_probe(
         ctx, ggml_view_1d(ctx, voice, 128,
             128 * voice->nb[0] + voice_row * voice->nb[1]),
         GGML_TYPE_F32);
+
+    // Pre-reserve LstmCustomParams storage before graph construction so that
+    // pointers into the vector remain stable while lstm_direction() pushes.
+    model.lstm_custom_params.clear();
+    model.lstm_custom_params.reserve(24);
 
     ggml_tensor * d = duration_encoder(ctx, model, cur, style, n_tokens, error);
     if (d == nullptr) {
@@ -467,18 +473,39 @@ bool run_kokoro_generation_probe(
     ggml_set_name(decoder_cur, "kokopop_decoder_probe");
     ggml_set_output(decoder_cur);
 
+    const bool gen_profile = std::getenv("KOKOPOP_GEN_PROFILE") != nullptr;
+    int64_t t_build = 0, t_alloc = 0, t_compute = 0;
+
+    // Clear and pre-reserve storage for LstmCustomParams built during graph
+    // construction (lstm_direction pushes one entry per direction call).
+    // Reserve 24 slots so that no reallocation occurs while the graph is being
+    // built, keeping the stored pointers stable until after compute().
+    model.lstm_custom_params.clear();
+    model.lstm_custom_params.reserve(24);
+
+    int64_t t0 = gen_profile ? ggml_time_us() : 0;
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, generation_graph_size(total_frames, n_tokens), false);
     ggml_build_forward_expand(gf, f0_curve);
     ggml_build_forward_expand(gf, n_curve);
     ggml_build_forward_expand(gf, asr);
     ggml_build_forward_expand(gf, decoder_cur);
+    if (gen_profile) {
+        t_build = ggml_time_us() - t0;
+        std::fprintf(stderr, "[gen-profile] n_nodes=%d  build=%.1fms\n",
+            ggml_graph_n_nodes(gf), t_build / 1000.0);
+    }
 
     model.backend->set_active_label("generation");
     model.backend->sched_reset();
+    t0 = gen_profile ? ggml_time_us() : 0;
     if (!model.backend->sched_alloc_graph(gf)) {
         ggml_free(ctx);
         error = "ggml generation backend allocation failed";
         return false;
+    }
+    if (gen_profile) {
+        t_alloc = ggml_time_us() - t0;
+        std::fprintf(stderr, "[gen-profile] sched_alloc=%.1fms\n", t_alloc / 1000.0);
     }
     if (!model.backend->apply_pending_inits()) {
         ggml_free(ctx);
@@ -494,7 +521,13 @@ bool run_kokoro_generation_probe(
         model.backend->tensor_set(duration_pred, frontend.hidden.data(),   0, ggml_nbytes(duration_pred));
         model.backend->tensor_set(duration_mask, mask_data.data(),         0, ggml_nbytes(duration_mask));
     }
+    t0 = gen_profile ? ggml_time_us() : 0;
     ggml_status status = model.backend->compute(ctx, gf);
+    if (gen_profile) {
+        t_compute = ggml_time_us() - t0;
+        std::fprintf(stderr, "[gen-profile] compute=%.1fms  total=%.1fms\n",
+            t_compute / 1000.0, (t_build + t_alloc + t_compute) / 1000.0);
+    }
 
     if (status != GGML_STATUS_SUCCESS) {
         ggml_free(ctx);

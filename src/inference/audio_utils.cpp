@@ -4,8 +4,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <ggml.h>
 #include <new>
 #include <numeric>
 
@@ -421,16 +424,28 @@ bool ggml_generator(
         return false;
     }
 
+    const bool gen_profile = std::getenv("KOKOPOP_GEN_PROFILE") != nullptr;
+
+    int64_t t0g = gen_profile ? ggml_time_us() : 0;
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, generator_graph_size(decoder.length), false);
     ggml_set_output(post);
     ggml_build_forward_expand(gf, post);
+    if (gen_profile) {
+        std::fprintf(stderr, "[gen-profile] generator n_nodes=%d  build=%.1fms\n",
+            ggml_graph_n_nodes(gf), (ggml_time_us() - t0g) / 1000.0);
+    }
 
     model.backend->set_active_label("generator");
     model.backend->sched_reset();
+    t0g = gen_profile ? ggml_time_us() : 0;
     if (!model.backend->sched_alloc_graph(gf)) {
         ggml_free(ctx);
         error = "ggml generator backend allocation failed";
         return false;
+    }
+    if (gen_profile) {
+        std::fprintf(stderr, "[gen-profile] generator sched_alloc=%.1fms\n",
+            (ggml_time_us() - t0g) / 1000.0);
     }
     if (!model.backend->apply_pending_inits()) {
         ggml_free(ctx);
@@ -440,7 +455,12 @@ bool ggml_generator(
     model.backend->tensor_set(x,       decoder.data.data(), 0, decoder.data.size() * sizeof(float));
     model.backend->tensor_set(style_t, style.data(),        0, style.size()        * sizeof(float));
     model.backend->tensor_set(har_t,   har.data.data(),     0, har.data.size()     * sizeof(float));
+    t0g = gen_profile ? ggml_time_us() : 0;
     ggml_status status = model.backend->compute(ctx, gf);
+    if (gen_profile) {
+        std::fprintf(stderr, "[gen-profile] generator compute=%.1fms\n",
+            (ggml_time_us() - t0g) / 1000.0);
+    }
 
     if (status != GGML_STATUS_SUCCESS) {
         ggml_free(ctx);

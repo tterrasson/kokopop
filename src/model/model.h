@@ -1,6 +1,7 @@
 #pragma once
 
 #include "backend/backend.h"
+#include "inference/lstm_fused.h"
 #include "kokopop.h"
 
 #include <cstdint>
@@ -136,6 +137,19 @@ struct Model {
     std::vector<float> tmp_stft_har_f32;     // harmonic STFT magnitude + phase
     std::vector<float> tmp_istft_y_f32;      // overlap-add accumulator
     std::vector<float> tmp_istft_denom_f32;  // window energy denominator
+
+    // Pre-dequantized LSTM recurrent weight matrices (w_hh Q5_K → F32).
+    // Key = tensor logical name (e.g. "kokopop.text_encoder.lstm.weight_hh_l0").
+    // Populated once by preload_tensor_cache(); stable thereafter (no reallocation
+    // after insertion).
+    std::unordered_map<std::string, std::vector<float>> lstm_w_hh_f32;
+
+    // Scratch storage for LstmCustomParams instances built during graph
+    // construction.  Reserve 24 slots before building the generation graph
+    // (12 LSTM directions × safety margin) so no reallocation occurs and
+    // stored pointers remain valid until after graph execution.
+    // See graph_ops.cpp::lstm_direction for usage.
+    std::vector<struct LstmCustomParams> lstm_custom_params;
 
     // Lazily cached inference constants derived from immutable model weights.
     std::unordered_map<std::string, std::vector<float>> depthwise_pool_kernels;

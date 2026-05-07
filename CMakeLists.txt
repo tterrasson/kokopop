@@ -84,6 +84,7 @@ set(_kokopop_backend_sources
 )
 if(KOKOPOP_ENABLE_METAL)
   list(APPEND _kokopop_backend_sources src/backend/metal.cpp)
+  list(APPEND _kokopop_backend_sources src/backend/metal_lstm.mm)
 endif()
 
 # Model module (GGUF loading)
@@ -96,6 +97,7 @@ set(_kokopop_inference_sources
   src/inference/kokoro.cpp
   src/inference/graph_ops.cpp
   src/inference/audio_utils.cpp
+  src/inference/lstm_fused.cpp
 )
 
 # Synthesis module (phonemization + chunking + main synth)
@@ -178,6 +180,10 @@ endif()
 
 if(KOKOPOP_ENABLE_METAL)
   target_compile_definitions(kokopop PUBLIC KOKOPOP_HAS_METAL)
+  target_link_libraries(kokopop PRIVATE
+    "-framework Metal"
+    "-framework Foundation"
+  )
   message(STATUS "kokopop: Metal backend enabled")
 else()
   message(STATUS "kokopop: Metal backend disabled (CPU-only)")

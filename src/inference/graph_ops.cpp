@@ -1,4 +1,5 @@
 #include "kokoro.h"
+#include "lstm_fused.h"
 
 #include "core/constants.h"
 
@@ -512,94 +513,46 @@ ggml_tensor * lstm_direction(
         ggml_mul_mat(ctx, w.w_ih_packed, input),
         w.b_ih_packed);
 
-    // --- Pre-allocate output buffer and initialize h, c ---
+    // Fused LSTM: replace the per-timestep ggml graph loop (n_steps × ~18 nodes
+    // per direction) with a single custom2 node that runs the full recurrence in
+    // one C++ callback or Metal compute shader.
     //
-    // NOTE on ggml_set_2d in the loop below:
-    // GGML has no fused LSTM primitive, so we express the sequential recurrence
-    // as a graph of per-timestep nodes.  Each iteration emits one ggml_set_2d
-    // that copies h_t into column t of the pre-allocated output buffer.
-    //
-    // Cost: n_steps graph nodes per direction.  Across the full model:
-    //   text_encoder.lstm             → 2 directions
-    //   predictor.text_encoder.lstms → 3 × 2 directions
-    //   predictor.lstm               → 2 directions
-    //   predictor.shared             → 2 directions
-    // Total: 12 × n_steps set_2d calls.  On GPU (Metal) each is a kernel
-    // launch with a potential memory bounce.  This is a known hot spot.
-    //
-    // Ideal fix: a fused LSTM kernel (backend-specific) that runs the
-    // entire recurrence natively and writes the [hidden, n_steps] output
-    // in one pass, eliminating all set_2d nodes.
-    //
-    // Pragmatic fix (applied): output buffer allocated once outside the
-    // loop; columns are written in-place via set_2d.  This avoids
-    // per-iteration buffer reallocation.
+    // LstmCustomParams must outlive graph execution.  We store it in
+    // model.lstm_custom_params (pre-reserved before graph construction in
+    // run_kokoro_generation_probe) so the pointer is stable after push_back.
+    const std::string whh_key =
+        prefix + ".weight_hh_l0" + (reverse ? "_reverse" : "");
+    const auto it = model.lstm_w_hh_f32.find(whh_key);
+    if (it == model.lstm_w_hh_f32.end()) {
+        error = "fused LSTM: w_hh not preloaded for " + whh_key;
+        return nullptr;
+    }
+
+    // b_hh_packed is a F32 tensor in the CPU weight buffer; ->data is a valid
+    // CPU pointer for the lifetime of the model.
+    const float * b_hh_ptr = static_cast<const float *>(w.b_hh_packed->data);
+
+    model.lstm_custom_params.push_back({
+        it->second.data(),                     // w_hh_f32
+        b_hh_ptr,                              // b_hh
+        model.backend->metal_lstm_kernel(),    // metal_kernel (null on CPU)
+        it->first.c_str(),                     // whh_key (key stable in lstm_w_hh_f32)
+        hidden,                                // hidden
+        n_steps,                               // n_steps
+        reverse                                // reverse
+    });
+    const LstmCustomParams * params = &model.lstm_custom_params.back();
+
     ggml_tensor * output = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, n_steps);
     model.backend->queue_zero_tensor(output);
 
-    ggml_tensor * h = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, 1);
-    ggml_tensor * c = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, 1);
-    model.backend->queue_zero_tensor(h);
-    model.backend->queue_zero_tensor(c);
-
-    for (int64_t step = 0; step < n_steps; ++step) {
-        const int64_t t = reverse ? n_steps - 1 - step : step;
-
-        // pre_gates_t: [4 * hidden, 1]
-        ggml_tensor * pre_gates_t = col_view(ctx, pre_input_gates_packed, t);
-
-        // recurrent_gates: [4 * hidden, 1]
-        ggml_tensor * recurrent_gates = ggml_add(ctx,
-            ggml_mul_mat(ctx, w.w_hh_packed, h),
-            w.b_hh_packed);
-
-        // combined:
-        // [W_ii x_t + b_ii + W_hi h + b_hi,
-        //  W_if x_t + b_if + W_hf h + b_hf,
-        //  W_ig x_t + b_ig + W_hg h + b_hg,
-        //  W_io x_t + b_io + W_ho h + b_ho]
-        ggml_tensor * combined = ggml_add(ctx, pre_gates_t, recurrent_gates);
-
-        // combined is [4 * hidden, 1].
-        // The 4 gates are concatenated along axis 0.
-        //
-        // ggml_view_2d(ctx, src, ne0, ne1, nb1, offset)
-        // - ne0    = gate size = hidden
-        // - ne1    = 1 column
-        // - nb1    = column stride of the source tensor
-        // - offset = start of the gate along axis 0
-        const size_t nb0 = combined->nb[0];
-        const size_t nb1 = combined->nb[1];
-
-        ggml_tensor * i_gate = ggml_sigmoid(ctx,
-            ggml_view_2d(ctx, combined, hidden, 1, nb1, 0));
-
-        ggml_tensor * f_gate = ggml_sigmoid(ctx,
-            ggml_view_2d(ctx, combined, hidden, 1, nb1, hidden * nb0));
-
-        ggml_tensor * g_gate = ggml_tanh(ctx,
-            ggml_view_2d(ctx, combined, hidden, 1, nb1, 2 * hidden * nb0));
-
-        ggml_tensor * o_gate = ggml_sigmoid(ctx,
-            ggml_view_2d(ctx, combined, hidden, 1, nb1, 3 * hidden * nb0));
-
-        c = ggml_add(ctx,
-            ggml_mul(ctx, f_gate, c),
-            ggml_mul(ctx, i_gate, g_gate));
-
-        h = ggml_mul(ctx, o_gate, ggml_tanh(ctx, c));
-
-        // Write h_t into column t of the output buffer.
-        // See the NOTE above on the set_2d performance trade-off.
-        // Keep the assignment: ggml_set_2d creates a graph node that must be
-        // retained for the buffer to be materialized during graph execution.
-        output = ggml_set_2d(
-            ctx,
-            output,
-            h,
-            output->nb[1],
-            static_cast<size_t>(t) * output->nb[1]);
-    }
+    output = ggml_map_custom2_inplace(
+        ctx,
+        output,
+        pre_input_gates_packed,
+        lstm_fused_callback,
+        1,
+        const_cast<LstmCustomParams *>(params));
 
     return output;
 }

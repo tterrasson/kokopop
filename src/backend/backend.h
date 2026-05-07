@@ -78,6 +78,21 @@ struct Backend {
     // benefits above a minimum batch size). Default: no-op.
     virtual void set_input_tokens(int n_tokens) { (void)n_tokens; }
 
+    // Pre-load a dequantized LSTM recurrent weight matrix for the fused LSTM
+    // kernel.  Called once per LSTM direction at model-load time.
+    //   key     : logical tensor name (e.g. "kokopop.text_encoder.lstm.weight_hh_l0")
+    //   w_hh_f32: [H, 4*H] F32 (ggml col-major: ne[0]=H is fast dim)
+    //   H / four_H: hidden size and 4*hidden
+    // Default: no-op (CPU backend runs the recurrence entirely in C++).
+    virtual void preload_lstm_whh(const std::string & key,
+                                   const float * w_hh_f32, int H, int four_H) {
+        (void)key; (void)w_hh_f32; (void)H; (void)four_H;
+    }
+
+    // Return the fused LSTM kernel handle cast to void* (null for CPU backend).
+    // Used by graph_ops::lstm_direction to fill LstmCustomParams::metal_kernel.
+    virtual void * metal_lstm_kernel() const { return nullptr; }
+
     // ---- Context sizing ----
 
     // Memory bytes needed for a generation scratch context.
