@@ -16,7 +16,6 @@
 #import <Metal/Metal.h>
 #include <unordered_map>
 #include <string>
-#include <vector>
 #include <cstring>
 #include <cstdio>
 
@@ -100,18 +99,21 @@ struct MetalLstmKernelState {
     // Pre-loaded W_hh buffers keyed by LSTM direction name.
     std::unordered_map<std::string, id<MTLBuffer>> whh_buffers;
 
-    // Scratch buffers for per-inference copies (pre_gates, b_hh, output).
+    // Scratch buffers for the synchronous metal_lstm_run path.
     // Re-used across calls if size fits; reallocated otherwise.
     id<MTLBuffer> pre_gates_buf = nil;
     id<MTLBuffer> b_hh_buf      = nil;
     id<MTLBuffer> output_buf    = nil;
 
-    // Persistent scalar parameter buffers (4 bytes each, never reallocated).
-    id<MTLBuffer> h_buf   = nil;
-    id<MTLBuffer> n_buf   = nil;
-    id<MTLBuffer> rev_buf = nil;
-
     bool valid = false;
+};
+
+// Per in-flight async dispatch (returned as MetalLstmHandle).
+struct MetalLstmInflight {
+    id<MTLCommandBuffer> cmd;
+    id<MTLBuffer>        out_staging; // GPU-shared output buffer
+    float*               dst;         // caller's destination pointer
+    size_t               out_bytes;
 };
 
 // ---------------------------------------------------------------------------
@@ -172,17 +174,6 @@ MetalLstmKernelState * metal_lstm_create() {
         return nullptr;
     }
 
-    // Allocate persistent scalar buffers once (H, N, rev — 4 bytes each).
-    const NSUInteger scalar_len = sizeof(uint);
-    s->h_buf   = [s->device newBufferWithLength:scalar_len options:MTLResourceStorageModeShared];
-    s->n_buf   = [s->device newBufferWithLength:scalar_len options:MTLResourceStorageModeShared];
-    s->rev_buf = [s->device newBufferWithLength:scalar_len options:MTLResourceStorageModeShared];
-    if (!s->h_buf || !s->n_buf || !s->rev_buf) {
-        fprintf(stderr, "[metal_lstm] failed to allocate scalar parameter buffers\n");
-        delete s;
-        return nullptr;
-    }
-
     s->valid = true;
     return s;
 }
@@ -209,6 +200,117 @@ void metal_lstm_preload_whh(
     s->whh_buffers[key] = buf;
 }
 
+// ---------------------------------------------------------------------------
+// Internal: encode one LSTM dispatch into a command buffer.
+// Does NOT commit. Caller owns cmd lifecycle.
+// ---------------------------------------------------------------------------
+static bool encode_lstm(
+    MetalLstmKernelState   * s,
+    id<MTLCommandBuffer>     cmd,
+    id<MTLBuffer>            pre_gates_buf,
+    id<MTLBuffer>            b_hh_buf,
+    id<MTLBuffer>            out_buf,
+    id<MTLBuffer>            whh_buf,
+    int H, int N, bool reverse)
+{
+    const uint params_H   = static_cast<uint>(H);
+    const uint params_N   = static_cast<uint>(N);
+    const uint params_rev = reverse ? 1u : 0u;
+
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    [enc setComputePipelineState:s->pipeline];
+    [enc setBuffer:out_buf       offset:0 atIndex:0];
+    [enc setBuffer:pre_gates_buf offset:0 atIndex:1];
+    [enc setBuffer:whh_buf       offset:0 atIndex:2];
+    [enc setBuffer:b_hh_buf      offset:0 atIndex:3];
+    // Scalars < 4 KB go inline into the command buffer via setBytes —
+    // no MTLBuffer allocation or memcpy into a persistent buffer needed.
+    [enc setBytes:&params_H   length:sizeof(uint) atIndex:4];
+    [enc setBytes:&params_N   length:sizeof(uint) atIndex:5];
+    [enc setBytes:&params_rev length:sizeof(uint) atIndex:6];
+
+    const NSUInteger tpg = static_cast<NSUInteger>(4 * H);
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+    [enc endEncoding];
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Async API: submit without blocking.
+// Returns an opaque handle; caller must pass it to metal_lstm_collect().
+// Allows forward + backward of the same layer to run concurrently:
+//   MetalLstmHandle hf = metal_lstm_submit(s, "fwd", ...);
+//   MetalLstmHandle hb = metal_lstm_submit(s, "bwd", ...);
+//   metal_lstm_collect(hf);  // waits once for both — Metal overlaps them
+//   metal_lstm_collect(hb);
+// ---------------------------------------------------------------------------
+MetalLstmHandle metal_lstm_submit(
+    MetalLstmKernelState * s,
+    const char * whh_key,
+    const float * pre_gates,
+    const float * b_hh,
+    float       * output,
+    int H, int N, bool reverse)
+{
+    if (!s || !s->valid) return nullptr;
+
+    auto it = s->whh_buffers.find(whh_key);
+    if (it == s->whh_buffers.end()) {
+        fprintf(stderr, "[metal_lstm] W_hh not preloaded for key: %s\n", whh_key);
+        return nullptr;
+    }
+
+    const size_t pg_bytes  = static_cast<size_t>(4 * H * N) * sizeof(float);
+    const size_t bhh_bytes = static_cast<size_t>(4 * H)     * sizeof(float);
+    const size_t out_bytes = static_cast<size_t>(H * N)      * sizeof(float);
+
+    // Each in-flight call owns its buffers so parallel calls don't alias.
+    id<MTLBuffer> pg_buf  = [s->device newBufferWithLength:pg_bytes
+                                                    options:MTLResourceStorageModeShared];
+    id<MTLBuffer> bhh_buf = [s->device newBufferWithLength:bhh_bytes
+                                                    options:MTLResourceStorageModeShared];
+    id<MTLBuffer> out_buf = [s->device newBufferWithLength:out_bytes
+                                                    options:MTLResourceStorageModeShared];
+    if (!pg_buf || !bhh_buf || !out_buf) {
+        fprintf(stderr, "[metal_lstm] buffer alloc failed in submit\n");
+        return nullptr;
+    }
+
+    memcpy([pg_buf  contents], pre_gates, pg_bytes);
+    memcpy([bhh_buf contents], b_hh,      bhh_bytes);
+
+    // retainedReferences:NO — Metal won't hold the encoder/library beyond endEncoding,
+    // reducing memory pressure when many command buffers are in flight.
+    MTLCommandBufferDescriptor * desc = [MTLCommandBufferDescriptor new];
+    desc.retainedReferences = NO;
+    id<MTLCommandBuffer> cmd = [s->queue commandBufferWithDescriptor:desc];
+
+    encode_lstm(s, cmd, pg_buf, bhh_buf, out_buf, it->second, H, N, reverse);
+
+    auto * inflight     = new MetalLstmInflight{};
+    inflight->cmd        = cmd;
+    inflight->out_staging = out_buf;
+    inflight->dst        = output;
+    inflight->out_bytes  = out_bytes;
+
+    [cmd commit];
+    return inflight;
+}
+
+void metal_lstm_collect(MetalLstmHandle handle)
+{
+    if (!handle) return;
+    auto * inflight = static_cast<MetalLstmInflight *>(handle);
+    [inflight->cmd waitUntilCompleted];
+    memcpy(inflight->dst, [inflight->out_staging contents], inflight->out_bytes);
+    delete inflight;
+}
+
+// ---------------------------------------------------------------------------
+// Synchronous convenience wrapper (unchanged call-site).
+// Uses persistent scratch buffers to avoid per-call MTLBuffer allocation.
+// ---------------------------------------------------------------------------
 void metal_lstm_run(
     MetalLstmKernelState * s,
     const char * whh_key,
@@ -224,13 +326,11 @@ void metal_lstm_run(
         fprintf(stderr, "[metal_lstm] W_hh not preloaded for key: %s\n", whh_key);
         return;
     }
-    id<MTLBuffer> whh_buf = it->second;
 
     const size_t pg_bytes  = static_cast<size_t>(4 * H * N) * sizeof(float);
     const size_t bhh_bytes = static_cast<size_t>(4 * H)     * sizeof(float);
     const size_t out_bytes = static_cast<size_t>(H * N)      * sizeof(float);
 
-    // Get or reallocate scratch buffers
     s->pre_gates_buf = ensure_buf(s->device, s->pre_gates_buf, pg_bytes);
     s->b_hh_buf      = ensure_buf(s->device, s->b_hh_buf,      bhh_bytes);
     s->output_buf    = ensure_buf(s->device, s->output_buf,    out_bytes);
@@ -240,39 +340,18 @@ void metal_lstm_run(
         return;
     }
 
-    // Copy inputs into Metal buffers
     memcpy([s->pre_gates_buf contents], pre_gates, pg_bytes);
     memcpy([s->b_hh_buf      contents], b_hh,      bhh_bytes);
 
-    // Write scalar params into persistent buffers (avoids per-call allocation).
-    const uint params_H   = static_cast<uint>(H);
-    const uint params_N   = static_cast<uint>(N);
-    const uint params_rev = reverse ? 1u : 0u;
-    memcpy([s->h_buf   contents], &params_H,   sizeof(uint));
-    memcpy([s->n_buf   contents], &params_N,   sizeof(uint));
-    memcpy([s->rev_buf contents], &params_rev, sizeof(uint));
+    MTLCommandBufferDescriptor * desc = [MTLCommandBufferDescriptor new];
+    desc.retainedReferences = NO;
+    id<MTLCommandBuffer> cmd = [s->queue commandBufferWithDescriptor:desc];
 
-    id<MTLCommandBuffer>        cmd  = [s->queue commandBuffer];
-    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-
-    [enc setComputePipelineState:s->pipeline];
-    [enc setBuffer:s->output_buf    offset:0 atIndex:0];
-    [enc setBuffer:s->pre_gates_buf offset:0 atIndex:1];
-    [enc setBuffer:whh_buf          offset:0 atIndex:2];
-    [enc setBuffer:s->b_hh_buf      offset:0 atIndex:3];
-    [enc setBuffer:s->h_buf         offset:0 atIndex:4];
-    [enc setBuffer:s->n_buf         offset:0 atIndex:5];
-    [enc setBuffer:s->rev_buf       offset:0 atIndex:6];
-
-    // One threadgroup, 4*H threads (= 1024 for H=256)
-    const NSUInteger threads_per_group = static_cast<NSUInteger>(4 * H);
-    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
-       threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1, 1)];
-    [enc endEncoding];
+    encode_lstm(s, cmd, s->pre_gates_buf, s->b_hh_buf, s->output_buf,
+                it->second, H, N, reverse);
 
     [cmd commit];
     [cmd waitUntilCompleted];
 
-    // Copy output back to CPU buffer
     memcpy(output, [s->output_buf contents], out_bytes);
 }
