@@ -6,6 +6,9 @@ Usage:
     # Stream PCM float32 and play via ffplay
     uv run python tools/tts_client.py "Hello world" | ffplay -f f32le -ar 24000 -ac 1 -
 
+    # Read text from a file
+    uv run python tools/tts_client.py --file story.txt | ffplay -f f32le -ar 24000 -ac 1 -
+
     # Stream PCM and save as WAV
     uv run python tools/tts_client.py "Hello world" --out hello.wav
 
@@ -98,7 +101,9 @@ def fetch_wav(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="kokopop TTS HTTP client")
-    parser.add_argument("text", help="Text to synthesize")
+    parser.add_argument("text", nargs="?", default=None, help="Text to synthesize")
+    parser.add_argument("--file", "-f", default=None, metavar="PATH",
+                        help="Read text from a file (alternative to positional text)")
     parser.add_argument("--url", default="http://127.0.0.1:8080/tts",
                         help="Server URL (default: http://127.0.0.1:8080/tts)")
     parser.add_argument("--voice", default=None, help="Voice name (e.g. ff_siwis)")
@@ -112,8 +117,16 @@ def main() -> None:
                              "raw PCM is written to stdout.")
     args = parser.parse_args()
 
+    # Resolve text: positional arg takes precedence, then --file, then error
+    if args.text is not None:
+        text = args.text
+    elif args.file is not None:
+        text = Path(args.file).read_text(encoding="utf-8")
+    else:
+        parser.error("the following arguments are required: text or --file")
+
     if args.fmt == "wav":
-        data = fetch_wav(args.text, args.voice, args.speed, args.mode, args.url)
+        data = fetch_wav(text, args.voice, args.speed, args.mode, args.url)
         if args.out:
             Path(args.out).write_bytes(data)
             print(f"Saved {len(data):,} bytes → {args.out}", file=sys.stderr)
@@ -121,7 +134,7 @@ def main() -> None:
             sys.stdout.buffer.write(data)
     else:
         # PCM mode: stream to stdout or save as WAV
-        pcm = stream_pcm(args.text, args.voice, args.speed, args.mode, args.url)
+        pcm = stream_pcm(text, args.voice, args.speed, args.mode, args.url)
         if args.out:
             wav = _pcm_to_wav(pcm)
             Path(args.out).write_bytes(wav)
