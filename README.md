@@ -34,6 +34,22 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release -DKOKOPOP_ENABLE_METAL=ON
 cmake --build build
 ```
 
+### HTTP Server Dependencies (Ogg/Opus)
+
+The HTTP server (`kokopop_stream --http`) supports Ogg/Opus audio streaming. Install the required libraries:
+
+**Debian / Ubuntu:**
+```bash
+sudo apt install libespeak-ng-dev libopus-dev libogg-dev libopusenc-dev
+```
+
+**macOS (Homebrew):**
+```bash
+brew install libogg opus libopusenc
+```
+
+If these libraries are not found, CMake will automatically disable Ogg/Opus output and continue with PCM and WAV support.
+
 ### Export Kokoro model to gguf format
 
 Requires [uv](https://docs.astral.sh/uv/getting-started/installation/).
