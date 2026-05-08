@@ -41,7 +41,7 @@ Requires [uv](https://docs.astral.sh/uv/getting-started/installation/).
 ```bash
 uv run python tools/convert_kokoro_to_gguf.py \
   --output models/kokoro.gguf \
-  --voices af_heart,ff_siwis,zf_xiaoni,im_nicola \
+  --voices af_heart,ff_siwis,zf_xiaoxiao,im_nicola \
   --tier kokoro-md
 ```
 
@@ -59,7 +59,7 @@ Two tiers are available:
 Synthesize text to a WAV file:
 
 ```bash
-./kokopop_say \
+./build/kokopop_say \
   --model models/kokoro.gguf \
   --voice af_heart \
   --text "Hello, world!" \
@@ -69,7 +69,7 @@ Synthesize text to a WAV file:
 Synthesize and play directly (macOS):
 
 ```bash
-./kokopop_say \
+./build/kokopop_say \
   --model models/kokoro.gguf \
   --voice af_heart \
   --text "Hello, world!" \
@@ -79,7 +79,7 @@ Synthesize and play directly (macOS):
 Generate audio from phonemes:
 
 ```bash
-./kokopop_say \
+./build/kokopop_say \
   --model models/kokoro.gguf \
   --voice af_heart \
   --phonemes "həˈloʊ wɜrld" \
@@ -89,7 +89,7 @@ Generate audio from phonemes:
 Adjust generation speed:
 
 ```bash
-./kokopop_say \
+./build/kokopop_say \
   --model models/kokoro.gguf \
   --voice af_heart \
   --text "Hello, world!" \
@@ -103,7 +103,7 @@ The `kokopop_play` tool reads raw audio from stdin and plays it via Core Audio (
 
 ```bash
 # Pipe audio from kokopop_say directly to playback
-./kokopop_say \
+./build/kokopop_say \
   --model models/kokoro.gguf \
   --voice af_heart \
   --text "Hello, world!" \
@@ -123,14 +123,14 @@ Reads JSON commands from stdin and streams raw audio (float32) to stdout:
 ```bash
 # Feed commands via stdin
 echo '{"text": "Hello world", "flush": true}' | \
-  ./kokopop_stream \
+  ./build/kokopop_stream \
     --model models/kokoro.gguf \
     --voice af_heart \
     --mode long_form
 
 # Save full output to WAV (accumulates all chunks, writes WAV on exit)
 echo '{"text": "Hello world", "flush": true}' | \
-  ./kokopop_stream \
+  ./build/kokopop_stream \
     --model models/kokoro.gguf \
     --voice af_heart \
     --out output.wav
@@ -150,7 +150,7 @@ JSON protocol (one command per line):
 Start an async, event-driven HTTP server for TTS synthesis. Uses `poll()` for non-blocking I/O with a `SynthesisScheduler` for round-robin chunk interleaving across concurrent requests:
 
 ```bash
-./kokopop_stream \
+./build/kokopop_stream \
   --model models/kokoro.gguf \
   --voice af_heart \
   --http \
@@ -200,7 +200,7 @@ Request body fields:
 | `voice` | string | Override default voice (e.g., `ff_siwis`) |
 | `speed` | float | Synthesis speed (default: from CLI `--speed`) |
 | `mode` | string | `interactive` (default) or `long_form` |
-| `format` | string | `pcm` (default) — raw float32 stream; `wav` — complete WAV file |
+| `format` | string | `pcm` (default) — raw float32 stream; `wav` — complete WAV file; `ogg` — Ogg/Opus stream |
 
 #### Python client (`tools/tts_client.py`)
 
@@ -208,9 +208,9 @@ A minimal Python client is provided. It requires no third-party packages.
 
 ```bash
 # Start the server first
-./kokopop_stream \
+./build/kokopop_stream \
   --model models/kokoro.gguf \
-  --voice af_heart --http --mode interactive --port 8080
+  --voice af_heart --http --port 8080
 
 # Stream ogg/opus and play in real time (requires ffplay)
 uv run python tools/tts_client.py \
