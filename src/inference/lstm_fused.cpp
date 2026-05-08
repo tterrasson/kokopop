@@ -72,10 +72,14 @@ void lstm_fused_callback(
     ggml_tensor       * dst,
     const ggml_tensor * /*a_unused*/,
     const ggml_tensor * pre_gates,
-    int   /*ith*/,
+    int   ith,
     int   /*nth*/,
     void * userdata)
 {
+    if (ith != 0) {
+        return;
+    }
+
     const LstmCustomParams * p = static_cast<const LstmCustomParams *>(userdata);
     const float * pg  = static_cast<const float *>(pre_gates->data);
     float       * out = static_cast<float *>(dst->data);

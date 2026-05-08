@@ -46,11 +46,10 @@ static size_t graph_capacity(ggml_cgraph * graph) {
 //       therefore rejects them and would require copies for CPU graphs.  CPU
 //       weight placement is optimal given generation/generator dominates calls.
 //   * Scheduler `op_offload=false`: ops naturally follow their weight tensors
-//     to CPU.  Metal assignment is done explicitly in pin_graph_cpu_fallbacks:
-//     every node that isn't hard-pinned (unsupported op) or soft-pinned (NORM,
-//     CONV_TRANSPOSE_1D, force_cpu stage) is assigned to Metal with
-//     ggml_backend_sched_set_tensor_backend.  This gives precise control
-//     without relying on the scheduler's heuristic offload path.
+//     unless the scheduler has a reason to split.  pin_graph_cpu_fallbacks only
+//     forces known CPU fallbacks; it deliberately leaves all other nodes
+//     unassigned.  Explicitly pinning every supported frontend op to Metal
+//     changes ALBERT numerics enough to skew duration prediction on long inputs.
 //   * **NO `ggml_backend_sched_reserve`** — the reserve-then-alloc combo
 //     triggers two consecutive `split_graph` calls; tensor copies created
 //     in the 1st are freed by the `ggml_free(sched->ctx)` of the 2nd, and
@@ -213,11 +212,6 @@ class MetalBackend : public Backend {
     }
 
     void pin_graph_cpu_fallbacks(ggml_cgraph * graph) {
-        // Explicit two-way assignment: every node is pinned to either Metal
-        // or CPU.  This is required because the scheduler uses op_offload=false
-        // (ops follow their weight tensors to CPU by default), so without
-        // explicit Metal assignment the frontend would run entirely on CPU.
-        //
         // hard_pin       : Metal cannot execute the op (integer type, or
         //                  ggml_backend_supports_op=false). No override.
         // default_unsafe : (currently none) reserved for ops with verified GPU bugs.
@@ -225,13 +219,14 @@ class MetalBackend : public Backend {
         //                  Override via ALLOW_OP — at user's own risk.
         // soft_pin       : user-requested pin via FORCE_CPU or PIN_OP env var.
         //                  Override via ALLOW_OP.
-        // metal_assign   : when none of the above apply AND the graph is not
-        //                  force_cpu, explicitly assign to Metal so that the
-        //                  scheduler doesn't silently default to CPU because
-        //                  the weight tensors live in a CPU buffer.
+        //
+        // Leave all other nodes unassigned so ggml's scheduler keeps the same
+        // placement decisions it used before the pin-decision cache.  Forcing
+        // every supported frontend op to Metal changes ALBERT numerics enough
+        // to skew duration prediction on long inputs.
         //
         // Pin cache: when active_label_ and n_nodes are unchanged the per-node
-        // assignments are deterministic, so we replay the cached vector instead
+        // CPU pins are deterministic, so we replay the cached vector instead
         // of re-running the O(n_nodes) classification loop.
         const int n_nodes = ggml_graph_n_nodes(graph);
         const bool cache_hit = (pin_cache_n_nodes_ == n_nodes)
@@ -264,8 +259,6 @@ class MetalBackend : public Backend {
             ggml_backend_t backend;
             if (hard_pin || ((default_unsafe || soft_pin) && !allowed)) {
                 backend = cpu_backend_;
-            } else if (!force_cpu) {
-                backend = metal_backend_;
             } else {
                 backend = nullptr;
             }
