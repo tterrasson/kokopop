@@ -22,6 +22,20 @@ A standalone C++ library and toolkit for running [Kokoro](https://github.com/hex
 
 ### Build
 
+Install `espeak-ng` (required for phonemization):
+
+**Debian / Ubuntu:**
+```bash
+sudo apt install libespeak-ng-dev
+```
+
+**macOS (Homebrew):**
+```bash
+brew install espeak-ng
+```
+
+Then build:
+
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
@@ -40,7 +54,7 @@ The HTTP server (`kokopop_stream --http`) supports Ogg/Opus audio streaming. Ins
 
 **Debian / Ubuntu:**
 ```bash
-sudo apt install libespeak-ng-dev libopus-dev libogg-dev libopusenc-dev
+sudo apt install libopus-dev libogg-dev libopusenc-dev
 ```
 
 **macOS (Homebrew):**
