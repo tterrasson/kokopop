@@ -535,7 +535,9 @@ ggml_tensor * lstm_direction(
     model.lstm_custom_params.push_back({
         it->second.data(),                     // w_hh_f32
         b_hh_ptr,                              // b_hh
-        model.backend->metal_lstm_kernel(),    // metal_kernel (null on CPU)
+        model.backend->use_metal_lstm(n_steps)
+            ? model.backend->metal_lstm_kernel()
+            : nullptr,                         // metal_kernel (null on CPU/small LSTM)
         it->first.c_str(),                     // whh_key (key stable in lstm_w_hh_f32)
         hidden,                                // hidden
         n_steps,                               // n_steps

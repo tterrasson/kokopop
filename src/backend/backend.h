@@ -93,6 +93,15 @@ struct Backend {
     // Used by graph_ops::lstm_direction to fill LstmCustomParams::metal_kernel.
     virtual void * metal_lstm_kernel() const { return nullptr; }
 
+    // Optional: decide whether a fused LSTM should run through Metal for this
+    // sequence length. Small recurrences are often faster in the CPU callback
+    // because Metal has to upload the precomputed gates and wait for a command
+    // buffer for every direction.
+    virtual bool use_metal_lstm(int64_t n_steps) const {
+        (void)n_steps;
+        return metal_lstm_kernel() != nullptr;
+    }
+
     // Return the Metal STFT kernel handle cast to void* (null for CPU backend).
     // Used by cpu_harmonic_stft to dispatch the DFT on the GPU.
     virtual void * metal_stft_kernel() const { return nullptr; }

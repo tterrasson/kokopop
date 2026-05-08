@@ -33,23 +33,21 @@ static size_t graph_capacity(ggml_cgraph * graph) {
 
 // ---- MetalBackend ---------------------------------------------------------
 //
-// Placement strategy (bisect 2026-05-02, revised 2026-05-04):
+// Placement strategy (bisect 2026-05-02, revised 2026-05-08):
 //   * Weights allocated on CPU (weight_buffer_type → cpu_backend_).
-//     - CPU-pinned graphs (generation/generator): weights+ops on CPU → 1 split,
+//     - CPU-pinned graphs (generation/generator/short frontend): weights+ops on CPU → 1 split,
 //       0 cross-backend copies, zero Metal overhead per inference.
 //     - Frontend (Metal ops): scheduler creates CPU→Metal galloc copies before
-//       the Metal split (~2 splits). On M1 unified memory (MTLStorageModeShared)
-//       these are direct memcpy, not GPU blits.
-//     - Eliminates the old `pin_weights_cpu_for_cpu_graph` O(n_nodes) loop and
-//       the per-inference Metal→CPU sync that added ~120 ms on generation.
+//       the Metal split (~2 splits). On Apple unified memory these are direct
+//       memcpy into shared MTL buffers.
 //     - Note: Metal shared/mapped buffer types report is_host=false; CPU backend
 //       therefore rejects them and would require copies for CPU graphs.  CPU
-//       weight placement is optimal given generation/generator dominates calls.
+//       weight placement is optimal while generation/generator dominate calls.
 //   * Scheduler `op_offload=false`: ops naturally follow their weight tensors
-//     unless the scheduler has a reason to split.  pin_graph_cpu_fallbacks only
+//     unless the scheduler has a reason to split. pin_graph_cpu_fallbacks only
 //     forces known CPU fallbacks; it deliberately leaves all other nodes
-//     unassigned.  Explicitly pinning every supported frontend op to Metal
-//     changes ALBERT numerics enough to skew duration prediction on long inputs.
+//     unassigned. Enabling ggml op_offload on Kokoro's hybrid graphs creates
+//     many expensive Metal/CPU transitions and can make the whole machine lag.
 //   * **NO `ggml_backend_sched_reserve`** — the reserve-then-alloc combo
 //     triggers two consecutive `split_graph` calls; tensor copies created
 //     in the 1st are freed by the `ggml_free(sched->ctx)` of the 2nd, and
@@ -57,17 +55,14 @@ static size_t graph_capacity(ggml_cgraph * graph) {
 //     actually allocated in the 2nd. Observed symptom: silent audio despite
 //     correct duration. The allocator does its own reserve on the 1st alloc
 //     (ggml-backend.cpp:1509-1535), which is sufficient here (~40 MiB total).
-//   * **Full generation+generator on CPU by default** — generation: Metal NORM
-//     kernel (float4 path) produces corrupted values on certain token patterns
-//     (fixed in patches/ggml-metal-norm-scalar.patch) and hybrid Metal/CPU
-//     transitions cause ~50 s wall-clock (25 GPU syncs). Generator: ggml Metal
-//     CONV_TRANSPOSE_1D dispatches 1 thread/output — GPU watchdog kills it for
-//     large dims (fixed in patches/ggml-conv-transpose-1d-simd.patch).
-//     Both pinned CPU by default. Override via `KOKOPOP_METAL_FORCE_CPU=none`.
 //   * **Adaptive Metal frontend** (2026-05-04) — Metal kernel-launch overhead
 //     (~100 us/kernel * N ALBERT kernels) exceeds GPU compute speedup for
 //     short inputs. Frontend runs on CPU when n_tokens < KOKOPOP_METAL_MIN_TOKENS
-//     (default 100). Set to 0 to always use Metal for frontend.
+//     (default 192). Set to 0 to always use Metal for frontend.
+//   * **Adaptive fused LSTM** (2026-05-08) — the custom Metal LSTM uploads
+//     precomputed gates and blocks for every direction. It wins on longer
+//     recurrences but loses on short frontend/text-encoder recurrences, so it
+//     is gated by KOKOPOP_METAL_LSTM_MIN_STEPS (default 128).
 //   * **Env var caching** — all KOKOPOP_METAL_* env vars are read once at
 //     construction and cached as members (env vars do not change at runtime).
 //   * **Pin decision cache** — pin assignments for a graph are reused across
@@ -83,8 +78,10 @@ static size_t graph_capacity(ggml_cgraph * graph) {
 //   KOKOPOP_METAL_RUN_ONLY=<lvl>  — run up to level frontend|generation|
 //                                generator inclusive, skip the following.
 //   KOKOPOP_METAL_MIN_TOKENS=N    — minimum token count to use Metal for `frontend`
-//                                (default 100). Below N, frontend runs on CPU.
+//                                (default 192). Below N, frontend runs on CPU.
 //                                Set to 0 to always use Metal for frontend.
+//   KOKOPOP_METAL_LSTM_MIN_STEPS=N — minimum sequence length for the custom
+//                                Metal LSTM kernel (default 128).
 //   KOKOPOP_METAL_FORCE_CPU=<lbl> — pin all nodes of named graphs on
 //                                CPU (e.g. "generator" or "frontend,generator").
 //   KOKOPOP_METAL_PIN_OP=<ops>    — pin by op type everywhere (e.g. "SIN,REPEAT").
@@ -107,7 +104,8 @@ class MetalBackend : public Backend {
     const char * env_pin_op_     = nullptr;  // KOKOPOP_METAL_PIN_OP
     const char * env_allow_op_   = nullptr;  // KOKOPOP_METAL_ALLOW_OP
     const char * env_run_only_   = nullptr;  // KOKOPOP_METAL_RUN_ONLY
-    int          env_min_tokens_ = 100;      // KOKOPOP_METAL_MIN_TOKENS
+    int          env_min_tokens_ = 192;      // KOKOPOP_METAL_MIN_TOKENS
+    int          env_lstm_min_steps_ = 128;  // KOKOPOP_METAL_LSTM_MIN_STEPS
     bool         env_log_sched_  = false;    // KOKOPOP_METAL_LOG_SCHED
     bool         env_op_trace_   = false;    // KOKOPOP_METAL_OP_TRACE
     bool         env_alloc_only_ = false;    // KOKOPOP_METAL_ALLOC_ONLY
@@ -116,6 +114,8 @@ class MetalBackend : public Backend {
     // and the graph has pin_cache_n_nodes_ nodes.
     std::string              pin_cache_label_;
     int                      pin_cache_n_nodes_ = -1;
+    int                      pin_cache_tokens_ = -1;
+    bool                     pin_cache_force_cpu_ = false;
     std::vector<ggml_backend_t> pin_cache_;
 
     // Levels for KOKOPOP_METAL_RUN_ONLY: we compute a graph iff its level
@@ -163,18 +163,18 @@ class MetalBackend : public Backend {
 
     bool force_cpu_for_active_graph() const {
         if (active_label_ == nullptr) return false;
-        // Default: `generation` AND `generator` on CPU (conservative).
-        //   The two original blocking bugs are now patched:
+        // Default: `generation` and `generator` stay on CPU.
+        //   The two original blocking bugs are patched:
         //   - patches/ggml-metal-norm-scalar.patch: disables the float4 NORM
         //     kernel that corrupted values for certain token patterns in `generation`.
         //   - patches/ggml-conv-transpose-1d-simd.patch: CONV_TRANSPOSE_1D now
         //     uses 32 threads/group + simd_sum, avoiding GPU watchdog on the large
         //     generator dims.
-        //   CPU default is kept until full-Metal generation/generator paths are
-        //   validated end-to-end.  Override: KOKOPOP_METAL_FORCE_CPU=none.
+        //   Forcing ggml op_offload across these hybrid graphs was measured to
+        //   be much slower and made the desktop unresponsive on M-series Macs.
         //   `frontend` short inputs: Metal kernel-launch overhead (~100 µs per
         //   kernel × N ALBERT kernels) exceeds GPU compute speedup for small token
-        //   counts. Threshold = env_min_tokens_ (default 100).
+        //   counts. Threshold = env_min_tokens_ (default 192).
         if (env_force_cpu_ == nullptr) {
             if (std::strcmp(active_label_, "generator") == 0
                 || std::strcmp(active_label_, "generation") == 0) {
@@ -229,9 +229,12 @@ class MetalBackend : public Backend {
         // CPU pins are deterministic, so we replay the cached vector instead
         // of re-running the O(n_nodes) classification loop.
         const int n_nodes = ggml_graph_n_nodes(graph);
+        const bool force_cpu = force_cpu_for_active_graph();
         const bool cache_hit = (pin_cache_n_nodes_ == n_nodes)
                             && (active_label_ != nullptr)
-                            && (pin_cache_label_ == active_label_);
+                            && (pin_cache_label_ == active_label_)
+                            && (pin_cache_tokens_ == n_input_tokens_)
+                            && (pin_cache_force_cpu_ == force_cpu);
 
         if (cache_hit) {
             for (int i = 0; i < n_nodes; ++i) {
@@ -243,7 +246,6 @@ class MetalBackend : public Backend {
             return;
         }
 
-        const bool force_cpu = force_cpu_for_active_graph();
         pin_cache_.resize(n_nodes);
         for (int i = 0; i < n_nodes; ++i) {
             ggml_tensor * node = ggml_graph_node(graph, i);
@@ -269,6 +271,8 @@ class MetalBackend : public Backend {
         }
         pin_cache_label_   = active_label_ ? active_label_ : "";
         pin_cache_n_nodes_ = n_nodes;
+        pin_cache_tokens_  = n_input_tokens_;
+        pin_cache_force_cpu_ = force_cpu;
     }
 
     void log_sched_sizes(const char * stage) {
@@ -317,6 +321,9 @@ public:
         env_alloc_only_ = std::getenv("KOKOPOP_METAL_ALLOC_ONLY") != nullptr;
         if (const char * s = std::getenv("KOKOPOP_METAL_MIN_TOKENS")) {
             if (s[0]) env_min_tokens_ = std::atoi(s);
+        }
+        if (const char * s = std::getenv("KOKOPOP_METAL_LSTM_MIN_STEPS")) {
+            if (s[0]) env_lstm_min_steps_ = std::atoi(s);
         }
 
         cpu_backend_ = ggml_backend_cpu_init();
@@ -513,6 +520,14 @@ public:
 
     void * metal_lstm_kernel() const override {
         return lstm_kernel_;
+    }
+
+    bool use_metal_lstm(int64_t n_steps) const override {
+        if (lstm_kernel_ == nullptr ||
+            n_steps < static_cast<int64_t>(std::max(0, env_lstm_min_steps_))) {
+            return false;
+        }
+        return !force_cpu_for_active_graph();
     }
 
     void * metal_stft_kernel() const override {

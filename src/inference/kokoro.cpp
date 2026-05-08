@@ -139,6 +139,9 @@ bool run_kokoro_frontend_probe(
     }
 
     const int64_t n_tokens = static_cast<int64_t>(ids.size());
+    model.backend->set_input_tokens(static_cast<int>(n_tokens));
+    model.backend->set_active_label("frontend");
+
     ggml_tensor * token_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
     ggml_tensor * pos_ids   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
     ggml_set_input(token_ids);
@@ -223,8 +226,6 @@ bool run_kokoro_frontend_probe(
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, frontend_graph_size(n_tokens), false);
     ggml_build_forward_expand(gf, pred_dur);
 
-    model.backend->set_input_tokens(static_cast<int>(n_tokens));
-    model.backend->set_active_label("frontend");
     model.backend->sched_reset();
     if (!model.backend->sched_alloc_graph(gf)) {
         ggml_free(ctx);
@@ -334,6 +335,14 @@ bool run_kokoro_generation_probe(
     }
 
     const int64_t n_tokens = frontend.n_tokens;
+    model.backend->set_input_tokens(static_cast<int>(n_tokens));
+    model.backend->set_active_label("generation");
+
+    // Pre-reserve LstmCustomParams storage before any LSTM node is created so
+    // userdata pointers captured by ggml_map_custom2 stay valid until compute().
+    model.lstm_custom_params.clear();
+    model.lstm_custom_params.reserve(24);
+
     ggml_tensor * token_ids     = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
     ggml_tensor * duration_pred = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, frontend.hidden_dim, n_tokens);
     ggml_tensor * duration_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, total_frames, n_tokens);
@@ -486,13 +495,6 @@ bool run_kokoro_generation_probe(
     const bool gen_profile = std::getenv("KOKOPOP_GEN_PROFILE") != nullptr;
     int64_t t_build = 0, t_alloc = 0, t_compute = 0;
 
-    // Clear and pre-reserve storage for LstmCustomParams built during graph
-    // construction (lstm_direction pushes one entry per direction call).
-    // Reserve 24 slots so that no reallocation occurs while the graph is being
-    // built, keeping the stored pointers stable until after compute().
-    model.lstm_custom_params.clear();
-    model.lstm_custom_params.reserve(24);
-
     int64_t t0 = gen_profile ? ggml_time_us() : 0;
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, generation_graph_size(total_frames, n_tokens), false);
     ggml_build_forward_expand(gf, f0_curve);
@@ -505,7 +507,6 @@ bool run_kokoro_generation_probe(
             ggml_graph_n_nodes(gf), t_build / 1000.0);
     }
 
-    model.backend->set_active_label("generation");
     model.backend->sched_reset();
     t0 = gen_profile ? ggml_time_us() : 0;
     if (!model.backend->sched_alloc_graph(gf)) {

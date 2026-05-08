@@ -105,7 +105,12 @@ ggml_tensor * depthwise_pool_upsample(
 // CPU Harmonic STFT
 // ---------------------------------------------------------------------------
 
-CpuTensor cpu_harmonic_stft(Model & model, const std::vector<float> & f0, int64_t target_frames, std::string & error) {
+static bool fill_harmonic_stft(
+    Model & model,
+    const std::vector<float> & f0,
+    int64_t target_frames,
+    std::vector<float> & har_data,
+    std::string & error) {
     constexpr int harmonic = KOKOPOP_HARMONIC_COUNT;
     constexpr int upsample = KOKOPOP_UPSAMPLE;
     constexpr int sample_rate = KOKOPOP_SAMPLE_RATE;
@@ -121,7 +126,6 @@ CpuTensor cpu_harmonic_stft(Model & model, const std::vector<float> & f0, int64_
     if (source.size() < static_cast<size_t>(n_samples)) {
         source.resize(static_cast<size_t>(n_samples));
     }
-    std::fill(source.begin(), source.begin() + static_cast<ptrdiff_t>(n_samples), 0.0f);
 
     float phase_sin[harmonic]{};
     float phase_cos[harmonic];
@@ -130,14 +134,14 @@ CpuTensor cpu_harmonic_stft(Model & model, const std::vector<float> & f0, int64_
         ggml_tensor * merge_w = require_tensor(model, "kokopop.decoder.generator.m_source.l_linear.weight", error);
         ggml_tensor * merge_b = require_tensor(model, "kokopop.decoder.generator.m_source.l_linear.bias", error);
         if (!error.empty()) {
-            return {};
+            return false;
         }
         std::vector<float> merge_b_data;
         if (!tensor_to_f32(*model.backend, merge_w, model.harmonic_merge_w) ||
             !tensor_to_f32(*model.backend, merge_b, merge_b_data) ||
             merge_b_data.empty()) {
             error = "failed to read harmonic source merge weights";
-            return {};
+            return false;
         }
         model.harmonic_merge_b = merge_b_data[0];
         model.harmonic_source_loaded = true;
@@ -198,12 +202,10 @@ CpuTensor cpu_harmonic_stft(Model & model, const std::vector<float> & f0, int64_
     // 7.1 — Reuse pre-allocated harmonic STFT buffer.
     // The buffer lives in Model; we resize + zero it, fill via STFT,
     // then move a copy into the returned CpuTensor.
-    std::vector<float> & har_data = model.tmp_stft_har_f32;
     const size_t har_size = static_cast<size_t>(22 * target_frames);
     if (har_data.size() < har_size) {
         har_data.resize(har_size);
     }
-    std::fill(har_data.begin(), har_data.begin() + static_cast<ptrdiff_t>(har_size), 0.0f);
 
     // GPU path: dispatch the DFT kernel when the Metal STFT state is available.
 #ifdef KOKOPOP_HAS_METAL
@@ -212,7 +214,7 @@ CpuTensor cpu_harmonic_stft(Model & model, const std::vector<float> & f0, int64_
             metal_stft_compute(stft, source.data(), har_data.data(),
                             static_cast<int>(n_samples),
                             static_cast<int>(target_frames));
-            return CpuTensor{22, target_frames, std::move(har_data)};
+            return true;
         }
     }
 #endif
@@ -245,16 +247,28 @@ CpuTensor cpu_harmonic_stft(Model & model, const std::vector<float> & f0, int64_
             har_data[static_cast<size_t>((k + n_fft / 2 + 1) * target_frames + frame)] = std::atan2(imag, real);
         }
     }
-    return CpuTensor{22, target_frames, std::move(har_data)};
+    return true;
+}
+
+CpuTensor cpu_harmonic_stft(Model & model, const std::vector<float> & f0, int64_t target_frames, std::string & error) {
+    std::vector<float> & har_data = model.tmp_stft_har_f32;
+    if (!fill_harmonic_stft(model, f0, target_frames, har_data, error)) {
+        return {};
+    }
+    const size_t har_size = static_cast<size_t>(22 * target_frames);
+    return CpuTensor{
+        22,
+        target_frames,
+        std::vector<float>(har_data.begin(), har_data.begin() + static_cast<ptrdiff_t>(har_size)),
+    };
 }
 
 // 7.3 — cpu_istft now accepts a Model& and a std::vector<float>& for the output buffer.
 // The intermediate y[] and denom[] arrays are cached inside Model and reused across calls,
 // eliminating two large allocations per chunk.
-bool cpu_istft(Model & model, const CpuTensor & post, std::vector<float> & out) {
+static bool cpu_istft_data(Model & model, const float * post_data, int64_t n_frames, std::vector<float> & out) {
     constexpr int n_fft = KOKOPOP_STFT_N;
     constexpr int hop = KOKOPOP_STFT_HOP;
-    const int64_t n_frames = post.length;
     if (n_frames <= 0) {
         out.clear();
         return true;
@@ -271,7 +285,7 @@ bool cpu_istft(Model & model, const CpuTensor & post, std::vector<float> & out) 
     if (model.backend != nullptr) {
         if (auto * stft = static_cast<MetalStftState *>(model.backend->metal_stft_kernel())) {
             out.resize(static_cast<size_t>(out_len));
-            metal_istft_compute(stft, post.data.data(), out.data(),
+            metal_istft_compute(stft, post_data, out.data(),
                                 static_cast<int>(n_frames),
                                 static_cast<int>(out_len));
             return !out.empty();
@@ -293,6 +307,9 @@ bool cpu_istft(Model & model, const CpuTensor & post, std::vector<float> & out) 
     std::fill(denom.begin(), denom.begin() + static_cast<ptrdiff_t>(pad_size), 0.0f);
     const float * window = hann_window_20();
     const StftTwiddles & tw = stft_twiddles();
+    const auto post_at = [post_data, n_frames](int64_t c, int64_t t) -> float {
+        return post_data[static_cast<size_t>(c * n_frames + t)];
+    };
 
     // Precompute window² once — same for every frame.
     static float win_sq[n_fft];
@@ -306,8 +323,8 @@ bool cpu_istft(Model & model, const CpuTensor & post, std::vector<float> & out) 
         float real[n_fft / 2 + 1]{};
         float imag[n_fft / 2 + 1]{};
         for (int k = 0; k <= n_fft / 2; ++k) {
-            const float mag = std::exp(std::clamp(post.at(k, frame), -20.0f, 8.0f));
-            const float phase = std::sin(post.at(k + n_fft / 2 + 1, frame));
+            const float mag = std::exp(std::clamp(post_at(k, frame), -20.0f, 8.0f));
+            const float phase = std::sin(post_at(k + n_fft / 2 + 1, frame));
             const float sin_ph = std::sin(phase);
             const float cos_ph = std::cos(phase);
             real[k] = mag * cos_ph;
@@ -336,6 +353,10 @@ bool cpu_istft(Model & model, const CpuTensor & post, std::vector<float> & out) 
     return !out.empty();
 }
 
+bool cpu_istft(Model & model, const CpuTensor & post, std::vector<float> & out) {
+    return cpu_istft_data(model, post.data.data(), post.length, out);
+}
+
 // ---------------------------------------------------------------------------
 // Generator graph (GGML-based audio synthesis)
 // ---------------------------------------------------------------------------
@@ -346,8 +367,9 @@ bool ggml_generator(
     const std::vector<float> & style,
     std::vector<float> & audio,
     std::string & error) {
-    CpuTensor har = cpu_harmonic_stft(model, f0, decoder.length * 60 + 1, error);
-    if (!error.empty()) {
+    const int64_t har_len = decoder.length * 60 + 1;
+    std::vector<float> & har_data = model.tmp_stft_har_f32;
+    if (!fill_harmonic_stft(model, f0, har_len, har_data, error)) {
         return false;
     }
 
@@ -360,7 +382,7 @@ bool ggml_generator(
 
     ggml_tensor * x       = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, decoder.length, decoder.channels);
     ggml_tensor * style_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, static_cast<int64_t>(style.size()));
-    ggml_tensor * har_t   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, har.length, har.channels);
+    ggml_tensor * har_t   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, har_len, 22);
     ggml_set_input(x);
     ggml_set_input(style_t);
     ggml_set_input(har_t);
@@ -498,7 +520,7 @@ bool ggml_generator(
     }
     model.backend->tensor_set(x,       decoder.data.data(), 0, decoder.data.size() * sizeof(float));
     model.backend->tensor_set(style_t, style.data(),        0, style.size()        * sizeof(float));
-    model.backend->tensor_set(har_t,   har.data.data(),     0, har.data.size()     * sizeof(float));
+    model.backend->tensor_set(har_t,   har_data.data(),     0, ggml_nbytes(har_t));
     t0g = gen_profile ? ggml_time_us() : 0;
     ggml_status status = model.backend->compute(ctx, gf);
     if (gen_profile) {
@@ -512,16 +534,14 @@ bool ggml_generator(
         return false;
     }
 
-    CpuTensor post_cpu{
-        post->ne[1],
-        post->ne[0],
-        {},
-    };
     const size_t post_size = static_cast<size_t>(post->ne[0] * post->ne[1]);
-    post_cpu.data.resize(post_size);
-    model.backend->tensor_get(post, post_cpu.data.data(), 0, post_cpu.data.size() * sizeof(float));
+    std::vector<float> & post_data = model.tmp_post_f32;
+    if (post_data.size() < post_size) {
+        post_data.resize(post_size);
+    }
+    model.backend->tensor_get(post, post_data.data(), 0, post_size * sizeof(float));
     // 7.3 — Pass the output buffer; cpu_istft writes directly into it.
-    if (!cpu_istft(model, post_cpu, audio)) {
+    if (!cpu_istft_data(model, post_data.data(), post->ne[0], audio)) {
         ggml_free(ctx);
         error = "cpu_istft failed";
         return false;
