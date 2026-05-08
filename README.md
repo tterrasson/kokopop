@@ -212,8 +212,8 @@ A minimal Python client is provided. It requires no third-party packages.
   --model models/kokoro.gguf \
   --voice af_heart --http --mode interactive --port 8080
 
-# Stream PCM and play in real time (requires mpv)
-uv run python tools/tts_client.py --format wav "Hello world" | mpv -
+# Stream ogg/opus and play in real time (requires ffplay)
+uv run python tools/tts_client.py --file LICENSE --format ogg --prebuffer-mode second-chunk | ffplay -i pipe:0
 
 # Stream PCM and save as WAV (client-side conversion)
 uv run python tools/tts_client.py "Hello world" --out hello.wav
@@ -222,8 +222,7 @@ uv run python tools/tts_client.py "Hello world" --out hello.wav
 uv run python tools/tts_client.py "Hello world" --format wav --out hello.wav
 
 # Override voice and speed
-uv run python tools/tts_client.py "Bonjour le monde" \
-  --voice ff_siwis --speed 1.2 --format wav --out bonjour.wav
+uv run python tools/tts_client.py "Hello faster world" --speed 1.2 --format wav --out hello.wav
 ```
 
 All options:

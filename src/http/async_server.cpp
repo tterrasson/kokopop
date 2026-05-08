@@ -2,6 +2,9 @@
 
 #include "http/http_server.h"  // for HttpRequest, HttpResponse, json_error
 #include "core/wav.h"
+#ifdef KOKOPOP_HAS_OPUS
+#  include "core/ogg_opus_encoder.h"
+#endif
 #include "yyjson.h"
 
 #include <algorithm>
@@ -276,26 +279,68 @@ void AsyncHttpServer::_event_loop() {
         for (auto & [fd, conn] : _connections) {
             if (conn.state != Connection::STATE_STREAMING || !conn.req_ctx) continue;
 
-            auto rs = conn.req_ctx->state.load();
-            bool is_stream = conn.req_ctx->stream_mode;
+            auto rs  = conn.req_ctx->state.load();
+            auto fmt = conn.req_ctx->format;
 
+            // Drain all available chunks before pulling Ogg pages.
+            // Writing all chunks first then pulling once ensures ffplay
+            // receives a single batch of pages covering all available audio
+            // rather than one tiny page per synthesis chunk.
+            bool ogg_has_writes = false;
             RequestContext::AudioChunk chunk;
             while (conn.req_ctx->try_pop(chunk)) {
-                if (is_stream) {
+                if (fmt == RequestContext::AudioFormat::PCM) {
                     const char * p = reinterpret_cast<const char *>(chunk.samples.data());
                     std::vector<char> raw(p, p + chunk.samples.size() * sizeof(float));
                     _send_http_chunk(fd, conn, raw);
+                } else if (fmt == RequestContext::AudioFormat::OGG_OPUS) {
+#ifdef KOKOPOP_HAS_OPUS
+                    conn.req_ctx->opus_encoder->write(chunk.samples.data(),
+                                                      static_cast<int>(chunk.samples.size()));
+                    ogg_has_writes = true;
+#endif
                 } else {
                     auto & acc = conn.req_ctx->wav_accumulator;
                     acc.insert(acc.end(), chunk.samples.begin(), chunk.samples.end());
                 }
             }
+#ifdef KOKOPOP_HAS_OPUS
+            // Pull pages once, after all available chunks have been written.
+            // Do not force page flushes mid-stream: libopusenc's muxing delay
+            // controls page cadence, which keeps ffplay from seeing a train of
+            // tiny partial pages at synthesis chunk boundaries.
+            if (ogg_has_writes) {
+                auto & enc = *conn.req_ctx->opus_encoder;
+                enc.pull_pages(0);
+                if (enc.has_pending()) {
+                    auto pages = enc.take_pending();
+                    std::vector<char> raw(pages.begin(), pages.end());
+                    _send_http_chunk(fd, conn, raw);
+                }
+            }
+#endif
 
             bool is_terminal = (rs == RequestContext::State::DONE ||
                                 rs == RequestContext::State::ERROR ||
                                 rs == RequestContext::State::CANCELLED);
             if (is_terminal && conn.write_buffer.empty()) {
-                if (is_stream) {
+                if (fmt == RequestContext::AudioFormat::PCM) {
+                    _send_final_chunk(fd, conn);
+                    if (rs == RequestContext::State::CANCELLED) {
+                        fds_to_close.push_back(fd);
+                    }
+                } else if (fmt == RequestContext::AudioFormat::OGG_OPUS) {
+#ifdef KOKOPOP_HAS_OPUS
+                    if (rs == RequestContext::State::DONE) {
+                        auto & enc = *conn.req_ctx->opus_encoder;
+                        enc.drain();
+                        if (enc.has_pending()) {
+                            auto pages = enc.take_pending();
+                            std::vector<char> raw(pages.begin(), pages.end());
+                            _send_http_chunk(fd, conn, raw);
+                        }
+                    }
+#endif
                     _send_final_chunk(fd, conn);
                     if (rs == RequestContext::State::CANCELLED) {
                         fds_to_close.push_back(fd);
@@ -544,9 +589,15 @@ void AsyncHttpServer::_dispatch_request(int fd, Connection & conn) {
             spd = (float)yyjson_get_num(speed_val);
         }
 
-        // "format": "wav"  → accumulate and return a complete WAV file
-        // "format": "pcm"  → stream raw float32 PCM (default)
-        bool use_stream = !(fmt_str && std::string(fmt_str) == "wav");
+        // "format": "pcm"     → stream raw float32 PCM (default)
+        // "format": "wav"     → accumulate and return a complete WAV file
+        // "format": "ogg"     → stream Ogg/Opus with Transfer-Encoding: chunked
+        RequestContext::AudioFormat fmt = RequestContext::AudioFormat::PCM;
+        if (fmt_str) {
+            std::string fs(fmt_str);
+            if (fs == "wav")      fmt = RequestContext::AudioFormat::WAV;
+            else if (fs == "ogg") fmt = RequestContext::AudioFormat::OGG_OPUS;
+        }
 
         std::string current_voice = voice ? voice : _default_voice.c_str();
         StreamMode current_mode = _stream_mode;
@@ -579,13 +630,16 @@ void AsyncHttpServer::_dispatch_request(int fd, Connection & conn) {
             return;
         }
 
+        const char * fmt_name =
+            fmt == RequestContext::AudioFormat::WAV      ? "wav"
+          : fmt == RequestContext::AudioFormat::OGG_OPUS ? "ogg"
+          :                                                "pcm";
         std::fprintf(stderr, "[http] POST /tts: %zu chars, voice=%s, speed=%.1f, format=%s\n",
-                     text_str.size(), current_voice.c_str(), spd,
-                     use_stream ? "pcm" : "wav");
+                     text_str.size(), current_voice.c_str(), spd, fmt_name);
 
         // Submit to scheduler (round-robin interleaving)
         auto ctx = _scheduler->submit(
-            text_str, current_voice, spd, current_mode, use_stream);
+            text_str, current_voice, spd, current_mode, fmt);
 
         _send_streaming_response(fd, conn, ctx);
         return;
@@ -645,8 +699,9 @@ void AsyncHttpServer::_send_response(int fd, Connection & conn,
 void AsyncHttpServer::_send_streaming_response(int fd, Connection & conn,
                                                 std::shared_ptr<RequestContext> ctx) {
     conn.req_ctx = std::move(ctx);
-    if (conn.req_ctx->stream_mode) {
-        // PCM float32 stream — send headers immediately, chunks follow
+    auto fmt = conn.req_ctx->format;
+
+    if (fmt == RequestContext::AudioFormat::PCM) {
         std::ostringstream oss;
         oss << "HTTP/1.1 200 OK\r\n";
         oss << "Transfer-Encoding: chunked\r\n";
@@ -654,6 +709,26 @@ void AsyncHttpServer::_send_streaming_response(int fd, Connection & conn,
         oss << "Server: kokopop-async/0.1\r\n";
         oss << "\r\n";
         conn.write_buffer = oss.str();
+    } else if (fmt == RequestContext::AudioFormat::OGG_OPUS) {
+#ifdef KOKOPOP_HAS_OPUS
+        conn.req_ctx->opus_encoder =
+            std::make_unique<kokopop::OggOpusEncoder>(conn.req_ctx->sample_rate);
+        conn.req_ctx->opus_encoder->flush_header();
+#endif
+        std::ostringstream oss;
+        oss << "HTTP/1.1 200 OK\r\n";
+        oss << "Transfer-Encoding: chunked\r\n";
+        oss << "Content-Type: audio/ogg\r\n";
+        oss << "Server: kokopop-async/0.1\r\n";
+        oss << "\r\n";
+        conn.write_buffer = oss.str();
+#ifdef KOKOPOP_HAS_OPUS
+        if (conn.req_ctx->opus_encoder->has_pending()) {
+            auto pages = conn.req_ctx->opus_encoder->take_pending();
+            std::vector<char> raw(pages.begin(), pages.end());
+            _send_http_chunk(fd, conn, raw);
+        }
+#endif
     }
     // WAV mode: no headers yet — they are sent with the complete file in _send_wav_response
     conn.state = Connection::STATE_STREAMING;

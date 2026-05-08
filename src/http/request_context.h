@@ -2,9 +2,14 @@
 
 #include "streaming/streaming.h"
 
+#ifdef KOKOPOP_HAS_OPUS
+#  include "core/ogg_opus_encoder.h"
+#endif
+
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <string>
@@ -43,14 +48,17 @@ struct RequestContext {
     // ----------------------------------------------------------------
     // Request configuration
     // ----------------------------------------------------------------
+    enum class AudioFormat { PCM, WAV, OGG_OPUS };
+
     std::string text;
     std::string voice;
     float speed = 1.0f;
     StreamMode mode = StreamMode::Interactive;
+    AudioFormat format = AudioFormat::PCM;
 
-    /// If true, stream PCM float32 with Transfer-Encoding: chunked.
-    /// If false, accumulate and return a complete WAV file.
-    bool stream_mode = true;
+    bool is_streaming() const {
+        return format == AudioFormat::PCM || format == AudioFormat::OGG_OPUS;
+    }
 
     // ----------------------------------------------------------------
     // Synthesis plan (filled during PREPARING phase)
@@ -111,9 +119,16 @@ struct RequestContext {
     std::vector<float> prev_tail;
 
     // ----------------------------------------------------------------
-    // WAV accumulation (for non-streaming mode)
+    // WAV accumulation (for format=wav)
     // ----------------------------------------------------------------
     std::vector<float> wav_accumulator;
+
+    // ----------------------------------------------------------------
+    // Ogg/Opus encoder (for format=ogg, owned by event loop thread)
+    // ----------------------------------------------------------------
+#ifdef KOKOPOP_HAS_OPUS
+    std::unique_ptr<kokopop::OggOpusEncoder> opus_encoder;
+#endif
 
     // ----------------------------------------------------------------
     // Error reporting

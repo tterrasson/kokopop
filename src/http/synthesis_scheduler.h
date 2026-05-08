@@ -43,7 +43,7 @@ public:
         const std::string & voice,
         float speed,
         StreamMode mode,
-        bool stream_mode);
+        RequestContext::AudioFormat format);
 
     /// Stop the worker thread. Does not wait — call join() for that.
     void stop();

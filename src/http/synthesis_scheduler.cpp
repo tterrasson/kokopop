@@ -24,7 +24,7 @@ std::shared_ptr<RequestContext> SynthesisScheduler::submit(
     const std::string & voice,
     float speed,
     StreamMode mode,
-    bool stream_mode)
+    RequestContext::AudioFormat format)
 {
     auto ctx = std::make_shared<RequestContext>();
     ctx->request_id = next_request_id();
@@ -32,7 +32,7 @@ std::shared_ptr<RequestContext> SynthesisScheduler::submit(
     ctx->voice = voice;
     ctx->speed = speed;
     ctx->mode = mode;
-    ctx->stream_mode = stream_mode;
+    ctx->format = format;
     ctx->sample_rate = _model.sample_rate;
 
     {
@@ -41,9 +41,12 @@ std::shared_ptr<RequestContext> SynthesisScheduler::submit(
     }
     _queue_cv.notify_one();
 
-    std::fprintf(stderr, "[scheduler] request #%u submitted: %zu chars, voice=%s, stream=%s\n",
-                ctx->request_id, text.size(), voice.c_str(),
-                stream_mode ? "true" : "false");
+    const char * fmt_name =
+        format == RequestContext::AudioFormat::WAV     ? "wav"
+      : format == RequestContext::AudioFormat::OGG_OPUS ? "ogg"
+      :                                                   "pcm";
+    std::fprintf(stderr, "[scheduler] request #%u submitted: %zu chars, voice=%s, format=%s\n",
+                ctx->request_id, text.size(), voice.c_str(), fmt_name);
 
     return ctx;
 }

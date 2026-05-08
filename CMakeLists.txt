@@ -78,12 +78,27 @@ else()
   set(KOKOPOP_ESPEAK_INCLUDE_DIRS ${ESPEAK_NG_INCLUDE_DIR})
 endif()
 
+option(KOKOPOP_ENABLE_OPUS "Enable Ogg/Opus streaming output" ON)
+
+if(KOKOPOP_ENABLE_OPUS)
+  if(NOT PkgConfig_FOUND)
+    find_package(PkgConfig REQUIRED)
+  endif()
+  pkg_check_modules(OPUS REQUIRED opus)
+  pkg_check_modules(OGG REQUIRED ogg)
+  pkg_check_modules(OPUSENC REQUIRED libopusenc)
+  message(STATUS "kokopop: Ogg/Opus output enabled")
+else()
+  message(STATUS "kokopop: Ogg/Opus output disabled")
+endif()
+
 # Core utilities
 set(_kokopop_core_sources
   src/core/error.cpp
   src/core/replace.cpp
   src/core/utf8.cpp
   src/core/wav.cpp
+  src/core/ogg_opus_encoder.cpp
 )
 
 # Backend module
@@ -188,6 +203,20 @@ target_link_libraries(kokopop
     ${KOKOPOP_ESPEAK_LIBRARIES}
     yyjson
 )
+
+if(KOKOPOP_ENABLE_OPUS)
+  target_compile_definitions(kokopop PUBLIC KOKOPOP_HAS_OPUS)
+  target_include_directories(kokopop PRIVATE
+    ${OPUSENC_INCLUDE_DIRS}
+    ${OPUS_INCLUDE_DIRS}
+    ${OGG_INCLUDE_DIRS}
+  )
+  target_link_libraries(kokopop PRIVATE
+    ${OPUSENC_LIBRARIES}
+    ${OPUS_LIBRARIES}
+    ${OGG_LIBRARIES}
+  )
+endif()
 
 if(APPLE AND KOKOPOP_HAS_COREAUDIO)
   target_link_libraries(kokopop PRIVATE
