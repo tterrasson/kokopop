@@ -34,9 +34,9 @@ FetchContent_Declare(
   # Apply only when the patch still matches. This keeps re-configure
   # idempotent without leaving .rej files in FetchContent sources.
   PATCH_COMMAND
-    sh -c "git apply --check \"${CMAKE_SOURCE_DIR}/patches/ggml-metal-norm-scalar.patch\" && git apply \"${CMAKE_SOURCE_DIR}/patches/ggml-metal-norm-scalar.patch\" || true"
+    ${CMAKE_COMMAND} -DPATCH_FILE=${CMAKE_SOURCE_DIR}/patches/ggml-metal-norm-scalar.patch -P ${CMAKE_SOURCE_DIR}/tools/apply_patch_if_needed.cmake
     COMMAND
-    sh -c "git apply --check \"${CMAKE_SOURCE_DIR}/patches/ggml-conv-transpose-1d-simd.patch\" && git apply \"${CMAKE_SOURCE_DIR}/patches/ggml-conv-transpose-1d-simd.patch\" || true"
+    ${CMAKE_COMMAND} -DPATCH_FILE=${CMAKE_SOURCE_DIR}/patches/ggml-conv-transpose-1d-simd.patch -P ${CMAKE_SOURCE_DIR}/tools/apply_patch_if_needed.cmake
 )
 FetchContent_MakeAvailable(ggml)
 
@@ -111,6 +111,7 @@ if(KOKOPOP_ENABLE_METAL)
   list(APPEND _kokopop_backend_sources src/backend/metal.cpp)
   list(APPEND _kokopop_backend_sources src/backend/metal_lstm.mm)
   list(APPEND _kokopop_backend_sources src/backend/metal_stft.mm)
+  list(APPEND _kokopop_backend_sources src/backend/metal_vocoder.mm)
 endif()
 
 # Model module (GGUF loading)
