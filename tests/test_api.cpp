@@ -22,8 +22,8 @@ TEST_CASE("api_model_load_and_mock_synthesis") {
     }
     CHECK(peak > 0.001f);
 
-    CHECK_EQ(kokopop_write_wav("kokopop_mock_test.wav", &audio), KOKOPOP_OK);
-    std::ifstream wav("kokopop_mock_test.wav", std::ios::binary);
+    CHECK_EQ(kokopop_write_wav("tests/kokopop_mock_test.wav", &audio), KOKOPOP_OK);
+    std::ifstream wav("tests/kokopop_mock_test.wav", std::ios::binary);
     char riff[4] = {};
     wav.read(riff, 4);
     CHECK(std::memcmp(riff, "RIFF", 4) == 0);
@@ -128,8 +128,8 @@ TEST_CASE("api_write_wav_empty_audio") {
     audio.n_samples = 0;
     audio.sample_rate = 24000;
     // wav_bytes produces a valid header with empty data chunk
-    CHECK_EQ(kokopop_write_wav("kokopop_empty_audio.wav", &audio), KOKOPOP_OK);
-    std::remove("kokopop_empty_audio.wav");
+    CHECK_EQ(kokopop_write_wav("tests/kokopop_empty_audio.wav", &audio), KOKOPOP_OK);
+    std::remove("tests/kokopop_empty_audio.wav");
 }
 
 TEST_CASE("api_last_error_after_failure") {
