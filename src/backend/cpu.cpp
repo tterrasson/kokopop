@@ -21,12 +21,12 @@ class CpuBackend : public Backend {
 
     bool ensure_scheduler(ggml_cgraph * graph) {
         const size_t required = backend_graph_capacity(graph);
-        if (sched_ != nullptr && sched_capacity_ >= required) {
-            return true;
-        }
+        // Kokoro builds different tensor shapes for each chunk. Recreate the
+        // scheduler so ggml's graph allocator never reuses stale shape state.
         if (sched_ != nullptr) {
             ggml_backend_sched_free(sched_);
             sched_ = nullptr;
+            sched_capacity_ = 0;
         }
         ggml_backend_t backends[] = { backend_ };
         sched_ = ggml_backend_sched_new(backends, nullptr, 1, required, false, true);

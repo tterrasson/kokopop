@@ -125,7 +125,7 @@ void StdioStreamer::_synthesize(const std::string & text) {
         _speed,
         _mode,
         [](const float * data, size_t n_samples, int chunk_index, void * user_data) {
-            static_cast<StdioStreamer *>(user_data)->_on_audio(data, n_samples, chunk_index, nullptr);
+            static_cast<StdioStreamer *>(user_data)->_on_audio(data, n_samples, chunk_index, user_data);
             return true;
         },
         this);

@@ -75,6 +75,16 @@ int64_t voice_style_row(ggml_tensor * voice, int64_t n_tokens) {
     return std::clamp<int64_t>(n_tokens - 3, 0, voice->ne[1] - 1);
 }
 
+bool all_finite(const std::vector<float> & values, const char * label, std::string & error) {
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (!std::isfinite(values[i])) {
+            error = std::string("non-finite Kokoro ") + label + " value at index " + std::to_string(i);
+            return false;
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 int duration_to_frames(float value) {
@@ -552,6 +562,15 @@ bool run_kokoro_generation_probe(
     model.backend->tensor_get(
         decoder_style, model.tmp_decoder_style_f32.data(), 0,
         model.tmp_decoder_style_f32.size() * sizeof(float));
+
+    if (!all_finite(probe.f0, "f0", error) ||
+        !all_finite(probe.noise, "noise", error) ||
+        !all_finite(probe.asr, "asr", error) ||
+        !all_finite(probe.decoder, "decoder", error) ||
+        !all_finite(model.tmp_decoder_style_f32, "decoder style", error)) {
+        ggml_free(ctx);
+        return false;
+    }
 
     // 6.2 — Reuse model.tmp_decoder_cpu_f32 for the transposed decoder buffer.
     //       probe.decoder is row-major [decoder_dim][decoder_len] (raw flat).
