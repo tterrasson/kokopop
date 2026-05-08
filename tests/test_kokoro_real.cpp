@@ -84,6 +84,26 @@ TEST_CASE("real_kokoro_generation_probe") {
     CHECK(audio.peak > 0.35f);
 }
 
+TEST_CASE("real_kokoro_synthesize_stabilizes_af_heart_short_unpunctuated_text") {
+    auto * model = shared_real_model();
+    if (!model) { MESSAGE("skipping: models/kokoro-md.gguf not found"); return; }
+
+    std::string phonemes;
+    std::string error;
+    CHECK(kokopop::phonemize_text("Hello world", "af_heart", phonemes, error));
+
+    kokopop_audio audio{};
+    CHECK(kokopop::synthesize_phonemes(*model, phonemes, "af_heart", 1.0f, audio, error));
+
+    std::vector<float> samples(audio.samples, audio.samples + audio.n_samples);
+    kokopop_audio_free(&audio);
+
+    const Stats audio_stats = stats(samples);
+    CHECK(audio_stats.rms > 0.02);
+    CHECK(audio_stats.rms < 0.2);
+    CHECK(audio_stats.peak < 0.6f);
+}
+
 TEST_CASE("real_kokoro_scratch_reuse") {
     auto * model = shared_real_model();
     if (!model) { MESSAGE("skipping: models/kokoro-md.gguf not found"); return; }

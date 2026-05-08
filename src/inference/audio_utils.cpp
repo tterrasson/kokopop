@@ -307,9 +307,9 @@ bool cpu_istft(Model & model, const CpuTensor & post, std::vector<float> & out) 
         float imag[n_fft / 2 + 1]{};
         for (int k = 0; k <= n_fft / 2; ++k) {
             const float mag = std::exp(std::clamp(post.at(k, frame), -20.0f, 8.0f));
-            // ph = sin(stored_phase) ∈ [-1,1] ⊂ (-π/2,π/2) → cos(ph) always positive.
-            const float sin_ph = std::sin(post.at(k + n_fft / 2 + 1, frame));
-            const float cos_ph = std::sqrt(std::max(0.0f, 1.0f - sin_ph * sin_ph));
+            const float phase = std::sin(post.at(k + n_fft / 2 + 1, frame));
+            const float sin_ph = std::sin(phase);
+            const float cos_ph = std::cos(phase);
             real[k] = mag * cos_ph;
             imag[k] = mag * sin_ph;
         }

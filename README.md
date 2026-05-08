@@ -208,11 +208,12 @@ A minimal Python client is provided. It requires no third-party packages.
 
 ```bash
 # Start the server first
-./kokopop_stream --model models/kokoro.gguf --voice ff_siwis --http --port 8080
+./kokopop_stream \
+  --model models/kokoro.gguf \
+  --voice af_heart --http --mode interactive --port 8080
 
-# Stream PCM and play in real time (requires ffplay)
-uv run python tools/tts_client.py "Hello world" | \
-  ffplay -f f32le -ar 24000 -ac 1 -nodisp -
+# Stream PCM and play in real time (requires mpv)
+uv run python tools/tts_client.py --format wav "Hello world" | mpv -
 
 # Stream PCM and save as WAV (client-side conversion)
 uv run python tools/tts_client.py "Hello world" --out hello.wav

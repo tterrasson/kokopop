@@ -74,7 +74,7 @@ inline void align_to(std::vector<uint8_t> & out, size_t alignment) {
 }
 
 inline std::string write_mock_gguf() {
-    const std::string path = "tests/kokopop_mock_test.gguf";
+    const std::string path = "kokopop_mock_test.gguf";
     std::vector<uint8_t> bytes;
     bytes.insert(bytes.end(), {'G', 'G', 'U', 'F'});
     put_u32(bytes, 3);
