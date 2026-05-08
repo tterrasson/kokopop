@@ -6,7 +6,7 @@ A standalone C++ library and toolkit for running [Kokoro](https://github.com/hex
 
 - **Zero dependencies beyond libespeak-ng and ggml** — no Python, no heavy ML frameworks
 - **CPU inference** with configurable thread count
-- **Metal GPU backend** (macOS) for accelerated inference
+- **Metal GPU backend** (macOS) for accelerated inference (experimental)
 - **Streaming API** for real-time audio generation
 - **Chunked synthesis** for long-form text processing
 - **WAV output** and optional direct playback (Core Audio on macOS)
@@ -343,6 +343,53 @@ Build and run benchmarks (requires a Kokoro GGUF model):
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DKOKOPOP_BUILD_BENCH=ON
 cmake --build build
 ./build/kokopop_bench --model models/kokoro.gguf
+```
+
+### Runtime Benchmarks (`kokopop_rt`)
+
+Run `kokopop_rt` to get a detailed per-chunk real-time factor breakdown:
+
+```bash
+./build/kokopop_rt \
+  --model models/kokoro-md.gguf \
+  --voice af_heart \
+  --backend cpu \
+  --threads 4 \
+  --seed 1234 2>/dev/null
+```
+
+**Hardware:** MacBook Pro M1, **Backend:** CPU, **Threads:** 4
+
+```
+  Backend:     CPU
+  Voice:       af_heart
+  Threads:     4
+  Sample Rate: 24000 Hz
+  Sentences:   10 → 10 chunk(s) (947 tokens)
+
+  Prepare time:       7.0 ms (chunking + phonemization)
+
+  ┌──────┬────────┬────────────┬──────────┬──────────┬──────────┐
+  │ Chunk│ Tokens │  Gen Time  │ Duration │    RT    │ Samples  │
+  ├──────┼────────┼────────────┼──────────┼──────────┼──────────┤
+  │     1│     183│   6278.9ms │    11.79s│     1.88x│    283080│
+  │     2│      41│   1515.4ms │     2.88s│     1.90x│     69000│
+  │     3│     180│   6450.7ms │    11.45s│     1.78x│    274800│
+  │     4│      21│    939.8ms │     1.85s│     1.97x│     44400│
+  │     5│     123│   4202.7ms │     7.72s│     1.84x│    185400│
+  │     6│      76│   2602.0ms │     4.83s│     1.85x│    115800│
+  │     7│      95│   3313.6ms │     6.15s│     1.86x│    147600│
+  │     8│      92│   3091.9ms │     5.75s│     1.86x│    138000│
+  │     9│      63│   2015.1ms │     3.85s│     1.91x│     92400│
+  │    10│      73│   2317.5ms │     4.28s│     1.85x│    102720│
+  └──────┴────────┴────────────┴──────────┴──────────┴──────────┘
+  ─────────────────────────────────────────────────────────
+
+  Total Generation:  32727.6 ms
+  Total Audio:        60.55 s  (1453200 samples @ 24000 Hz)
+  Overall RT:         1.85x
+  TTFB (1st chunk):  6278.9 ms
+  → 1.9x faster than real-time
 ```
 
 ## License
