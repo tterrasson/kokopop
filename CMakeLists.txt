@@ -31,11 +31,12 @@ FetchContent_Declare(
   #         values for certain token patterns (e.g. comma phrases).
   # Fix 4: dispatch CONV_TRANSPOSE_1D with 32 threads/group and simd_sum
   #         reduction, avoiding GPU watchdog on large generator dims.
-  # patch -N skips patches already applied (idempotent on re-configure).
+  # Apply only when the patch still matches. This keeps re-configure
+  # idempotent without leaving .rej files in FetchContent sources.
   PATCH_COMMAND
-    patch -N -p1 < ${CMAKE_SOURCE_DIR}/patches/ggml-metal-norm-scalar.patch || true
+    sh -c "git apply --check \"${CMAKE_SOURCE_DIR}/patches/ggml-metal-norm-scalar.patch\" && git apply \"${CMAKE_SOURCE_DIR}/patches/ggml-metal-norm-scalar.patch\" || true"
     COMMAND
-    patch -N -p1 < ${CMAKE_SOURCE_DIR}/patches/ggml-conv-transpose-1d-simd.patch || true
+    sh -c "git apply --check \"${CMAKE_SOURCE_DIR}/patches/ggml-conv-transpose-1d-simd.patch\" && git apply \"${CMAKE_SOURCE_DIR}/patches/ggml-conv-transpose-1d-simd.patch\" || true"
 )
 FetchContent_MakeAvailable(ggml)
 

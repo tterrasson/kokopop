@@ -12,3 +12,4 @@ index d211bf7..23eb083 100644
 +    if (op->op != GGML_OP_NORM && op->ne[0] % 4 == 0) {
          suffix = "_4";
      }
+ 
