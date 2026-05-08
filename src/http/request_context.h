@@ -55,6 +55,8 @@ struct RequestContext {
     float speed = 1.0f;
     StreamMode mode = StreamMode::Interactive;
     AudioFormat format = AudioFormat::PCM;
+    ChunkConfig chunk_config;      // override fields (defaults = no-op)
+    bool has_chunk_config = false;
 
     bool is_streaming() const {
         return format == AudioFormat::PCM || format == AudioFormat::OGG_OPUS;

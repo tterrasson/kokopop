@@ -24,7 +24,9 @@ std::shared_ptr<RequestContext> SynthesisScheduler::submit(
     const std::string & voice,
     float speed,
     StreamMode mode,
-    RequestContext::AudioFormat format)
+    RequestContext::AudioFormat format,
+    const ChunkConfig & chunk_config_override,
+    bool has_chunk_config_override)
 {
     auto ctx = std::make_shared<RequestContext>();
     ctx->request_id = next_request_id();
@@ -33,6 +35,8 @@ std::shared_ptr<RequestContext> SynthesisScheduler::submit(
     ctx->speed = speed;
     ctx->mode = mode;
     ctx->format = format;
+    ctx->chunk_config = chunk_config_override;
+    ctx->has_chunk_config = has_chunk_config_override;
     ctx->sample_rate = _model.sample_rate;
 
     {
@@ -99,6 +103,11 @@ void SynthesisScheduler::_worker_loop() {
                 std::fprintf(stderr, "[scheduler] request #%u prepare failed: %s\n",
                             ctx->request_id, ctx->error.c_str());
                 continue;
+            }
+
+            // Apply chunking overrides from the HTTP request
+            if (ctx->has_chunk_config) {
+                plan.config = merge_chunk_config(plan.config, ctx->chunk_config);
             }
 
             ctx->plan = std::make_shared<SynthesisPlan>(std::move(plan));

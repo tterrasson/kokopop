@@ -52,6 +52,11 @@ ChunkConfig make_interactive_config();
 /// Default "long-form" config — larger chunks, better prosody
 ChunkConfig make_long_form_config();
 
+/// Merge `overrides` into `base`: only non-default fields in overrides
+/// replace the corresponding fields in base.  This lets a client send a
+/// partial ChunkConfig that patches the preset.
+ChunkConfig merge_chunk_config(ChunkConfig base, ChunkConfig overrides);
+
 // ---------------------------------------------------------------------------
 // Unit — a text fragment with phonemes and tokens (pre-chunking)
 // ---------------------------------------------------------------------------

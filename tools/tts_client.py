@@ -20,6 +20,12 @@ Usage:
 
     # Save Ogg/Opus to file
     uv run python tools/tts_client.py "Hello world" --format ogg --out hello.ogg
+
+    # Override chunking params (patches the mode preset)
+    uv run python tools/tts_client.py "Hello world" \\
+        --chunk-target-max 80 --chunk-first-max 40 \\
+        --chunk-crossfade 15 --chunk-sentence-pause 100 \\
+        --out hello.wav
 """
 
 from __future__ import annotations
@@ -36,8 +42,8 @@ from typing import BinaryIO
 
 STREAM_READ_SIZE = 1024
 OGG_OPUS_GRANULE_RATE = 48000
-DEFAULT_OGG_PREBUFFER_MS = 5000
-DEFAULT_OGG_BURST_GAP_MS = 200
+DEFAULT_OGG_PREBUFFER_MS = 3000
+DEFAULT_OGG_BURST_GAP_MS = 250
 
 
 def _read_stream(resp: BinaryIO, emit_stdout: bool) -> bytes:
@@ -218,18 +224,23 @@ def _pcm_to_wav(pcm: bytes, sample_rate: int = 24000) -> bytes:
     return header + pcm
 
 
-def stream_pcm(
+def _build_payload(
     text: str,
     voice: str | None,
     speed: float,
     mode: str,
-    url: str,
-    emit_stdout: bool,
-) -> bytes:
-    payload = {"text": text, "speed": speed, "mode": mode, "format": "pcm"}
+    fmt: str,
+    chunking: dict | None,
+) -> dict:
+    payload = {"text": text, "speed": speed, "mode": mode, "format": fmt}
     if voice:
         payload["voice"] = voice
+    if chunking:
+        payload["chunking"] = chunking
+    return payload
 
+
+def _send_tts(url: str, payload: dict, read_fn) -> bytes:
     body = json.dumps(payload).encode()
     req = urllib.request.Request(
         url,
@@ -237,9 +248,27 @@ def stream_pcm(
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-
     with urllib.request.urlopen(req) as resp:
-        return _read_stream(resp, emit_stdout)
+        return read_fn(resp)
+
+
+def stream_pcm(
+    text: str,
+    voice: str | None,
+    speed: float,
+    mode: str,
+    url: str,
+    emit_stdout: bool,
+    chunking: dict | None,
+) -> bytes:
+    payload = _build_payload(text, voice, speed, mode, "pcm", chunking)
+    buf: list[bytes] = []
+    def read_fn(resp):
+        out = _read_stream(resp, emit_stdout)
+        buf.append(out)
+        return out
+    _send_tts(url, payload, read_fn)
+    return buf[0] if buf else b""
 
 
 def fetch_wav(
@@ -248,21 +277,12 @@ def fetch_wav(
     speed: float,
     mode: str,
     url: str,
+    chunking: dict | None,
 ) -> bytes:
-    payload = {"text": text, "speed": speed, "mode": mode, "format": "wav"}
-    if voice:
-        payload["voice"] = voice
-
-    body = json.dumps(payload).encode()
-    req = urllib.request.Request(
-        url,
-        data=body,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-
-    with urllib.request.urlopen(req) as resp:
+    payload = _build_payload(text, voice, speed, mode, "wav", chunking)
+    def read_fn(resp):
         return resp.read()
+    return _send_tts(url, payload, read_fn)
 
 
 def stream_ogg(
@@ -275,22 +295,13 @@ def stream_ogg(
     prebuffer_mode: str,
     prebuffer_ms: int,
     burst_gap_ms: int,
+    chunking: dict | None,
 ) -> bytes:
-    payload = {"text": text, "speed": speed, "mode": mode, "format": "ogg"}
-    if voice:
-        payload["voice"] = voice
-
-    body = json.dumps(payload).encode()
-    req = urllib.request.Request(
-        url,
-        data=body,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-
-    with urllib.request.urlopen(req) as resp:
+    payload = _build_payload(text, voice, speed, mode, "ogg", chunking)
+    def read_fn(resp):
         return _read_ogg_stream(resp, emit_stdout, prebuffer_mode,
                                 prebuffer_ms, burst_gap_ms)
+    return _send_tts(url, payload, read_fn)
 
 
 def main() -> None:
@@ -316,6 +327,41 @@ def main() -> None:
                         help="Idle gap used to detect the next TTS chunk in "
                              "second-chunk mode "
                              f"(default: {DEFAULT_OGG_BURST_GAP_MS})")
+
+    # -- Chunking overrides (sent as "chunking" JSON object) ----
+    chunk_grp = parser.add_argument_group("chunking overrides")
+    chunk_grp.add_argument("--chunk-target-min", type=int, default=None,
+                           help="Minimum tokens per chunk (default: preset)")
+    chunk_grp.add_argument("--chunk-target-max", type=int, default=None,
+                           help="Target max tokens per chunk (default: preset)")
+    chunk_grp.add_argument("--chunk-soft-max", type=int, default=None,
+                           help="Soft max tokens before forced split (default: preset)")
+    chunk_grp.add_argument("--chunk-hard-max", type=int, default=None,
+                           help="Hard max tokens per chunk (default: preset)")
+    chunk_grp.add_argument("--chunk-first-max", type=int, default=None,
+                           help="First-chunk target max for low TTFB (default: preset)")
+    chunk_grp.add_argument("--chunk-allow-short-first", dest="allow_short_first",
+                           action="store_true", default=None,
+                           help="Allow a short first chunk (default: preset)")
+    chunk_grp.add_argument("--chunk-no-short-first", dest="allow_short_first",
+                           action="store_false",
+                           help="Disable short first chunk (default: preset)")
+    chunk_grp.add_argument("--chunk-comma-pause", type=int, default=None,
+                           help="Comma pause in ms (default: preset)")
+    chunk_grp.add_argument("--chunk-sentence-pause", type=int, default=None,
+                           help="Sentence pause in ms (default: preset)")
+    chunk_grp.add_argument("--chunk-paragraph-pause", type=int, default=None,
+                           help="Paragraph pause in ms (default: preset)")
+    chunk_grp.add_argument("--chunk-crossfade", type=int, default=None,
+                           help="Crossfade between chunks in ms (default: preset)")
+    chunk_grp.add_argument("--chunk-trim-silence", dest="trim_silence",
+                           action="store_true", default=None,
+                           help="Enable silence trimming (default: preset)")
+    chunk_grp.add_argument("--chunk-no-trim", dest="trim_silence",
+                           action="store_false",
+                           help="Disable silence trimming (default: preset)")
+    chunk_grp.add_argument("--chunk-max-trim", type=int, default=None,
+                           help="Max silence trim in ms (default: preset)")
     parser.add_argument("--out", default=None,
                         help="Output file (.wav). If omitted and format=pcm, "
                              "raw PCM is written to stdout.")
@@ -329,8 +375,32 @@ def main() -> None:
     else:
         parser.error("the following arguments are required: text or --file")
 
+    # Build chunking override dict (only non-None fields)
+    _chunking = {}
+    field_map = [
+        ("chunk_target_min", "target_min_tokens"),
+        ("chunk_target_max", "target_max_tokens"),
+        ("chunk_soft_max", "soft_max_tokens"),
+        ("chunk_hard_max", "hard_max_tokens"),
+        ("chunk_first_max", "first_chunk_target_max_tokens"),
+        ("chunk_comma_pause", "comma_pause_ms"),
+        ("chunk_sentence_pause", "sentence_pause_ms"),
+        ("chunk_paragraph_pause", "paragraph_pause_ms"),
+        ("chunk_crossfade", "crossfade_ms"),
+        ("chunk_max_trim", "max_silence_trim_ms"),
+    ]
+    for cli_name, json_name in field_map:
+        val = getattr(args, cli_name)
+        if val is not None:
+            _chunking[json_name] = val
+    if args.allow_short_first is not None:
+        _chunking["allow_short_first_chunk"] = args.allow_short_first
+    if args.trim_silence is not None:
+        _chunking["trim_silence"] = args.trim_silence
+    chunking = _chunking if _chunking else None
+
     if args.fmt == "wav":
-        data = fetch_wav(text, args.voice, args.speed, args.mode, args.url)
+        data = fetch_wav(text, args.voice, args.speed, args.mode, args.url, chunking)
         if args.out:
             Path(args.out).write_bytes(data)
             print(f"Saved {len(data):,} bytes → {args.out}", file=sys.stderr)
@@ -340,7 +410,7 @@ def main() -> None:
         emit_stdout = args.out is None and not sys.stdout.buffer.isatty()
         ogg = stream_ogg(text, args.voice, args.speed, args.mode, args.url,
                          emit_stdout, args.prebuffer_mode,
-                         args.prebuffer_ms, args.prebuffer_gap_ms)
+                         args.prebuffer_ms, args.prebuffer_gap_ms, chunking)
         if args.out:
             Path(args.out).write_bytes(ogg)
             print(f"Saved {len(ogg):,} bytes → {args.out}", file=sys.stderr)
@@ -354,7 +424,8 @@ def main() -> None:
     else:
         # PCM mode: stream to stdout or save as WAV
         emit_stdout = args.out is None and not sys.stdout.buffer.isatty()
-        pcm = stream_pcm(text, args.voice, args.speed, args.mode, args.url, emit_stdout)
+        pcm = stream_pcm(text, args.voice, args.speed, args.mode, args.url,
+                         emit_stdout, chunking)
         if args.out:
             wav = _pcm_to_wav(pcm)
             Path(args.out).write_bytes(wav)

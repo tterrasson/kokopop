@@ -43,7 +43,9 @@ public:
         const std::string & voice,
         float speed,
         StreamMode mode,
-        RequestContext::AudioFormat format);
+        RequestContext::AudioFormat format,
+        const ChunkConfig & chunk_config_override = ChunkConfig{},
+        bool has_chunk_config_override = false);
 
     /// Stop the worker thread. Does not wait — call join() for that.
     void stop();

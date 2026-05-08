@@ -213,7 +213,12 @@ A minimal Python client is provided. It requires no third-party packages.
   --voice af_heart --http --mode interactive --port 8080
 
 # Stream ogg/opus and play in real time (requires ffplay)
-uv run python tools/tts_client.py --file LICENSE --format ogg --prebuffer-mode second-chunk | ffplay -i pipe:0
+uv run python tools/tts_client.py \
+  --file LICENSE \
+  --format ogg \
+  --prebuffer-mode second-chunk \
+  --chunk-target-min 5 \
+  --chunk-target-max 10 | ffplay -i pipe:0
 
 # Stream PCM and save as WAV (client-side conversion)
 uv run python tools/tts_client.py "Hello world" --out hello.wav

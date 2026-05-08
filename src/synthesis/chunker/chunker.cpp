@@ -19,7 +19,7 @@ ChunkConfig make_interactive_config() {
     cfg.target_max_tokens = 100;
     cfg.soft_max_tokens = 240;
     cfg.hard_max_tokens = 510;
-    cfg.first_chunk_target_max_tokens = 60;
+    cfg.first_chunk_target_max_tokens = 80;
     cfg.allow_short_first_chunk = true;
     cfg.comma_pause_ms = 70;
     cfg.sentence_pause_ms = 170;
@@ -45,6 +45,35 @@ ChunkConfig make_long_form_config() {
     cfg.trim_silence = true;
     cfg.max_silence_trim_ms = 160;
     return cfg;
+}
+
+ChunkConfig merge_chunk_config(ChunkConfig base, ChunkConfig overrides) {
+    ChunkConfig def; // all defaults
+    if (overrides.target_min_tokens != def.target_min_tokens)
+        base.target_min_tokens = overrides.target_min_tokens;
+    if (overrides.target_max_tokens != def.target_max_tokens)
+        base.target_max_tokens = overrides.target_max_tokens;
+    if (overrides.soft_max_tokens != def.soft_max_tokens)
+        base.soft_max_tokens = overrides.soft_max_tokens;
+    if (overrides.hard_max_tokens != def.hard_max_tokens)
+        base.hard_max_tokens = overrides.hard_max_tokens;
+    if (overrides.first_chunk_target_max_tokens != def.first_chunk_target_max_tokens)
+        base.first_chunk_target_max_tokens = overrides.first_chunk_target_max_tokens;
+    if (overrides.allow_short_first_chunk != def.allow_short_first_chunk)
+        base.allow_short_first_chunk = overrides.allow_short_first_chunk;
+    if (overrides.comma_pause_ms != def.comma_pause_ms)
+        base.comma_pause_ms = overrides.comma_pause_ms;
+    if (overrides.sentence_pause_ms != def.sentence_pause_ms)
+        base.sentence_pause_ms = overrides.sentence_pause_ms;
+    if (overrides.paragraph_pause_ms != def.paragraph_pause_ms)
+        base.paragraph_pause_ms = overrides.paragraph_pause_ms;
+    if (overrides.crossfade_ms != def.crossfade_ms)
+        base.crossfade_ms = overrides.crossfade_ms;
+    if (overrides.trim_silence != def.trim_silence)
+        base.trim_silence = overrides.trim_silence;
+    if (overrides.max_silence_trim_ms != def.max_silence_trim_ms)
+        base.max_silence_trim_ms = overrides.max_silence_trim_ms;
+    return base;
 }
 
 // ---------------------------------------------------------------------------

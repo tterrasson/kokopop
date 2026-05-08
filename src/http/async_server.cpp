@@ -589,6 +589,38 @@ void AsyncHttpServer::_dispatch_request(int fd, Connection & conn) {
             spd = (float)yyjson_get_num(speed_val);
         }
 
+        // Parse optional "chunking" overrides
+        ChunkConfig chunk_override = ChunkConfig{};
+        bool has_chunk_config = false;
+        yyjson_val * chunking_obj = yyjson_obj_get(root, "chunking");
+        if (chunking_obj && yyjson_is_obj(chunking_obj)) {
+            has_chunk_config = true;
+            auto read_int = [&](const char *key, int &field) {
+                yyjson_val *v = yyjson_obj_get(chunking_obj, key);
+                if (v && !yyjson_is_null(v) && yyjson_is_num(v)) {
+                    field = static_cast<int>(yyjson_get_int(v));
+                }
+            };
+            auto read_bool = [&](const char *key, bool &field) {
+                yyjson_val *v = yyjson_obj_get(chunking_obj, key);
+                if (v && !yyjson_is_null(v) && yyjson_is_bool(v)) {
+                    field = yyjson_get_bool(v);
+                }
+            };
+            read_int("target_min_tokens", chunk_override.target_min_tokens);
+            read_int("target_max_tokens", chunk_override.target_max_tokens);
+            read_int("soft_max_tokens", chunk_override.soft_max_tokens);
+            read_int("hard_max_tokens", chunk_override.hard_max_tokens);
+            read_int("first_chunk_target_max_tokens", chunk_override.first_chunk_target_max_tokens);
+            read_bool("allow_short_first_chunk", chunk_override.allow_short_first_chunk);
+            read_int("comma_pause_ms", chunk_override.comma_pause_ms);
+            read_int("sentence_pause_ms", chunk_override.sentence_pause_ms);
+            read_int("paragraph_pause_ms", chunk_override.paragraph_pause_ms);
+            read_int("crossfade_ms", chunk_override.crossfade_ms);
+            read_bool("trim_silence", chunk_override.trim_silence);
+            read_int("max_silence_trim_ms", chunk_override.max_silence_trim_ms);
+        }
+
         // "format": "pcm"     → stream raw float32 PCM (default)
         // "format": "wav"     → accumulate and return a complete WAV file
         // "format": "ogg"     → stream Ogg/Opus with Transfer-Encoding: chunked
@@ -639,7 +671,8 @@ void AsyncHttpServer::_dispatch_request(int fd, Connection & conn) {
 
         // Submit to scheduler (round-robin interleaving)
         auto ctx = _scheduler->submit(
-            text_str, current_voice, spd, current_mode, fmt);
+            text_str, current_voice, spd, current_mode, fmt,
+            chunk_override, has_chunk_config);
 
         _send_streaming_response(fd, conn, ctx);
         return;
