@@ -50,6 +50,15 @@ ggml_tensor * conv_transpose1d_crop(
     int stride,
     int crop_left,
     int out_len);
+ggml_tensor * conv_transpose1d_crop_bias(
+    ggml_context * ctx,
+    Model & model,
+    ggml_tensor * weight,
+    ggml_tensor * input,
+    ggml_tensor * bias,
+    int stride,
+    int crop_left,
+    int out_len);
 ggml_tensor * depthwise_pool_upsample(
     ggml_context * ctx,
     Model & model,

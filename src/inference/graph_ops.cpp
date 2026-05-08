@@ -1,11 +1,92 @@
 #include "kokoro.h"
 #include "lstm_fused.h"
 
+#ifdef KOKOPOP_HAS_METAL
+#include "backend/metal_vocoder.h"
+#endif
+
 #include "core/constants.h"
 
+#include <cstdio>
 #include <cstring>
 
 namespace kokopop {
+
+namespace {
+
+#ifdef KOKOPOP_HAS_METAL
+static float convt_weight_at(const ggml_tensor * weight, int64_t k, int64_t oc, int64_t ic) {
+    const size_t index = static_cast<size_t>(k + weight->ne[0] * oc + weight->ne[0] * weight->ne[1] * ic);
+    if (weight->type == GGML_TYPE_F16) {
+        return ggml_fp16_to_fp32(static_cast<const ggml_fp16_t *>(weight->data)[index]);
+    }
+    return static_cast<const float *>(weight->data)[index];
+}
+
+void convt_crop_bias_cpu_fallback(
+    ggml_tensor * dst,
+    const ggml_tensor * input,
+    const ggml_tensor * weight,
+    const ggml_tensor * bias,
+    int stride,
+    int crop_left) {
+    const float * x = static_cast<const float *>(input->data);
+    const float * b = static_cast<const float *>(bias->data);
+    float * y = static_cast<float *>(dst->data);
+    const int64_t il = input->ne[0];
+    const int64_t ic_count = input->ne[1];
+    const int64_t k_count = weight->ne[0];
+    const int64_t oc_count = weight->ne[1];
+    const int64_t ol = dst->ne[0];
+    for (int64_t oc = 0; oc < oc_count; ++oc) {
+        for (int64_t t = 0; t < ol; ++t) {
+            const int64_t full_t = t + crop_left;
+            float acc = b[oc];
+            for (int64_t ic = 0; ic < ic_count; ++ic) {
+                for (int64_t k = 0; k < k_count; ++k) {
+                    const int64_t src_num = full_t - k;
+                    if (src_num < 0 || (src_num % stride) != 0) {
+                        continue;
+                    }
+                    const int64_t ti = src_num / stride;
+                    if (ti >= il) {
+                        continue;
+                    }
+                    acc += convt_weight_at(weight, k, oc, ic) *
+                           x[static_cast<size_t>(ti + il * ic)];
+                }
+            }
+            y[static_cast<size_t>(t + ol * oc)] = acc;
+        }
+    }
+}
+
+void metal_vocoder_convt_callback(
+    ggml_tensor * dst,
+    const ggml_tensor * output_storage,
+    const ggml_tensor * input,
+    const ggml_tensor * weight,
+    int /* ith */,
+    int /* nth */,
+    void * userdata) {
+    (void)output_storage;
+    const auto * params = static_cast<const MetalVocoderConvTransposeParams *>(userdata);
+    if (params == nullptr || params->kernel == nullptr || params->bias == nullptr ||
+        !metal_vocoder_conv_transpose1d_crop_bias(
+            static_cast<MetalVocoderState *>(params->kernel),
+            input,
+            weight,
+            params->bias,
+            dst,
+            params->stride,
+            params->crop_left)) {
+        std::fprintf(stderr, "[metal_vocoder] conv_transpose1d_crop_bias failed\n");
+        convt_crop_bias_cpu_fallback(dst, input, weight, params->bias, params->stride, params->crop_left);
+    }
+}
+#endif
+
+} // namespace
 
 // ---------------------------------------------------------------------------
 // Basic graph operations
@@ -106,6 +187,46 @@ ggml_tensor * conv_transpose1d_crop(
         return conv;
     }
     return ggml_view_2d(ctx, conv, out_len, conv->ne[1], conv->nb[1], crop_left * conv->nb[0]);
+}
+
+ggml_tensor * conv_transpose1d_crop_bias(
+    ggml_context * ctx,
+    Model & model,
+    ggml_tensor * weight,
+    ggml_tensor * input,
+    ggml_tensor * bias,
+    int stride,
+    int crop_left,
+    int out_len) {
+#ifdef KOKOPOP_HAS_METAL
+    if (model.backend != nullptr &&
+        model.backend->use_metal_vocoder_convt() &&
+        input->type == GGML_TYPE_F32 &&
+        (weight->type == GGML_TYPE_F32 || weight->type == GGML_TYPE_F16) &&
+        bias->type == GGML_TYPE_F32 &&
+        input->ne[1] == weight->ne[2] &&
+        bias->ne[0] == weight->ne[1] &&
+        out_len > 0) {
+        model.metal_vocoder_convt_params.push_back({
+            model.backend->metal_vocoder_kernel(),
+            bias,
+            stride,
+            crop_left,
+        });
+        const MetalVocoderConvTransposeParams * params = &model.metal_vocoder_convt_params.back();
+        ggml_tensor * out = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, out_len, weight->ne[1]);
+        return ggml_map_custom3_inplace(
+            ctx,
+            out,
+            input,
+            weight,
+            metal_vocoder_convt_callback,
+            1,
+            const_cast<MetalVocoderConvTransposeParams *>(params));
+    }
+#endif
+
+    return add_channel_bias(ctx, conv_transpose1d_crop(ctx, weight, input, stride, crop_left, out_len), bias);
 }
 
 // ---------------------------------------------------------------------------

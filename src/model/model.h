@@ -151,6 +151,11 @@ struct Model {
     // See graph_ops.cpp::lstm_direction for usage.
     std::vector<struct LstmCustomParams> lstm_custom_params;
 
+    // Scratch storage for experimental Metal vocoder custom-op parameters.
+    // Reserved before building the generator graph so userdata pointers remain
+    // stable until graph execution completes.
+    std::vector<MetalVocoderConvTransposeParams> metal_vocoder_convt_params;
+
     // Lazily cached inference constants derived from immutable model weights.
     std::unordered_map<std::string, std::vector<float>> depthwise_pool_kernels;
     std::vector<float> harmonic_merge_w;

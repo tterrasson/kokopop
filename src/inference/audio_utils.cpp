@@ -387,6 +387,9 @@ bool ggml_generator(
     ggml_set_input(style_t);
     ggml_set_input(har_t);
 
+    model.metal_vocoder_convt_params.clear();
+    model.metal_vocoder_convt_params.reserve(4);
+
     struct StageParams {
         int kernel;
         int up_stride;
@@ -451,10 +454,8 @@ bool ggml_generator(
             return false;
         }
         const int64_t out_len = (x->ne[0] - 1) * sp.up_stride - 2 * sp.up_padding + up_w->ne[0];
-        x = add_channel_bias(ctx,
-            conv_transpose1d_crop(ctx, up_w, x, sp.up_stride,
-                sp.up_padding, static_cast<int>(out_len)),
-            up_b);
+        x = conv_transpose1d_crop_bias(ctx, model, up_w, x, up_b, sp.up_stride,
+            sp.up_padding, static_cast<int>(out_len));
         if (stage == 1) {
             x = ggml_pad_reflect_1d(ctx, x, 1, 0);
         }

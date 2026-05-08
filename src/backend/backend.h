@@ -106,6 +106,14 @@ struct Backend {
     // Used by cpu_harmonic_stft to dispatch the DFT on the GPU.
     virtual void * metal_stft_kernel() const { return nullptr; }
 
+    // Return the experimental Metal vocoder kernel handle cast to void*
+    // (null for CPU backend). Used by selected custom ggml nodes.
+    virtual void * metal_vocoder_kernel() const { return nullptr; }
+
+    // Optional: enable experimental Metal vocoder kernels. Default is false so
+    // the CPU backend and the stable Metal placement remain unchanged.
+    virtual bool use_metal_vocoder_convt() const { return false; }
+
     // ---- Context sizing ----
 
     // Memory bytes needed for a generation scratch context.
@@ -133,6 +141,13 @@ struct PendingInit {
     ggml_tensor * tensor = nullptr;
     std::vector<uint8_t> bytes;
     bool zero = false;
+};
+
+struct MetalVocoderConvTransposeParams {
+    void * kernel = nullptr;
+    const ggml_tensor * bias = nullptr;
+    int stride = 1;
+    int crop_left = 0;
 };
 
 // Factory: creates a CPU backend (always available).

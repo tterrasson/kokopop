@@ -1,6 +1,7 @@
 #include "metal.h"
 #include "metal_lstm.h"
 #include "metal_stft.h"
+#include "metal_vocoder.h"
 #include "core/constants.h"
 
 #include <algorithm>
@@ -82,6 +83,8 @@ static size_t graph_capacity(ggml_cgraph * graph) {
 //                                Set to 0 to always use Metal for frontend.
 //   KOKOPOP_METAL_LSTM_MIN_STEPS=N — minimum sequence length for the custom
 //                                Metal LSTM kernel (default 128).
+//   KOKOPOP_METAL_VOCODER_CONVT=1 — experimental standalone Metal kernel for
+//                                generator conv_transpose1d_crop+bias nodes.
 //   KOKOPOP_METAL_FORCE_CPU=<lbl> — pin all nodes of named graphs on
 //                                CPU (e.g. "generator" or "frontend,generator").
 //   KOKOPOP_METAL_PIN_OP=<ops>    — pin by op type everywhere (e.g. "SIN,REPEAT").
@@ -94,6 +97,7 @@ class MetalBackend : public Backend {
     ggml_backend_sched_t sched_ = nullptr;
     MetalLstmKernelState * lstm_kernel_ = nullptr;
     MetalStftState       * stft_kernel_ = nullptr;
+    MetalVocoderState    * vocoder_kernel_ = nullptr;
     size_t sched_capacity_ = 0;
     const char * active_label_ = nullptr;
     int n_input_tokens_ = 0;
@@ -109,6 +113,7 @@ class MetalBackend : public Backend {
     bool         env_log_sched_  = false;    // KOKOPOP_METAL_LOG_SCHED
     bool         env_op_trace_   = false;    // KOKOPOP_METAL_OP_TRACE
     bool         env_alloc_only_ = false;    // KOKOPOP_METAL_ALLOC_ONLY
+    bool         env_vocoder_convt_ = false; // KOKOPOP_METAL_VOCODER_CONVT
 
     // Pin decision cache — valid when active_label_ == pin_cache_label_
     // and the graph has pin_cache_n_nodes_ nodes.
@@ -319,6 +324,7 @@ public:
         env_log_sched_  = std::getenv("KOKOPOP_METAL_LOG_SCHED")  != nullptr;
         env_op_trace_   = std::getenv("KOKOPOP_METAL_OP_TRACE")   != nullptr;
         env_alloc_only_ = std::getenv("KOKOPOP_METAL_ALLOC_ONLY") != nullptr;
+        env_vocoder_convt_ = std::getenv("KOKOPOP_METAL_VOCODER_CONVT") != nullptr;
         if (const char * s = std::getenv("KOKOPOP_METAL_MIN_TOKENS")) {
             if (s[0]) env_min_tokens_ = std::atoi(s);
         }
@@ -351,6 +357,9 @@ public:
         } else {
             lstm_kernel_ = metal_lstm_create();
             stft_kernel_ = metal_stft_create(KOKOPOP_STFT_N, KOKOPOP_STFT_HOP);
+            if (env_vocoder_convt_) {
+                vocoder_kernel_ = metal_vocoder_create();
+            }
         }
     }
 
@@ -366,6 +375,10 @@ public:
         if (stft_kernel_) {
             metal_stft_destroy(stft_kernel_);
             stft_kernel_ = nullptr;
+        }
+        if (vocoder_kernel_) {
+            metal_vocoder_destroy(vocoder_kernel_);
+            vocoder_kernel_ = nullptr;
         }
         if (metal_backend_) {
             ggml_backend_free(metal_backend_);
@@ -532,6 +545,14 @@ public:
 
     void * metal_stft_kernel() const override {
         return stft_kernel_;
+    }
+
+    void * metal_vocoder_kernel() const override {
+        return vocoder_kernel_;
+    }
+
+    bool use_metal_vocoder_convt() const override {
+        return env_vocoder_convt_ && vocoder_kernel_ != nullptr;
     }
 
     ggml_backend_buffer_type_t weight_buffer_type() const override {
