@@ -399,13 +399,46 @@ Run `kokopop_rt` to get a detailed per-chunk real-time factor breakdown:
   │     9│      63│   2015.1ms │     3.85s│     1.91x│     92400│
   │    10│      73│   2317.5ms │     4.28s│     1.85x│    102720│
   └──────┴────────┴────────────┴──────────┴──────────┴──────────┘
-  ─────────────────────────────────────────────────────────
 
   Total Generation:  32727.6 ms
   Total Audio:        60.55 s  (1453200 samples @ 24000 Hz)
   Overall RT:         1.85x
   TTFB (1st chunk):  6278.9 ms
   → 1.9x faster than real-time
+```
+
+**Hardware:** AMD Ryzen 9 7950X 16-Core Processor, **Backend:** CPU, **Threads:** 16
+
+```
+  Backend:     CPU
+  Voice:       af_heart
+  Threads:     16
+  Sample Rate: 24000 Hz
+  Sentences:   10 → 11 chunk(s) (876 tokens)
+
+  Prepare time:       4.3 ms (chunking + phonemization)
+
+  ┌──────┬────────┬────────────┬──────────┬──────────┬──────────┐
+  │ Chunk│ Tokens │  Gen Time  │ Duration │    RT    │ Samples  │
+  ├──────┼────────┼────────────┼──────────┼──────────┼──────────┤
+  │     1│      85│   1512.0ms │     5.59s│     3.70x│    134280│
+  │     2│      25│    526.5ms │     2.12s│     4.04x│     51000│
+  │     3│     113│   2010.5ms │     7.40s│     3.68x│    177600│
+  │     4│      86│   1404.8ms │     5.28s│     3.75x│    126600│
+  │     5│     123│   2192.3ms │     7.78s│     3.55x│    186600│
+  │     6│      76│   1245.2ms │     4.80s│     3.85x│    115200│
+  │     7│     100│   1598.3ms │     6.28s│     3.93x│    150600│
+  │     8│      40│    692.8ms │     2.70s│     3.90x│     64800│
+  │     9│      92│   1486.6ms │     5.75s│     3.87x│    138000│
+  │    10│      63│    987.4ms │     3.88s│     3.92x│     93000│
+  │    11│      73│   1135.1ms │     4.33s│     3.81x│    103920│
+  └──────┴────────┴────────────┴──────────┴──────────┴──────────┘
+
+  Total Generation:  14791.5 ms
+  Total Audio:        55.90 s  (1341600 samples @ 24000 Hz)
+  Overall RT:         3.78x
+  TTFB (1st chunk):  1512.0 ms
+  → 3.8x faster than real-time
 ```
 
 ## License

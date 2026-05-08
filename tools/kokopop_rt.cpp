@@ -247,14 +247,9 @@ void print_table_footer() {
     std::printf("  └──────┴────────┴────────────┴──────────┴──────────┴──────────┘\n");
 }
 
-void print_separator() {
-    std::printf("  ─────────────────────────────────────────────────────────\n");
-}
-
 void print_summary(const std::vector<ChunkResult> & results,
                    double total_gen_ms, double total_audio_s,
                    double overall_rt, double ttfb_ms, int sample_rate) {
-    print_separator();
     std::printf("\n");
     std::printf("  Total Generation:  %6.1f ms\n", total_gen_ms);
     std::printf("  Total Audio:       %6.2f s  (%7zu samples @ %d Hz)\n",
