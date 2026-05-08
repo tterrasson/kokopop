@@ -56,14 +56,9 @@ static size_t graph_capacity(ggml_cgraph * graph) {
 //     actually allocated in the 2nd. Observed symptom: silent audio despite
 //     correct duration. The allocator does its own reserve on the 1st alloc
 //     (ggml-backend.cpp:1509-1535), which is sufficient here (~40 MiB total).
-//   * **Adaptive Metal frontend** (2026-05-04) — Metal kernel-launch overhead
-//     (~100 us/kernel * N ALBERT kernels) exceeds GPU compute speedup for
-//     short inputs. Frontend runs on CPU when n_tokens < KOKOPOP_METAL_MIN_TOKENS
-//     (default 192). Set to 0 to always use Metal for frontend.
-//   * **Adaptive fused LSTM** (2026-05-08) — the custom Metal LSTM uploads
-//     precomputed gates and blocks for every direction. It wins on longer
-//     recurrences but loses on short frontend/text-encoder recurrences, so it
-//     is gated by KOKOPOP_METAL_LSTM_MIN_STEPS (default 128).
+//   * **Metal frontend** — Metal ops are used unconditionally for frontend.
+//   * **Fused LSTM** — the custom Metal LSTM is used unconditionally when
+//     available (kernel created and graph not force-cpu).
 //   * **Env var caching** — all KOKOPOP_METAL_* env vars are read once at
 //     construction and cached as members (env vars do not change at runtime).
 //   * **Pin decision cache** — pin assignments for a graph are reused across
@@ -78,11 +73,7 @@ static size_t graph_capacity(ggml_cgraph * graph) {
 //   KOKOPOP_METAL_ALLOC_ONLY=1    — full compute bypass (memory measurement).
 //   KOKOPOP_METAL_RUN_ONLY=<lvl>  — run up to level frontend|generation|
 //                                generator inclusive, skip the following.
-//   KOKOPOP_METAL_MIN_TOKENS=N    — minimum token count to use Metal for `frontend`
-//                                (default 192). Below N, frontend runs on CPU.
-//                                Set to 0 to always use Metal for frontend.
-//   KOKOPOP_METAL_LSTM_MIN_STEPS=N — minimum sequence length for the custom
-//                                Metal LSTM kernel (default 128).
+
 //   KOKOPOP_METAL_VOCODER_CONVT=1 — experimental standalone Metal kernel for
 //                                generator conv_transpose1d_crop+bias nodes.
 //   KOKOPOP_METAL_FORCE_CPU=<lbl> — pin all nodes of named graphs on
@@ -108,8 +99,7 @@ class MetalBackend : public Backend {
     const char * env_pin_op_     = nullptr;  // KOKOPOP_METAL_PIN_OP
     const char * env_allow_op_   = nullptr;  // KOKOPOP_METAL_ALLOW_OP
     const char * env_run_only_   = nullptr;  // KOKOPOP_METAL_RUN_ONLY
-    int          env_min_tokens_ = 192;      // KOKOPOP_METAL_MIN_TOKENS
-    int          env_lstm_min_steps_ = 128;  // KOKOPOP_METAL_LSTM_MIN_STEPS
+
     bool         env_log_sched_  = false;    // KOKOPOP_METAL_LOG_SCHED
     bool         env_op_trace_   = false;    // KOKOPOP_METAL_OP_TRACE
     bool         env_alloc_only_ = false;    // KOKOPOP_METAL_ALLOC_ONLY
@@ -177,16 +167,10 @@ class MetalBackend : public Backend {
         //     generator dims.
         //   Forcing ggml op_offload across these hybrid graphs was measured to
         //   be much slower and made the desktop unresponsive on M-series Macs.
-        //   `frontend` short inputs: Metal kernel-launch overhead (~100 µs per
-        //   kernel × N ALBERT kernels) exceeds GPU compute speedup for small token
-        //   counts. Threshold = env_min_tokens_ (default 192).
         if (env_force_cpu_ == nullptr) {
             if (std::strcmp(active_label_, "generator") == 0
                 || std::strcmp(active_label_, "generation") == 0) {
                 return true;
-            }
-            if (std::strcmp(active_label_, "frontend") == 0 && n_input_tokens_ > 0) {
-                return n_input_tokens_ < env_min_tokens_;
             }
             return false;
         }
@@ -325,12 +309,7 @@ public:
         env_op_trace_   = std::getenv("KOKOPOP_METAL_OP_TRACE")   != nullptr;
         env_alloc_only_ = std::getenv("KOKOPOP_METAL_ALLOC_ONLY") != nullptr;
         env_vocoder_convt_ = std::getenv("KOKOPOP_METAL_VOCODER_CONVT") != nullptr;
-        if (const char * s = std::getenv("KOKOPOP_METAL_MIN_TOKENS")) {
-            if (s[0]) env_min_tokens_ = std::atoi(s);
-        }
-        if (const char * s = std::getenv("KOKOPOP_METAL_LSTM_MIN_STEPS")) {
-            if (s[0]) env_lstm_min_steps_ = std::atoi(s);
-        }
+
 
         cpu_backend_ = ggml_backend_cpu_init();
         if (cpu_backend_ != nullptr) {
@@ -536,8 +515,8 @@ public:
     }
 
     bool use_metal_lstm(int64_t n_steps) const override {
-        if (lstm_kernel_ == nullptr ||
-            n_steps < static_cast<int64_t>(std::max(0, env_lstm_min_steps_))) {
+        (void)n_steps;
+        if (lstm_kernel_ == nullptr) {
             return false;
         }
         return !force_cpu_for_active_graph();

@@ -503,8 +503,9 @@ bool load_model_from_gguf(
     }
     // Record the actual backend type based on what was created,
     // not what was requested (AUTO can resolve to Metal or CPU).
-    const char * buft_name = ggml_backend_buft_name(m->backend->weight_buffer_type());
-    if (buft_name && std::strncmp(buft_name, "MTL", 3) == 0) {
+    // Use the backend's own label() — weight_buffer_type is always CPU
+    // because weights stay in unified memory even on Metal.
+    if (std::strcmp(m->backend->label(), "Metal (GPU)") == 0) {
         m->backend_type = KOKOPOP_BACKEND_METAL;
     } else {
         m->backend_type = KOKOPOP_BACKEND_CPU;

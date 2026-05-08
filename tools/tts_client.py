@@ -37,7 +37,7 @@ from typing import BinaryIO
 STREAM_READ_SIZE = 1024
 OGG_OPUS_GRANULE_RATE = 48000
 DEFAULT_OGG_PREBUFFER_MS = 5000
-DEFAULT_OGG_BURST_GAP_MS = 500
+DEFAULT_OGG_BURST_GAP_MS = 200
 
 
 def _read_stream(resp: BinaryIO, emit_stdout: bool) -> bytes:

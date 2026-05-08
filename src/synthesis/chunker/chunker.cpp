@@ -15,11 +15,11 @@ namespace kokopop {
 
 ChunkConfig make_interactive_config() {
     ChunkConfig cfg;
-    cfg.target_min_tokens = 60;
-    cfg.target_max_tokens = 150;
+    cfg.target_min_tokens = 20;
+    cfg.target_max_tokens = 100;
     cfg.soft_max_tokens = 240;
     cfg.hard_max_tokens = 510;
-    cfg.first_chunk_target_max_tokens = 90;
+    cfg.first_chunk_target_max_tokens = 60;
     cfg.allow_short_first_chunk = true;
     cfg.comma_pause_ms = 70;
     cfg.sentence_pause_ms = 170;
