@@ -139,7 +139,7 @@ void SynthesisScheduler::_worker_loop() {
                 ctx->chunks_completed.fetch_add(1);
 
                 std::fprintf(stderr, "[scheduler] request #%u chunk %d/%d: %d tokens\n",
-                            ctx->request_id, idx, ctx->chunks_total,
+                            ctx->request_id, idx + 1, ctx->chunks_total,
                             ctx->plan->chunks[idx].n_tokens);
 
                 // Check if this was the last chunk
@@ -155,7 +155,7 @@ void SynthesisScheduler::_worker_loop() {
                 ctx->error = error.empty() ? "inference failed" : error;
                 ctx->state.store(RequestContext::State::ERROR);
                 std::fprintf(stderr, "[scheduler] request #%u chunk %d failed: %s\n",
-                            ctx->request_id, idx, ctx->error.c_str());
+                            ctx->request_id, idx + 1, ctx->error.c_str());
             }
         }
     }

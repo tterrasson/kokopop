@@ -89,7 +89,7 @@ std::vector<float> infer_chunk(
     const auto & chunk = plan.chunks[chunk_idx];
 
     std::fprintf(stderr, "[kokopop] chunk[%d/%zu]: %d tokens, phonemes=%zu chars\n",
-                chunk_idx, plan.chunks.size(),
+                chunk_idx + 1, plan.chunks.size(),
                 chunk.n_tokens, chunk.phonemes.size());
 
     // --- Synthesize raw audio ---
@@ -110,7 +110,7 @@ std::vector<float> infer_chunk(
     kokopop_audio_free(&raw);
 
     std::fprintf(stderr, "[kokopop] chunk[%d] synthesized: %zu samples (%.1fms)\n",
-                chunk_idx, raw_audio.size(),
+                chunk_idx + 1, raw_audio.size(),
                 (double)raw_audio.size() / model.sample_rate * 1000.0);
 
     // --- Post-process ---
