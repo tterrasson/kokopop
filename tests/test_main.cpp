@@ -19,3 +19,4 @@
 #include "test_audio_utils.cpp"
 #include "test_text_splitter.cpp"
 #include "test_zh_g2p.cpp"
+#include "test_unicode_inputs.cpp"
