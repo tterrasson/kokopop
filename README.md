@@ -415,28 +415,28 @@ Run `kokopop_rt` to get a detailed per-chunk real-time factor breakdown:
   Sample Rate: 24000 Hz
   Sentences:   10 → 10 chunk(s) (947 tokens)
 
-  Prepare time:       7.0 ms (chunking + phonemization)
+  Prepare time:       7.6 ms (chunking + phonemization)
 
   ┌──────┬────────┬────────────┬──────────┬──────────┬──────────┐
   │ Chunk│ Tokens │  Gen Time  │ Duration │    RT    │ Samples  │
   ├──────┼────────┼────────────┼──────────┼──────────┼──────────┤
-  │     1│     183│   6278.9ms │    11.79s│     1.88x│    283080│
-  │     2│      41│   1515.4ms │     2.88s│     1.90x│     69000│
-  │     3│     180│   6450.7ms │    11.45s│     1.78x│    274800│
-  │     4│      21│    939.8ms │     1.85s│     1.97x│     44400│
-  │     5│     123│   4202.7ms │     7.72s│     1.84x│    185400│
-  │     6│      76│   2602.0ms │     4.83s│     1.85x│    115800│
-  │     7│      95│   3313.6ms │     6.15s│     1.86x│    147600│
-  │     8│      92│   3091.9ms │     5.75s│     1.86x│    138000│
-  │     9│      63│   2015.1ms │     3.85s│     1.91x│     92400│
-  │    10│      73│   2317.5ms │     4.28s│     1.85x│    102720│
+  │     1│     183│   5906.6ms │    11.72s│     1.98x│    281280│
+  │     2│      41│   1352.0ms │     2.85s│     2.11x│     68400│
+  │     3│     180│   5887.4ms │    11.55s│     1.96x│    277200│
+  │     4│      21│    894.9ms │     1.88s│     2.10x│     45000│
+  │     5│     123│   3923.6ms │     7.75s│     1.98x│    186000│
+  │     6│      76│   2315.5ms │     4.80s│     2.07x│    115200│
+  │     7│      95│   3041.5ms │     6.12s│     2.01x│    147000│
+  │     8│      92│   2862.4ms │     5.78s│     2.02x│    138600│
+  │     9│      63│   1842.6ms │     3.85s│     2.09x│     92400│
+  │    10│      73│   2107.7ms │     4.28s│     2.03x│    102720│
   └──────┴────────┴────────────┴──────────┴──────────┴──────────┘
 
-  Total Generation:  32727.6 ms
-  Total Audio:        60.55 s  (1453200 samples @ 24000 Hz)
-  Overall RT:         1.85x
-  TTFB (1st chunk):  6278.9 ms
-  → 1.9x faster than real-time
+  Total Generation:  30134.2 ms
+  Total Audio:        60.58 s  (1453800 samples @ 24000 Hz)
+  Overall RT:         2.01x
+  TTFB (1st chunk):  5906.6 ms
+  → 2.0x faster than real-time
 ```
 
 **Hardware:** AMD Ryzen 9 7950X 16-Core Processor, **Backend:** CPU, **Threads:** 16
