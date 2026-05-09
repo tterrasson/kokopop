@@ -47,35 +47,27 @@ static float dot_product_avx2(const float * __restrict__ a,
                                const float * __restrict__ b,
                                int64_t len)
 {
-    // AVX2: 8-wide F32 vectors; with FMA we get 8 FMA per instruction.
-    // 4 accumulators → 32 elements per loop iteration.
-    __m256 acc0 = _mm256_setzero_ps();
-    __m256 acc1 = _mm256_setzero_ps();
-    __m256 acc2 = _mm256_setzero_ps();
-    __m256 acc3 = _mm256_setzero_ps();
-
+    // Keep the accumulation order identical to the scalar recurrence.
+    //
+    // The duration LSTMs are sensitive enough that a wide AVX2 reduction
+    // tree/FMA contraction can audibly change predicted frame counts over
+    // long-form chunks.  We still use AVX2 for the 8 products at a time, but
+    // fold those products back into the scalar accumulator in k order.
+    alignas(32) float products[8];
+    float dot = 0.0f;
     int64_t i = 0;
-    for (; i + 31 < len; i += 32) {
-        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i),     _mm256_loadu_ps(b + i),     acc0);
-        acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i +  8), _mm256_loadu_ps(b + i +  8), acc1);
-        acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 16), _mm256_loadu_ps(b + i + 16), acc2);
-        acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 24), _mm256_loadu_ps(b + i + 24), acc3);
+    for (; i + 7 < len; i += 8) {
+        const __m256 prod = _mm256_mul_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i));
+        _mm256_store_ps(products, prod);
+        dot += products[0];
+        dot += products[1];
+        dot += products[2];
+        dot += products[3];
+        dot += products[4];
+        dot += products[5];
+        dot += products[6];
+        dot += products[7];
     }
-
-    // Merge: acc0 += acc1..3
-    acc0 = _mm256_add_ps(acc0, acc1);
-    acc2 = _mm256_add_ps(acc2, acc3);
-    acc0 = _mm256_add_ps(acc0, acc2);
-
-    // Horizontal sum: fold 256→128, then hadd twice
-    __m128 lo = _mm256_castps256_ps128(acc0);
-    __m128 hi = _mm256_extractf128_ps(acc0, 1);
-    lo = _mm_add_ps(lo, hi);       // [a+e, b+f, c+g, d+h]
-    lo = _mm_hadd_ps(lo, lo);      // [a+b+e+f, c+d+g+h, ...]
-    lo = _mm_hadd_ps(lo, lo);      // [a+b+c+d+e+f+g+h, ...]
-    float dot = _mm_cvtss_f32(lo);
-
-    // Scalar tail
     for (; i < len; ++i) {
         dot += a[i] * b[i];
     }
