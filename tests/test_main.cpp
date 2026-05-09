@@ -20,3 +20,4 @@
 #include "test_text_splitter.cpp"
 #include "test_zh_g2p.cpp"
 #include "test_unicode_inputs.cpp"
+#include "test_chunker.cpp"

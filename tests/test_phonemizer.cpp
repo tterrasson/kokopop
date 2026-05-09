@@ -189,3 +189,20 @@ TEST_CASE("espeak_voice_for_kokoro_voice_all_prefixes") {
     // Unknown prefix falls back to en-US
     CHECK_EQ(kokopop::espeak_voice_for_kokoro_voice("xx_test"),  std::string("gmw/en-US"));
 }
+
+TEST_CASE("phonemizer_different_voices_give_different_phonemes") {
+    // Regression: the phoneme cache key must include the voice so that the
+    // same text phonemized for two different languages stays independent.
+    std::string fr_phonemes, en_phonemes, error;
+    CHECK(kokopop::phonemize_text("Bonjour", "ff_siwis", fr_phonemes, error));
+    CHECK(kokopop::phonemize_text("Bonjour", "af_heart", en_phonemes, error));
+    // French and English phonemizations of the same word must differ
+    CHECK(fr_phonemes != en_phonemes);
+}
+
+TEST_CASE("phonemizer_same_voice_same_text_is_deterministic") {
+    std::string p1, p2, error;
+    CHECK(kokopop::phonemize_text("Hello world", "af_heart", p1, error));
+    CHECK(kokopop::phonemize_text("Hello world", "af_heart", p2, error));
+    CHECK_EQ(p1, p2);
+}
