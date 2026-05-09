@@ -519,7 +519,12 @@ bool ggml_generator(
         error = "ggml generator backend tensor initialization failed";
         return false;
     }
-    model.backend->tensor_set(x,       decoder.data.data(), 0, decoder.data.size() * sizeof(float));
+    model.backend->tensor_set(
+        x,
+        decoder.data.data(),
+        0,
+        static_cast<size_t>(decoder.length * decoder.channels) * sizeof(float)
+    );
     model.backend->tensor_set(style_t, style.data(),        0, style.size()        * sizeof(float));
     model.backend->tensor_set(har_t,   har_data.data(),     0, ggml_nbytes(har_t));
     t0g = gen_profile ? ggml_time_us() : 0;
