@@ -57,7 +57,7 @@ public:
         _scheduler = &scheduler;
     }
 
-    /// Set the model pointer (for health/voices endpoints)
+    /// Set the model pointer (for the health endpoint)
     void set_model(Model * model) {
         _model = model;
     }

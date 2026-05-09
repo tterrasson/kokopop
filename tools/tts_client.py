@@ -6,8 +6,8 @@ Usage:
     # Stream PCM float32 and play via ffplay
     uv run python tools/tts_client.py "Hello world" | ffplay -f f32le -ar 24000 -ac 1 -
 
-    # Stream Ogg/Opus and play via ffplay (prebuffers by default)
-    uv run python tools/tts_client.py "Hello world" --format ogg | ffplay -i pipe:0
+    # Stream Ogg/Opus and play via ffplay (prebuffers 2 synthesis chunks before playback)
+    uv run python tools/tts_client.py "Hello world" --format ogg --prebuffer-chunks 2 | ffplay -i pipe:0
 
     # Read text from a file
     uv run python tools/tts_client.py --file story.txt | ffplay -f f32le -ar 24000 -ac 1 -
@@ -123,17 +123,19 @@ def _read_ogg_stream_by_duration(resp: BinaryIO, emit_stdout: bool,
     return b"".join(chunks)
 
 
-def _read_ogg_stream_by_second_burst(resp: BinaryIO, emit_stdout: bool,
-                                     burst_gap_ms: int) -> bytes:
-    """Buffer until audio resumes after the first TTS chunk burst."""
-    if not emit_stdout:
+def _read_ogg_stream_by_chunk_count(resp: BinaryIO, emit_stdout: bool,
+                                    prebuffer_chunks: int,
+                                    burst_gap_ms: int) -> bytes:
+    """Buffer until N TTS synthesis chunks have been received, then emit."""
+    if not emit_stdout or prebuffer_chunks <= 0:
         return _read_stream(resp, emit_stdout)
 
     chunks: list[bytes] = []
     pending = bytearray()
     parse_pos = 0
     emitted = False
-    saw_audio = False
+    bursts_seen = 0
+    in_burst = False
     last_read_at: float | None = None
     gap_seconds = max(0, burst_gap_ms) / 1000.0
     read = getattr(resp, "read1", resp.read)
@@ -151,8 +153,9 @@ def _read_ogg_stream_by_second_burst(resp: BinaryIO, emit_stdout: bool,
             last_read_at = now
             continue
 
-        starts_new_burst = (
-            saw_audio
+        # Detect gap between bursts (= boundary between two TTS chunks)
+        gap_detected = (
+            in_burst
             and last_read_at is not None
             and now - last_read_at >= gap_seconds
         )
@@ -183,10 +186,16 @@ def _read_ogg_stream_by_second_burst(resp: BinaryIO, emit_stdout: bool,
             granule = struct.unpack_from("<q", pending, parse_pos + 6)[0]
             parse_pos = page_end
             if granule > 0:
-                saw_audio = True
                 chunk_has_audio = True
 
-        if starts_new_burst and chunk_has_audio:
+        if chunk_has_audio:
+            if gap_detected or not in_burst:
+                bursts_seen += 1
+            in_burst = True
+        elif gap_detected:
+            in_burst = False
+
+        if bursts_seen >= prebuffer_chunks:
             sys.stdout.buffer.write(pending)
             sys.stdout.buffer.flush()
             pending.clear()
@@ -201,9 +210,11 @@ def _read_ogg_stream_by_second_burst(resp: BinaryIO, emit_stdout: bool,
 
 
 def _read_ogg_stream(resp: BinaryIO, emit_stdout: bool, prebuffer_mode: str,
-                     prebuffer_ms: int, burst_gap_ms: int) -> bytes:
-    if prebuffer_mode == "second-chunk":
-        return _read_ogg_stream_by_second_burst(resp, emit_stdout, burst_gap_ms)
+                     prebuffer_ms: int, burst_gap_ms: int,
+                     prebuffer_chunks: int) -> bytes:
+    if prebuffer_chunks > 0:
+        return _read_ogg_stream_by_chunk_count(resp, emit_stdout,
+                                               prebuffer_chunks, burst_gap_ms)
     return _read_ogg_stream_by_duration(resp, emit_stdout, prebuffer_ms)
 
 
@@ -295,12 +306,13 @@ def stream_ogg(
     prebuffer_mode: str,
     prebuffer_ms: int,
     burst_gap_ms: int,
+    prebuffer_chunks: int,
     chunking: dict | None,
 ) -> bytes:
     payload = _build_payload(text, voice, speed, mode, "ogg", chunking)
     def read_fn(resp):
         return _read_ogg_stream(resp, emit_stdout, prebuffer_mode,
-                                prebuffer_ms, burst_gap_ms)
+                                prebuffer_ms, burst_gap_ms, prebuffer_chunks)
     return _send_tts(url, payload, read_fn)
 
 
@@ -317,15 +329,18 @@ def main() -> None:
                         default="interactive", help="Synthesis mode")
     parser.add_argument("--format", choices=["pcm", "wav", "ogg"], default="pcm",
                         dest="fmt", help="Output format: pcm (float32), wav, or ogg (Opus)")
-    parser.add_argument("--prebuffer-mode", choices=["duration", "second-chunk"],
+    parser.add_argument("--prebuffer-mode", choices=["duration"],
                         default="duration",
-                        help="Ogg/Opus startup buffering strategy (default: duration)")
+                        help="Ogg/Opus startup buffering strategy (default: duration). "
+                             "Use --prebuffer-chunks for chunk-count-based buffering.")
     parser.add_argument("--prebuffer-ms", type=int, default=DEFAULT_OGG_PREBUFFER_MS,
                         help="Ogg/Opus audio to buffer before writing to stdout "
                              f"(default: {DEFAULT_OGG_PREBUFFER_MS}; use 0 for immediate)")
+    parser.add_argument("--prebuffer-chunks", type=int, default=0,
+                        help="Buffer this many TTS synthesis chunks before playback "
+                             "(overrides --prebuffer-ms when > 0; e.g. --prebuffer-chunks 2)")
     parser.add_argument("--prebuffer-gap-ms", type=int, default=DEFAULT_OGG_BURST_GAP_MS,
-                        help="Idle gap used to detect the next TTS chunk in "
-                             "second-chunk mode "
+                        help="Idle gap in ms used to detect boundaries between TTS chunks "
                              f"(default: {DEFAULT_OGG_BURST_GAP_MS})")
 
     # -- Chunking overrides (sent as "chunking" JSON object) ----
@@ -410,7 +425,8 @@ def main() -> None:
         emit_stdout = args.out is None and not sys.stdout.buffer.isatty()
         ogg = stream_ogg(text, args.voice, args.speed, args.mode, args.url,
                          emit_stdout, args.prebuffer_mode,
-                         args.prebuffer_ms, args.prebuffer_gap_ms, chunking)
+                         args.prebuffer_ms, args.prebuffer_gap_ms,
+                         args.prebuffer_chunks, chunking)
         if args.out:
             Path(args.out).write_bytes(ogg)
             print(f"Saved {len(ogg):,} bytes → {args.out}", file=sys.stderr)

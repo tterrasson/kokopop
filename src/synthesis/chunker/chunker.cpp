@@ -117,7 +117,15 @@ bool make_unit_cached(const std::string & text,
         phoneme_cache;
     constexpr size_t cache_max_size = 128;
 
-    auto it = phoneme_cache.find(text);
+    // Key includes voice so that the same text phonemized for different
+    // languages (e.g. ff_siwis → French, af_heart → English) is cached separately.
+    std::string cache_key;
+    cache_key.reserve(voice.size() + 1 + text.size());
+    cache_key = voice;
+    cache_key += '\0';
+    cache_key += text;
+
+    auto it = phoneme_cache.find(cache_key);
     if (it != phoneme_cache.end()) {
         out.text = text;
         out.phonemes = it->second.first;
@@ -140,7 +148,7 @@ bool make_unit_cached(const std::string & text,
     if (phoneme_cache.size() >= cache_max_size) {
         phoneme_cache.clear();
     }
-    phoneme_cache.emplace(text, std::make_pair(phonemes, tokens));
+    phoneme_cache.emplace(cache_key, std::make_pair(phonemes, tokens));
 
     out.text = text;
     out.phonemes = std::move(phonemes);

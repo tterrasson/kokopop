@@ -201,7 +201,7 @@ Available endpoints:
 |---|---|---|
 | `/tts` | `POST` | Synthesize text to audio — PCM float32 stream or complete WAV file |
 | `/health` | `GET` | Server health check |
-| `/voices` | `GET` | Voice info (model does not expose voice list) |
+| `/voices` | `GET` | List voices embedded in the GGUF model |
 
 Example requests:
 
@@ -244,11 +244,18 @@ A minimal Python client is provided. It requires no third-party packages.
 
 # Stream ogg/opus and play in real time (requires ffplay)
 uv run python tools/tts_client.py \
-  --file LICENSE \
+  --file examples/english.txt \
   --format ogg \
-  --prebuffer-mode second-chunk \
-  --chunk-target-min 5 \
-  --chunk-target-max 10 | ffplay -i pipe:0
+  --prebuffer-chunks 3 \
+  --chunk-target-min 20 \
+  --chunk-target-max 50 \
+  --voice af_bella | ffplay -i pipe:0
+
+uv run python tools/tts_client.py \
+  --file examples/mandarin.txt \
+  --format ogg \
+  --prebuffer-ms 2000 \
+  --voice zm_yunjian | ffplay -i pipe:0
 
 # Stream PCM and save as WAV (client-side conversion)
 uv run python tools/tts_client.py "Hello world" --out hello.wav
@@ -268,8 +275,19 @@ All options:
 | `--voice` | server default | Voice name |
 | `--speed` | `1.0` | Speed multiplier |
 | `--mode` | `interactive` | `interactive` or `long_form` |
-| `--format` | `pcm` | `pcm` (float32 stream) or `wav` (complete file) |
+| `--format` | `pcm` | `pcm` (float32 stream), `wav` (complete file), or `ogg` (Ogg/Opus stream) |
 | `--out` | — | Output file; if omitted, raw bytes go to stdout |
+| `--prebuffer-ms` | `3000` | Milliseconds of audio to buffer before playback starts (Ogg mode) |
+| `--prebuffer-chunks` | `0` | Number of TTS synthesis chunks to buffer before playback (Ogg mode; overrides `--prebuffer-ms` when > 0) |
+| `--prebuffer-gap-ms` | `250` | Idle gap in ms used to detect boundaries between TTS chunks |
+| `--chunk-target-min` | preset | Minimum tokens per synthesis chunk |
+| `--chunk-target-max` | preset | Target maximum tokens per synthesis chunk |
+| `--chunk-soft-max` | preset | Soft token limit before forced split |
+| `--chunk-hard-max` | preset | Hard token limit per chunk |
+| `--chunk-first-max` | preset | Token limit for the first chunk (lower = faster TTFB) |
+| `--chunk-sentence-pause` | preset | Pause between sentences in ms |
+| `--chunk-paragraph-pause` | preset | Pause between paragraphs in ms |
+| `--chunk-crossfade` | preset | Crossfade between chunks in ms |
 
 ## Library Integration
 

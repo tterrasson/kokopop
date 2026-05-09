@@ -36,7 +36,8 @@ SynthesisPlan prepare_synthesis(
     const std::string & voice,
     float speed,
     StreamMode mode,
-    std::string & error)
+    std::string & error,
+    const ChunkConfig * chunk_config_override)
 {
     SynthesisPlan plan;
 
@@ -44,6 +45,10 @@ SynthesisPlan prepare_synthesis(
     plan.config = (mode == StreamMode::Interactive)
         ? make_interactive_config()
         : make_long_form_config();
+
+    if (chunk_config_override) {
+        plan.config = merge_chunk_config(plan.config, *chunk_config_override);
+    }
 
     // Tokenize function wrapper
     TokenizeFn tokenize_fn = [&model](const std::string & phonemes,

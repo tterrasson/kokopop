@@ -191,7 +191,7 @@ ggml_tensor * conv_transpose1d_crop(
 
 ggml_tensor * conv_transpose1d_crop_bias(
     ggml_context * ctx,
-    Model & model,
+    [[maybe_unused]] Model & model,
     ggml_tensor * weight,
     ggml_tensor * input,
     ggml_tensor * bias,

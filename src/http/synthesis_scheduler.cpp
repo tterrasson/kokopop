@@ -94,8 +94,9 @@ void SynthesisScheduler::_worker_loop() {
         // ---- Phase 1: PREPARING (chunking + phonemization) ----
         if (ctx->state.load() == RequestContext::State::PREPARING) {
             std::string error;
+            const ChunkConfig * override_ptr = ctx->has_chunk_config ? &ctx->chunk_config : nullptr;
             auto plan = prepare_synthesis(
-                _model, ctx->text, ctx->voice, ctx->speed, ctx->mode, error);
+                _model, ctx->text, ctx->voice, ctx->speed, ctx->mode, error, override_ptr);
 
             if (plan.chunks.empty()) {
                 ctx->error = error.empty() ? "no chunks produced" : error;
@@ -103,11 +104,6 @@ void SynthesisScheduler::_worker_loop() {
                 std::fprintf(stderr, "[scheduler] request #%u prepare failed: %s\n",
                             ctx->request_id, ctx->error.c_str());
                 continue;
-            }
-
-            // Apply chunking overrides from the HTTP request
-            if (ctx->has_chunk_config) {
-                plan.config = merge_chunk_config(plan.config, ctx->chunk_config);
             }
 
             ctx->plan = std::make_shared<SynthesisPlan>(std::move(plan));

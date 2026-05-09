@@ -48,7 +48,7 @@ void usage(const char * argv0) {
         "  kokopop_stream --model m.gguf --voice ff_siwis --http --port 8080\n"
         "    POST /tts  - Synthesize text to audio\n"
         "    GET  /health - Server health check\n"
-        "    GET  /voices - List available voices (if model exposes them)\n"
+        "    GET  /voices - List voices embedded in the GGUF model\n"
         "\n"
         "Options:\n"
         "  --model PATH    Path to Kokoro GGUF model\n"
@@ -123,9 +123,26 @@ static bool handle_health(kokopop::Model * model, kokopop::HttpRequest & /*req*/
 // handle_voices
 // ---------------------------------------------------------------------------
 
-static bool handle_voices(kokopop::Model * /*model*/, kokopop::HttpRequest & /*req*/, kokopop::HttpResponse & res) {
-    std::string json = "{\"voices\":null,\"note\":\"Voice names are not exposed by the model. Use the --voice flag to set the default voice.\"}";
-    res.set_json_string(json);
+static bool handle_voices(kokopop::Model * model, kokopop::HttpRequest & /*req*/, kokopop::HttpResponse & res) {
+    yyjson_mut_doc * doc = yyjson_mut_doc_new(nullptr);
+    yyjson_mut_val * root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+
+    yyjson_mut_val * arr = yyjson_mut_arr(doc);
+    for (const auto & kv : model->voices) {
+        yyjson_mut_val * obj = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_str(doc, obj, "name", kv.second.name.c_str());
+        yyjson_mut_arr_append(arr, obj);
+    }
+    yyjson_mut_obj_add_val(doc, root, "voices", arr);
+
+    size_t len = 0;
+    char * json_str = yyjson_mut_write(doc, 0, &len);
+    if (json_str) {
+        res.set_json_string(std::string(json_str, len));
+        free(json_str);
+    }
+    yyjson_mut_doc_free(doc);
     return true; // keep-alive
 }
 

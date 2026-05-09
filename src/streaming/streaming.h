@@ -97,7 +97,8 @@ SynthesisPlan prepare_synthesis(
     const std::string & voice,
     float speed,
     StreamMode mode,
-    std::string & error);
+    std::string & error,
+    const ChunkConfig * chunk_config_override = nullptr);
 
 /// Phase 2 — Infer a single chunk of audio.
 ///
