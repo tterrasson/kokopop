@@ -654,8 +654,11 @@ ggml_tensor * lstm_direction(
     const float * b_hh_ptr = static_cast<const float *>(w.b_hh_packed->data);
 
     model.lstm_custom_params.push_back({
-        it->second.data(),                     // w_hh_f32
+        it->second.data(),                     // w_hh_f32 (original column-major)
         b_hh_ptr,                              // b_hh
+        model.lstm_w_hh_rowwise.find(whh_key) != model.lstm_w_hh_rowwise.end()
+            ? &model.lstm_w_hh_rowwise.at(whh_key).front()  // w_hh_rowwise (transposed)
+            : nullptr,                           // fallback: kernel uses column-major
         model.backend->use_metal_lstm(n_steps)
             ? model.backend->metal_lstm_kernel()
             : nullptr,                         // metal_kernel (null on CPU/small LSTM)

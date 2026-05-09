@@ -11,6 +11,7 @@ namespace kokopop {
 struct LstmCustomParams {
     const float * w_hh_f32;     // [hidden, 4*hidden] F32, dequantized at model load
     const float * b_hh;         // [4*hidden] F32
+    const float * w_hh_rowwise; // [4*hidden, hidden] transposed for SIMD-friendly access
     void        * metal_kernel; // null (CPU) or MetalLstmKernelState* (Metal)
     const char  * whh_key;      // logical tensor name used to look up pre-loaded MTLBuffer
     int64_t       hidden;

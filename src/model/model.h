@@ -144,6 +144,11 @@ struct Model {
     // after insertion).
     std::unordered_map<std::string, std::vector<float>> lstm_w_hh_f32;
 
+    // Transposed w_hh layout for SIMD-friendly access in the fused LSTM kernel.
+    // w_rowwise[j*H + k] provides contiguous access over hidden dimension k
+    // for each gate j, enabling NEON/AVX2 vectorisation of the dot product.
+    std::unordered_map<std::string, std::vector<float>> lstm_w_hh_rowwise;
+
     // Scratch storage for LstmCustomParams instances built during graph
     // construction.  Reserve 24 slots before building the generation graph
     // (12 LSTM directions × safety margin) so no reallocation occurs and

@@ -353,7 +353,9 @@ void Model::preload_tensor_cache() {
     // Dequantize all LSTM w_hh tensors (Q5_K → F32) for the fused LSTM kernel.
     // Iterates the full tensor map once; only matches "weight_hh_l0" entries.
     // On Metal, also uploads each matrix into a persistent MTLBuffer via the backend.
+    // Also produces a rowwise transposition for SIMD-friendly dot-product access.
     lstm_w_hh_f32.clear();
+    lstm_w_hh_rowwise.clear();
     for (const auto & kv : tensors) {
         const std::string & name = kv.first;
         if (name.find("weight_hh_l0") == std::string::npos) continue;
@@ -363,8 +365,19 @@ void Model::preload_tensor_cache() {
         if (tensor_to_f32(*backend, t, f32)) {
             const int H      = static_cast<int>(t->ne[0]);
             const int four_H = static_cast<int>(t->ne[1]);
+
+            // Original layout (column-major): f32[k + H*j], k∈[0,H), j∈[0,4*H)
+            // Transposed layout (row-major):  rowwise[j*H + k], contiguous over k
+            std::vector<float> rowwise(H * four_H);
+            for (int j = 0; j < four_H; ++j) {
+                for (int k = 0; k < H; ++k) {
+                    rowwise[j * H + k] = f32[k + H * j];
+                }
+            }
+
             backend->preload_lstm_whh(name, f32.data(), H, four_H);
             lstm_w_hh_f32.emplace(name, std::move(f32));
+            lstm_w_hh_rowwise.emplace(name, std::move(rowwise));
         }
     }
 }
