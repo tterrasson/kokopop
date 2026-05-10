@@ -36,14 +36,17 @@ const float * hann_window_20() {
 }
 
 struct StftTwiddles {
-    float c[11][KOKOPOP_STFT_N];
-    float s[11][KOKOPOP_STFT_N];
+    // c[n][k]: for a fixed n, all k bins are contiguous — enables auto-vectorisation
+    // of the inner-k loop in both the forward DFT and the IDFT.
+    static constexpr int K = KOKOPOP_STFT_N / 2 + 1;
+    float c[KOKOPOP_STFT_N][K];
+    float s[KOKOPOP_STFT_N][K];
     StftTwiddles() {
-        for (int k = 0; k <= 10; ++k) {
-            for (int n = 0; n < KOKOPOP_STFT_N; ++n) {
+        for (int n = 0; n < KOKOPOP_STFT_N; ++n) {
+            for (int k = 0; k < K; ++k) {
                 const float a = 2.0f * M_PI * static_cast<float>(k * n) / static_cast<float>(KOKOPOP_STFT_N);
-                c[k][n] = std::cos(a);
-                s[k][n] = std::sin(a);
+                c[n][k] = std::cos(a);
+                s[n][k] = std::sin(a);
             }
         }
     }
@@ -118,6 +121,11 @@ static bool fill_harmonic_stft(
     constexpr int hop = KOKOPOP_STFT_HOP;
     constexpr float sine_amp = KOKOPOP_SINE_AMP;
 
+    if (target_frames < 0) {
+        error = "invalid negative target_frames";
+        return false;
+    }
+
     const int64_t n_samples = static_cast<int64_t>(f0.size()) * upsample;
 
     // 7.1 — Reuse pre-allocated source buffer instead of allocating every call.
@@ -145,6 +153,10 @@ static bool fill_harmonic_stft(
         }
         model.harmonic_merge_b = merge_b_data[0];
         model.harmonic_source_loaded = true;
+    }
+    if (model.harmonic_merge_w.size() < static_cast<size_t>(harmonic)) {
+        error = "invalid harmonic source merge weight size";
+        return false;
     }
     const float mb = model.harmonic_merge_b;
     const float * mw = model.harmonic_merge_w.data();
@@ -181,7 +193,7 @@ static bool fill_harmonic_stft(
             // Every 16 segments (~4800 samples at 300 upsamp.) keeps float drift
             // well below 1e-6 — inaudible for audio synthesis.
             constexpr int64_t phase_reset_interval = 16;
-            if (seg % phase_reset_interval == 0) {
+            if ((seg + 1) % phase_reset_interval == 0) {
                 for (int h = 0; h < harmonic; ++h) {
                     const float norm =
                         std::sqrt(phase_sin[h] * phase_sin[h] + phase_cos[h] * phase_cos[h]);
@@ -200,8 +212,7 @@ static bool fill_harmonic_stft(
     }
 
     // 7.1 — Reuse pre-allocated harmonic STFT buffer.
-    // The buffer lives in Model; we resize + zero it, fill via STFT,
-    // then move a copy into the returned CpuTensor.
+    // The buffer lives in Model; the CPU path overwrites all useful elements; no zero-fill needed.
     const size_t har_size = static_cast<size_t>(22 * target_frames);
     if (har_data.size() < har_size) {
         har_data.resize(har_size);
@@ -231,22 +242,40 @@ static bool fill_harmonic_stft(
                 ws[n] = source[static_cast<size_t>(first + n)] * window[n];
         } else {
             for (int n = 0; n < n_fft; ++n) {
-                const int64_t src_i = first + n;
-                if (src_i >= 0 && src_i < n_samples)
+                int64_t src_i = first + n;
+
+                // reflect padding: matches torch.stft(center=True) default behaviour
+                if (src_i < 0) {
+                    src_i = -src_i - 1;
+                } else if (src_i >= n_samples) {
+                    src_i = 2 * n_samples - src_i - 1;
+                }
+
+                if (src_i >= 0 && src_i < n_samples) {
                     ws[n] = source[static_cast<size_t>(src_i)] * window[n];
+                }
             }
         }
-        for (int k = 0; k <= n_fft / 2; ++k) {
-            float real = 0.0f;
-            float imag = 0.0f;
-            for (int n = 0; n < n_fft; ++n) {
-                real += ws[n] * tw.c[k][n];
-                imag -= ws[n] * tw.s[k][n];
+
+        // Forward DFT: outer loop over n so tw.c[n][0..K] is contiguous per row,
+        // letting the compiler vectorise the inner k-loop across all 11 bins at once.
+        float real_acc[StftTwiddles::K]{};
+        float imag_acc[StftTwiddles::K]{};
+        for (int n = 0; n < n_fft; ++n) {
+            const float w   = ws[n];
+            const float * tc = tw.c[n];
+            const float * ts = tw.s[n];
+            for (int k = 0; k < StftTwiddles::K; ++k) {
+                real_acc[k] += w * tc[k];
+                imag_acc[k] -= w * ts[k];
             }
-            har_data[static_cast<size_t>(k * target_frames + frame)] = std::sqrt(real * real + imag * imag);
-            har_data[static_cast<size_t>((k + n_fft / 2 + 1) * target_frames + frame)] = std::atan2(imag, real);
+        }
+        for (int k = 0; k < StftTwiddles::K; ++k) {
+            har_data[static_cast<size_t>(k * target_frames + frame)] = std::sqrt(real_acc[k] * real_acc[k] + imag_acc[k] * imag_acc[k]);
+            har_data[static_cast<size_t>((k + n_fft / 2 + 1) * target_frames + frame)] = std::atan2(imag_acc[k], real_acc[k]);
         }
     }
+
     return true;
 }
 
@@ -330,11 +359,14 @@ static bool cpu_istft_data(Model & model, const float * post_data, int64_t n_fra
             real[k] = mag * cos_ph;
             imag[k] = mag * sin_ph;
         }
+
         for (int n = 0; n < n_fft; ++n) {
             // (n%2)==0 ? 1:-1  →  1 - 2*(n&1), no branch
             float sample = real[0] + real[n_fft / 2] * static_cast<float>(1 - 2 * (n & 1));
+            const float * tc = tw.c[n];
+            const float * ts = tw.s[n];
             for (int k = 1; k < n_fft / 2; ++k) {
-                sample += 2.0f * (real[k] * tw.c[k][n] - imag[k] * tw.s[k][n]);
+                sample += 2.0f * (real[k] * tc[k] - imag[k] * ts[k]);
             }
             sample *= (1.0f / static_cast<float>(n_fft));
             const int64_t dst = frame * hop + n;
