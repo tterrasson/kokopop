@@ -7,6 +7,13 @@
 
 #include "core/constants.h"
 
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
+
 namespace kokopop {
 namespace {
 
@@ -16,65 +23,64 @@ static int ms_to_samples(int ms, int sample_rate) {
     return (ms * sample_rate) / 1000;
 }
 
-// ---------------------------------------------------------------------------
-// Sliding-window silence detection via prefix-sum.
-//
-// Instead of rescanning every window independently (which re-evaluates fabs
-// for the same samples multiple times), we build a prefix-sum of "non-silent"
-// booleans once.  A window [lo, hi) contains non-silent audio iff
-//   prefix[hi] - prefix[lo] > 0
-//
-// This reduces the total work from O(k · window) to O(n) where n is the
-// number of samples and k is the number of window probes.
-// ---------------------------------------------------------------------------
-
-// Find the first non-silent sample from the start
-static size_t find_leading_edge(const std::vector<float> & audio, size_t max_samples) {
-    size_t check = std::min(audio.size(), max_samples);
-    if (check == 0) return 0;
-
-    const size_t window = static_cast<size_t>(50 * KOKOPOP_SAMPLE_RATE / 1000); // 50ms
-    const size_t step   = std::max(size_t(1), window / 4);
-
-    // Build prefix-sum: prefix[i] = count of non-silent samples in audio[0..i)
-    std::vector<uint32_t> prefix(check + 1, 0);
-    for (size_t i = 0; i < check; ++i) {
-        prefix[i + 1] = prefix[i] + (std::fabs(audio[i]) > SILENCE_THRESHOLD ? 1u : 0u);
+// Returns true if any |x| > SILENCE_THRESHOLD in [data, data+count).
+// SIMD with per-lane early exit; falls back to scalar.
+static bool any_above_threshold(const float * data, size_t count) {
+    size_t i = 0;
+#ifdef __ARM_NEON
+    const float32x4_t vt = vdupq_n_f32(SILENCE_THRESHOLD);
+    for (; i + 3 < count; i += 4) {
+        uint32x4_t cmp = vcgtq_f32(vabsq_f32(vld1q_f32(data + i)), vt);
+        if (vgetq_lane_u32(cmp, 0) | vgetq_lane_u32(cmp, 1) |
+            vgetq_lane_u32(cmp, 2) | vgetq_lane_u32(cmp, 3)) return true;
     }
+#elif defined(__AVX2__)
+    const __m256 vt       = _mm256_set1_ps(SILENCE_THRESHOLD);
+    const __m256 abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
+    for (; i + 7 < count; i += 8) {
+        __m256 v = _mm256_and_ps(_mm256_loadu_ps(data + i), abs_mask);
+        if (_mm256_movemask_ps(_mm256_cmp_ps(v, vt, _CMP_GT_OQ))) return true;
+    }
+#endif
+    for (; i < count; ++i)
+        if (std::fabs(data[i]) > SILENCE_THRESHOLD) return true;
+    return false;
+}
 
-    // Scan with sliding windows; return the start of the first non-silent window
+static size_t find_leading_edge(const std::vector<float> & audio, size_t max_samples) {
+    const size_t check  = std::min(audio.size(), max_samples);
+    if (check == 0) return 0;
+    const size_t window = static_cast<size_t>(50 * KOKOPOP_SAMPLE_RATE / 1000);
+    const size_t step   = std::max(size_t(1), window / 4);
     for (size_t i = 0; i < check; i += step) {
-        size_t end = std::min(i + window, check);
-        if (prefix[end] - prefix[i] > 0) {
-            return i;
-        }
+        if (any_above_threshold(audio.data() + i, std::min(window, check - i))) return i;
     }
     return check;
 }
 
-// Find the last non-silent sample from the end
+// Returns the position past the last non-silent sample, considering only the
+// trailing `max_samples` of audio. If the entire trailing region is silent,
+// returns audio.size() - max_samples (or 0 if the audio is shorter).
+// If the audio's last sample is non-silent, returns audio.size() (no trim).
 static size_t find_trailing_edge(const std::vector<float> & audio, size_t max_samples) {
-    size_t check_end = std::min(audio.size(), max_samples);
-    if (check_end == 0) return 0;
+    const size_t audio_size = audio.size();
+    if (audio_size == 0 || max_samples == 0) return audio_size;
+    const size_t scan_floor = audio_size > max_samples ? audio_size - max_samples : 0;
 
-    const size_t window = static_cast<size_t>(50 * KOKOPOP_SAMPLE_RATE / 1000); // 50ms
-    const size_t step   = std::max(size_t(1), window / 4);
-
-    // Build prefix-sum: prefix[i] = count of non-silent samples in audio[0..i)
-    std::vector<uint32_t> prefix(check_end + 1, 0);
-    for (size_t i = 0; i < check_end; ++i) {
-        prefix[i + 1] = prefix[i] + (std::fabs(audio[i]) > SILENCE_THRESHOLD ? 1u : 0u);
-    }
-
-    // Scan backwards; return the end of the first non-silent window found
-    for (size_t i = check_end; i > 0; ) {
-        size_t start = (i > window) ? i - window : 0;
-        if (prefix[i] - prefix[start] > 0) {
-            return i;
+    // Walk backwards in blocks; SIMD-skip blocks that are entirely silent,
+    // then locate the exact non-silent sample within the first hit.
+    constexpr size_t BLOCK = 256;
+    size_t end = audio_size;
+    while (end > scan_floor) {
+        const size_t block_start = (end > scan_floor + BLOCK) ? end - BLOCK : scan_floor;
+        if (any_above_threshold(audio.data() + block_start, end - block_start)) {
+            for (size_t i = end; i > block_start; --i) {
+                if (std::fabs(audio[i - 1]) > SILENCE_THRESHOLD) return i;
+            }
         }
-        i -= step;
+        end = block_start;
     }
-    return 0;
+    return scan_floor;
 }
 
 } // namespace
@@ -114,12 +120,46 @@ std::vector<float> apply_crossfade(
         // Edge case: single-sample overlap, just pick the next-head sample
         result[offset] = next[0];
     } else {
-        float inv_n_minus_1 = 1.0f / static_cast<float>(n - 1);
-        for (int i = 0; i < n; ++i) {
-            float t = static_cast<float>(i) * inv_n_minus_1;
-            result[offset + i] =
-                prev[prev.size() - n + i] * (1.0f - t) +
-                next[i] * t;
+        const float inv_n_minus_1 = 1.0f / static_cast<float>(n - 1);
+        const float * prev_tail   = prev.data() + (prev.size() - static_cast<size_t>(n));
+        const float * next_head   = next.data();
+        float       * out         = result.data() + offset;
+        int i = 0;
+
+#ifdef __ARM_NEON
+        {
+            float32x4_t vi    = { 0.f, 1.f, 2.f, 3.f };
+            const float32x4_t vstep  = vdupq_n_f32(4.f);
+            const float32x4_t vscale = vdupq_n_f32(inv_n_minus_1);
+            const float32x4_t vone   = vdupq_n_f32(1.f);
+            for (; i + 3 < n; i += 4) {
+                float32x4_t vt   = vmulq_f32(vi, vscale);
+                float32x4_t v1_t = vsubq_f32(vone, vt);
+                float32x4_t vp   = vld1q_f32(prev_tail + i);
+                float32x4_t vn   = vld1q_f32(next_head + i);
+                vst1q_f32(out + i, vmlaq_f32(vmulq_f32(vp, v1_t), vn, vt));
+                vi = vaddq_f32(vi, vstep);
+            }
+        }
+#elif defined(__AVX2__)
+        {
+            __m256 vi    = _mm256_set_ps(7.f, 6.f, 5.f, 4.f, 3.f, 2.f, 1.f, 0.f);
+            const __m256 vstep  = _mm256_set1_ps(8.f);
+            const __m256 vscale = _mm256_set1_ps(inv_n_minus_1);
+            const __m256 vone   = _mm256_set1_ps(1.f);
+            for (; i + 7 < n; i += 8) {
+                __m256 vt   = _mm256_mul_ps(vi, vscale);
+                __m256 v1_t = _mm256_sub_ps(vone, vt);
+                __m256 vp   = _mm256_loadu_ps(prev_tail + i);
+                __m256 vn   = _mm256_loadu_ps(next_head + i);
+                _mm256_storeu_ps(out + i, _mm256_fmadd_ps(vp, v1_t, _mm256_mul_ps(vn, vt)));
+                vi = _mm256_add_ps(vi, vstep);
+            }
+        }
+#endif
+        for (; i < n; ++i) {
+            const float t = static_cast<float>(i) * inv_n_minus_1;
+            out[i] = prev_tail[i] * (1.0f - t) + next_head[i] * t;
         }
     }
     offset += static_cast<size_t>(n);

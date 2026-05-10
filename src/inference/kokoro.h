@@ -111,7 +111,8 @@ ggml_tensor * graph_generator_resblock(
     const std::string & prefix,
     int kernel_size,
     const GeneratorResblockWeights & weights,
-    std::string & error);
+    std::string & error,
+    bool fused_snake = false);
 ggml_tensor * graph_generator_resblock(
     ggml_context * ctx,
     Model & model,

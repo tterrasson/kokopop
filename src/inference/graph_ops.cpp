@@ -7,8 +7,16 @@
 
 #include "core/constants.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
+
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
 
 namespace kokopop {
 
@@ -85,6 +93,106 @@ void metal_vocoder_convt_callback(
     }
 }
 #endif
+
+// ---------------------------------------------------------------------------
+// Snake1D fused callback: x + sin²(x·α) / α in a single pass.
+//
+// Used only on the CPU path (Metal runs native GGML ops).
+// a = x [n_time, n_channels], b = alpha_2d [1, n_channels].
+// SIMD vectorises the surrounding arithmetic; sinf stays scalar (no ISA sin).
+// ---------------------------------------------------------------------------
+
+static void snake1d_fused_callback(
+    ggml_tensor       * dst,
+    const ggml_tensor * a,
+    const ggml_tensor * b,
+    int ith, int nth,
+    void * /*userdata*/) {
+
+    const int64_t n_time     = a->ne[0];
+    const int64_t n_channels = a->ne[1];
+    const float * xd         = static_cast<const float *>(a->data);
+    float       * od         = static_cast<float *>(dst->data);
+    const char  * ab         = static_cast<const char *>(b->data);
+
+    // Split channels across threads (channels are independent).
+    const int64_t c_begin = (n_channels * ith)       / nth;
+    const int64_t c_end   = (n_channels * (ith + 1)) / nth;
+
+    for (int64_t c = c_begin; c < c_end; ++c) {
+        const float alpha = *reinterpret_cast<const float *>(ab + static_cast<size_t>(c) * b->nb[1]);
+        const float inv_a = 1.0f / alpha;
+        const float * xc  = xd + c * n_time;
+        float       * oc  = od + c * n_time;
+        int64_t t = 0;
+
+#ifdef __ARM_NEON
+        {
+            const float32x4_t va   = vdupq_n_f32(alpha);
+            const float32x4_t viva = vdupq_n_f32(inv_a);
+            for (; t + 3 < n_time; t += 4) {
+                float32x4_t vx = vld1q_f32(xc + t);
+                float xa[4];
+                vst1q_f32(xa, vmulq_f32(vx, va));
+                float s[4] = { std::sinf(xa[0]), std::sinf(xa[1]),
+                               std::sinf(xa[2]), std::sinf(xa[3]) };
+                float32x4_t vs2 = vmulq_f32(vld1q_f32(s), vld1q_f32(s));
+                vst1q_f32(oc + t, vaddq_f32(vx, vmulq_f32(vs2, viva)));
+            }
+        }
+#elif defined(__AVX2__)
+        {
+            const __m256 va   = _mm256_set1_ps(alpha);
+            const __m256 viva = _mm256_set1_ps(inv_a);
+            for (; t + 7 < n_time; t += 8) {
+                __m256 vx = _mm256_loadu_ps(xc + t);
+                alignas(32) float xa[8], s[8];
+                _mm256_store_ps(xa, _mm256_mul_ps(vx, va));
+                for (int k = 0; k < 8; ++k) s[k] = std::sinf(xa[k]);
+                __m256 vs  = _mm256_load_ps(s);
+                __m256 vs2 = _mm256_mul_ps(vs, vs);
+                _mm256_storeu_ps(oc + t, _mm256_add_ps(vx, _mm256_mul_ps(vs2, viva)));
+            }
+        }
+#endif
+        for (; t < n_time; ++t) {
+            const float v = xc[t];
+            const float s = std::sinf(v * alpha);
+            oc[t] = v + s * s * inv_a;
+        }
+    }
+}
+
+// Static dispatch: builds alpha_2d, then routes to fused (CPU F32) or graph ops.
+static ggml_tensor * snake1d_impl(
+    ggml_context * ctx,
+    ggml_tensor * x,
+    ggml_tensor * alpha,
+    const std::string & alpha_name,
+    std::string & error,
+    bool allow_fused) {
+
+    ggml_tensor * alpha_2d = nullptr;
+    if (alpha->ne[0] == 1 && alpha->ne[1] == x->ne[1]) {
+        alpha_2d = ggml_view_2d(ctx, alpha, 1, x->ne[1], alpha->nb[1], 0);
+    } else if (alpha->ne[0] == x->ne[1]) {
+        alpha_2d = ggml_view_2d(ctx, alpha, 1, x->ne[1], alpha->nb[0], 0);
+    } else {
+        error = "invalid Snake1D alpha shape: " + alpha_name;
+        return nullptr;
+    }
+
+    if (allow_fused && x->type == GGML_TYPE_F32) {
+        return ggml_map_custom2(ctx, x, alpha_2d, snake1d_fused_callback,
+                                GGML_N_TASKS_MAX, nullptr);
+    }
+
+    ggml_tensor * a  = ggml_repeat(ctx, alpha_2d, x);
+    ggml_tensor * xa = ggml_mul(ctx, x, a);
+    ggml_tensor * s  = ggml_sin(ctx, xa);
+    ggml_tensor * s2 = ggml_mul(ctx, s, s);
+    return ggml_add(ctx, x, ggml_div(ctx, s2, a));
+}
 
 } // namespace
 
@@ -300,21 +408,7 @@ ggml_tensor * graph_snake1d(
     ggml_tensor * alpha,
     const std::string & alpha_name,
     std::string & error) {
-    ggml_tensor * alpha_2d = nullptr;
-    if (alpha->ne[0] == 1 && alpha->ne[1] == x->ne[1]) {
-        alpha_2d = ggml_view_2d(ctx, alpha, 1, x->ne[1], alpha->nb[1], 0);
-    } else if (alpha->ne[0] == x->ne[1]) {
-        alpha_2d = ggml_view_2d(ctx, alpha, 1, x->ne[1], alpha->nb[0], 0);
-    } else {
-        error = "invalid Snake1D alpha shape: " + alpha_name;
-        return nullptr;
-    }
-
-    ggml_tensor * a  = ggml_repeat(ctx, alpha_2d, x);   // broadcast α to x's shape
-    ggml_tensor * xa = ggml_mul(ctx, x, a);              // x * α
-    ggml_tensor * s  = ggml_sin(ctx, xa);                // sin(x * α)
-    ggml_tensor * s2 = ggml_mul(ctx, s, s);              // sin²(x * α)
-    return ggml_add(ctx, x, ggml_div(ctx, s2, a));       // x + sin²(x·α) / α
+    return snake1d_impl(ctx, x, alpha, alpha_name, error, /*allow_fused=*/false);
 }
 
 ggml_tensor * graph_snake1d(
@@ -324,7 +418,8 @@ ggml_tensor * graph_snake1d(
     if (!error.empty()) {
         return nullptr;
     }
-    return graph_snake1d(ctx, x, alpha, alpha_name, error);
+    return snake1d_impl(ctx, x, alpha, alpha_name, error,
+                        model.backend_type == KOKOPOP_BACKEND_CPU);
 }
 
 // ---------------------------------------------------------------------------
@@ -435,11 +530,13 @@ ggml_tensor * graph_generator_resblock(
     const std::string & prefix,
     int kernel_size,
     const GeneratorResblockWeights & weights,
-    std::string & error) {
+    std::string & error,
+    bool fused_snake) {
     for (int i = 0; i < 3; ++i) {
         const size_t idx = static_cast<size_t>(i);
         ggml_tensor * cur = adain_1d(ctx, x, style, weights.adain1[idx]);
-        cur = graph_snake1d(ctx, cur, weights.alpha1[idx], prefix + ".alpha1." + std::to_string(i), error);
+        cur = snake1d_impl(ctx, cur, weights.alpha1[idx],
+                           prefix + ".alpha1." + std::to_string(i), error, fused_snake);
         if (cur == nullptr) {
             return nullptr;
         }
@@ -447,7 +544,8 @@ ggml_tensor * graph_generator_resblock(
             conv1d(ctx, weights.convs1_w[idx], cur, 1, weights.paddings[idx], KOKOPOP_RESBLOCK_DILATIONS[i], kernel_size),
             weights.convs1_b[idx]);
         cur = adain_1d(ctx, cur, style, weights.adain2[idx]);
-        cur = graph_snake1d(ctx, cur, weights.alpha2[idx], prefix + ".alpha2." + std::to_string(i), error);
+        cur = snake1d_impl(ctx, cur, weights.alpha2[idx],
+                           prefix + ".alpha2." + std::to_string(i), error, fused_snake);
         if (cur == nullptr) {
             return nullptr;
         }
@@ -469,7 +567,8 @@ ggml_tensor * graph_generator_resblock(
     std::string & error) {
     const auto cached = model.generator_resblock_weights.find(prefix);
     if (cached != model.generator_resblock_weights.end()) {
-        return graph_generator_resblock(ctx, x, style, prefix, kernel_size, cached->second, error);
+        return graph_generator_resblock(ctx, x, style, prefix, kernel_size, cached->second, error,
+                                        model.backend_type == KOKOPOP_BACKEND_CPU);
     }
 
     int paddings[3];
