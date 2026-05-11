@@ -456,6 +456,19 @@ void Model::preload_tensor_cache() {
         lstm_w_hh_f32.emplace(t.name, std::move(t.f32));
         lstm_w_hh_rowwise.emplace(t.name, std::move(t.rowwise));
     }
+
+    // CPU-side cache of LSTM b_hh tensors. The fused LSTM callback captures
+    // a raw host pointer to b_hh data; on backends that place weights in
+    // device memory (CUDA VRAM) this cache provides a host-addressable copy.
+    lstm_b_hh_f32.clear();
+    for (const auto & kv : tensors) {
+        if (kv.first.find("bias_hh_l0") == std::string::npos) continue;
+        if (kv.second == nullptr) continue;
+        std::vector<float> data;
+        if (tensor_to_f32(*backend, kv.second, data)) {
+            lstm_b_hh_f32.emplace(kv.first, std::move(data));
+        }
+    }
 }
 
 void Model::prereserve_scratch_buffers() {
@@ -618,10 +631,11 @@ bool load_model_from_gguf(
         }
         return false;
     }
-    // Record the actual backend type based on what was created,
-    // not what was requested (AUTO can resolve to Metal or CPU).
-    // Use the backend's own label() — weight_buffer_type is always CPU
-    // because weights stay in unified memory even on Metal.
+    // Record the actual backend type based on what was created, not what
+    // was requested (AUTO can resolve to CUDA, Metal, or CPU). Use the
+    // backend's own label() — weight_buffer_type varies by backend
+    // (CPU buffer on CPU/Metal, CUDA VRAM on CUDA), so it's not a
+    // reliable discriminator.
     if (std::strcmp(m->backend->label(), "Metal (GPU)") == 0) {
         m->backend_type = KOKOPOP_BACKEND_METAL;
     } else if (std::strcmp(m->backend->label(), "CUDA (GPU)") == 0) {

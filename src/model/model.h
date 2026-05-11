@@ -149,6 +149,13 @@ struct Model {
     // for each gate j, enabling NEON/AVX2 vectorisation of the dot product.
     std::unordered_map<std::string, std::vector<float>> lstm_w_hh_rowwise;
 
+    // CPU-side cache of LSTM b_hh tensors. The fused LSTM CPU callback reads
+    // b_hh through a raw pointer captured at graph build time, so the data
+    // must live in host memory regardless of where the GGUF weight tensor
+    // is allocated (CPU buffer on CPU/Metal backends, VRAM on CUDA).
+    // Key = tensor logical name (e.g. "kokopop.text_encoder.lstm.bias_hh_l0").
+    std::unordered_map<std::string, std::vector<float>> lstm_b_hh_f32;
+
     // Scratch storage for LstmCustomParams instances built during graph
     // construction.  Reserve 24 slots before building the generation graph
     // (12 LSTM directions × safety margin) so no reallocation occurs and

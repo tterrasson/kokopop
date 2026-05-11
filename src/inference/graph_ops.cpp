@@ -795,9 +795,18 @@ ggml_tensor * lstm_direction(
         return nullptr;
     }
 
-    // b_hh_packed is a F32 tensor in the CPU weight buffer; ->data is a valid
-    // CPU pointer for the lifetime of the model.
-    const float * b_hh_ptr = static_cast<const float *>(w.b_hh_packed->data);
+    // Resolve b_hh via the host-side cache (model.lstm_b_hh_f32). The fused
+    // LSTM CPU callback dereferences this pointer directly, so it must be
+    // host-addressable even when the GGUF weight tensor lives in device
+    // memory (e.g. CUDA VRAM).
+    const std::string b_hh_key =
+        prefix + ".bias_hh_l0" + (reverse ? "_reverse" : "");
+    const auto b_it = model.lstm_b_hh_f32.find(b_hh_key);
+    if (b_it == model.lstm_b_hh_f32.end()) {
+        error = "fused LSTM: b_hh not preloaded for " + b_hh_key;
+        return nullptr;
+    }
+    const float * b_hh_ptr = b_it->second.data();
 
     model.lstm_custom_params.push_back({
         it->second.data(),                     // w_hh_f32 (original column-major)

@@ -102,34 +102,42 @@ public:
         return false;
     }
 
-    // Pin nodes that must run on the CPU backend so their callbacks read
-    // host-resident data. Three layers, evaluated in order:
-    //   1. Hard pin: CUDA cannot execute the op (custom ops, integer types).
-    //   2. Default pin: ops known to produce numerically incorrect results
-    //      on ggml-cuda for Kokoro shapes — currently MUL_MAT. Pinning
-    //      matmul to CPU restores correct audio at a modest perf cost.
-    //   3. Soft pin: KOKOPOP_CUDA_PIN_OP (CSV) lets the user pin extra ops.
-    // KOKOPOP_CUDA_ALLOW_OP (CSV) overrides default/soft pins for testing.
+    // Default threshold for pinning wide MUL_MAT ops on the CPU backend.
+    // ggml-cuda's MUL_MAT (across MMQ, cuBLAS, F16/F32 compute) produces
+    // numerically corrupted output for Kokoro's wide matmuls (F0/N
+    // predictor, decoder, vocoder conv1d via im2col+mul_mat) where
+    // ne1 is the total frame count. A standalone repro of the same
+    // shape in isolation matches CPU within Q8_0 noise, so the bug is
+    // an in-graph interaction (scheduler buffer reuse, stream sync,
+    // or similar) we have not yet root-caused. Pinning these matmuls
+    // on CPU is a safe fallback. See tools/cuda_mulmat_repro.cpp.
+    // Override via KOKOPOP_CUDA_PIN_NE1_GE (0 disables the default).
+    static constexpr int64_t kDefaultPinNe1Threshold = 1024;
+
+    // Pin nodes that must run on the CPU backend:
+    //   - Hard pin: ops CUDA cannot execute (custom ops, integer types).
+    //   - Workaround pin: MUL_MAT with ne1 >= kDefaultPinNe1Threshold.
+    //   - Soft pin: KOKOPOP_CUDA_PIN_OP (CSV of op names) for extra debugging.
     void pin_cpu_fallbacks(ggml_cgraph * graph) {
-        const char * pin_env   = std::getenv("KOKOPOP_CUDA_PIN_OP");
-        const char * allow_env = std::getenv("KOKOPOP_CUDA_ALLOW_OP");
+        const char * pin_env = std::getenv("KOKOPOP_CUDA_PIN_OP");
+        int64_t ne1_threshold = kDefaultPinNe1Threshold;
+        if (const char * env_ne1 = std::getenv("KOKOPOP_CUDA_PIN_NE1_GE")) {
+            ne1_threshold = std::atoll(env_ne1);
+        }
         const int n_nodes = ggml_graph_n_nodes(graph);
         for (int i = 0; i < n_nodes; ++i) {
             ggml_tensor * node = ggml_graph_node(graph, i);
             if (node == nullptr) continue;
-            const char * op_name = ggml_op_name(node->op);
-            const char * unary_name = (node->op == GGML_OP_UNARY)
-                                    ? ggml_unary_op_name(ggml_get_unary_op(node))
-                                    : nullptr;
-            const bool hard_pin = !ggml_backend_supports_op(backend_, node);
-            const bool default_pin = (node->op == GGML_OP_MUL_MAT);
-            const bool soft_pin   = pin_env && (op_in_list(pin_env, op_name) ||
-                                                (unary_name && op_in_list(pin_env, unary_name)));
-            const bool allowed    = allow_env && (op_in_list(allow_env, op_name) ||
-                                                  (unary_name && op_in_list(allow_env, unary_name)));
-            bool pin = hard_pin;
-            if (!pin && !allowed) {
-                pin = default_pin || soft_pin;
+            bool pin = !ggml_backend_supports_op(backend_, node);
+            if (!pin && node->op == GGML_OP_MUL_MAT
+                && ne1_threshold > 0 && node->ne[1] >= ne1_threshold) {
+                pin = true;
+            }
+            if (!pin && pin_env != nullptr) {
+                pin = op_in_list(pin_env, ggml_op_name(node->op));
+                if (!pin && node->op == GGML_OP_UNARY) {
+                    pin = op_in_list(pin_env, ggml_unary_op_name(ggml_get_unary_op(node)));
+                }
             }
             if (pin) {
                 ggml_backend_sched_set_tensor_backend(sched_, node, cpu_backend_);
@@ -222,14 +230,17 @@ public:
     }
 
     ggml_backend_buffer_type_t weight_buffer_type() const override {
-        // Weights live in plain CPU memory for two reasons:
-        //   1. Kokoro custom ops (fused LSTM, Snake1D, vocoder
-        //      ConvTranspose) capture raw tensor->data pointers at graph
-        //      build time and dereference them from CPU callbacks.
-        //   2. MUL_MAT is pinned to CPU by default (see pin_cpu_fallbacks),
-        //      and CPU matmul needs the weights host-accessible.
-        // CUDA ops still read these tensors via cross-buffer DMA.
-        return ggml_backend_get_default_buffer_type(cpu_backend_);
+        // Weights live in CUDA VRAM. This keeps MUL_MAT on the
+        // "happy path" (src and dst share the CUDA backend) — feeding
+        // ggml-cuda matmul from a CPU-buffered weight tensor produced
+        // numerically corrupted output for Kokoro shapes.
+        //
+        // The fused LSTM CPU callback still needs host-addressable
+        // b_hh data; that's covered by model.lstm_b_hh_f32 (CPU cache
+        // populated at load time). Other custom ops (Snake1D, vocoder
+        // ConvT path when KOKOPOP_HAS_METAL is off) pass weights as
+        // graph inputs, so the scheduler handles cross-backend copies.
+        return ggml_backend_cuda_buffer_type(device_id_);
     }
 
     const char * label() const override {

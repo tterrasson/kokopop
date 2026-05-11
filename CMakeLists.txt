@@ -329,6 +329,15 @@ if(KOKOPOP_BUILD_TOOLS)
   )
   target_link_libraries(kokopop_stream PRIVATE kokopop yyjson)
 
+  # CUDA matmul repro tool (only when CUDA is enabled)
+  if(KOKOPOP_ENABLE_CUDA)
+    add_executable(cuda_mulmat_repro tools/cuda_mulmat_repro.cpp)
+    target_include_directories(cuda_mulmat_repro PRIVATE
+      $<BUILD_INTERFACE:${ggml_SOURCE_DIR}/include>
+    )
+    target_link_libraries(cuda_mulmat_repro PRIVATE ggml)
+  endif()
+
   # Audio playback tool
   add_executable(kokopop_play tools/kokopop_play.cpp)
   target_include_directories(kokopop_play PRIVATE
