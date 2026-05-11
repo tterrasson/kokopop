@@ -83,7 +83,7 @@ struct Model {
     uint32_t version = 1;
     int32_t n_threads = 1;
     int32_t sample_rate = 24000;
-    int32_t backend_type = KOKOPOP_BACKEND_CPU;  // actual backend used (CPU or Metal)
+    int32_t backend_type = KOKOPOP_BACKEND_CPU;  // actual backend used (CPU, Metal or CUDA)
     bool is_mock = false;
     std::vector<std::string> vocab;
 

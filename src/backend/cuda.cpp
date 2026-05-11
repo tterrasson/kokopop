@@ -9,6 +9,7 @@
 #include <vector>
 #include <ggml.h>
 #include <ggml-backend.h>
+#include <ggml-cpu.h>
 #include <ggml-cuda.h>
 
 namespace kokopop {
@@ -17,6 +18,7 @@ namespace {
 
 class CudaBackend : public Backend {
     ggml_backend_t backend_ = nullptr;
+    ggml_backend_t cpu_backend_ = nullptr;
     ggml_backend_sched_t sched_ = nullptr;
     size_t sched_capacity_ = 0;
     int device_id_ = 0;
@@ -31,14 +33,17 @@ class CudaBackend : public Backend {
             sched_ = nullptr;
             sched_capacity_ = 0;
         }
-        ggml_backend_t backends[] = { backend_ };
-        sched_ = ggml_backend_sched_new(backends, nullptr, 1, required, false, true);
+        // ggml's scheduler requires a CPU backend as the last entry — it's
+        // used as a fallback for ops not supported on the GPU. CUDA runs
+        // the vast majority of nodes; the CPU backend only catches strays.
+        ggml_backend_t backends[] = { backend_, cpu_backend_ };
+        sched_ = ggml_backend_sched_new(backends, nullptr, 2, required, false, true);
         sched_capacity_ = sched_ == nullptr ? 0 : required;
         return sched_ != nullptr;
     }
 
 public:
-    explicit CudaBackend(int32_t /*n_threads*/) {
+    explicit CudaBackend(int32_t n_threads) {
         const char * env = std::getenv("KOKOPOP_CUDA_DEVICE");
         const int requested = env ? std::atoi(env) : 0;
         const int count = ggml_backend_cuda_get_device_count();
@@ -47,6 +52,13 @@ public:
         }
         device_id_ = (requested >= 0 && requested < count) ? requested : 0;
         backend_ = ggml_backend_cuda_init(device_id_);
+        if (backend_ == nullptr) {
+            return;
+        }
+        cpu_backend_ = ggml_backend_cpu_init();
+        if (cpu_backend_ != nullptr) {
+            ggml_backend_cpu_set_n_threads(cpu_backend_, std::max<int32_t>(1, n_threads));
+        }
     }
 
     ~CudaBackend() override {
@@ -58,10 +70,14 @@ public:
             ggml_backend_free(backend_);
             backend_ = nullptr;
         }
+        if (cpu_backend_) {
+            ggml_backend_free(cpu_backend_);
+            cpu_backend_ = nullptr;
+        }
     }
 
     bool valid() const {
-        return backend_ != nullptr;
+        return backend_ != nullptr && cpu_backend_ != nullptr;
     }
 
     void sched_reset() override {

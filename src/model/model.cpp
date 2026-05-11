@@ -624,6 +624,8 @@ bool load_model_from_gguf(
     // because weights stay in unified memory even on Metal.
     if (std::strcmp(m->backend->label(), "Metal (GPU)") == 0) {
         m->backend_type = KOKOPOP_BACKEND_METAL;
+    } else if (std::strcmp(m->backend->label(), "CUDA (GPU)") == 0) {
+        m->backend_type = KOKOPOP_BACKEND_CUDA;
     } else {
         m->backend_type = KOKOPOP_BACKEND_CPU;
     }
