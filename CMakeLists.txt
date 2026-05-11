@@ -34,10 +34,15 @@ FetchContent_Declare(
   #         reduction, avoiding GPU watchdog on large generator dims.
   # Apply only when the patch still matches. This keeps re-configure
   # idempotent without leaving .rej files in FetchContent sources.
+  # Fix 5 (CUDA): IM2COL crashes with "invalid argument" when OW exceeds 65535
+  #         (long vocoder sequences). Clamp grid Y dim and loop the kernel
+  #         over OW chunks of MAX_GRIDDIM_Z.
   PATCH_COMMAND
     ${CMAKE_COMMAND} -DPATCH_FILE=${CMAKE_SOURCE_DIR}/patches/ggml-metal-norm-scalar.patch -P ${CMAKE_SOURCE_DIR}/tools/apply_patch_if_needed.cmake
     COMMAND
     ${CMAKE_COMMAND} -DPATCH_FILE=${CMAKE_SOURCE_DIR}/patches/ggml-conv-transpose-1d-simd.patch -P ${CMAKE_SOURCE_DIR}/tools/apply_patch_if_needed.cmake
+    COMMAND
+    ${CMAKE_COMMAND} -DPATCH_FILE=${CMAKE_SOURCE_DIR}/patches/ggml-cuda-im2col-griddim.patch -P ${CMAKE_SOURCE_DIR}/tools/apply_patch_if_needed.cmake
 )
 if(KOKOPOP_ENABLE_CUDA)
   set(GGML_CUDA ON CACHE BOOL "" FORCE)
