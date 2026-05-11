@@ -185,8 +185,17 @@ public:
     }
 
     ggml_backend_buffer_type_t weight_buffer_type() const override {
-        // Place weights directly in VRAM so compute avoids per-step PCIe copies.
-        return ggml_backend_cuda_buffer_type(device_id_);
+        // Weights must live in host-accessible memory: a few Kokoro custom
+        // ops (fused LSTM, Snake1D, vocoder ConvTranspose) capture raw
+        // tensor->data pointers at graph build time and dereference them
+        // from CPU callbacks. Pinned host memory keeps these pointers
+        // dereferenceable while still allowing fast async DMA from the
+        // CUDA backend when running matmul/conv on the GPU.
+        ggml_backend_buffer_type_t pinned = ggml_backend_cuda_host_buffer_type();
+        if (pinned != nullptr) {
+            return pinned;
+        }
+        return ggml_backend_get_default_buffer_type(cpu_backend_);
     }
 
     const char * label() const override {
