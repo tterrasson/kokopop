@@ -8,6 +8,7 @@ project(kokopop
 option(KOKOPOP_BUILD_TESTS "Build kokopop unit tests" ON)
 option(KOKOPOP_BUILD_TOOLS "Build kokopop command line tools" ON)
 option(KOKOPOP_ENABLE_METAL "Enable Metal (GPU) backend" OFF)
+option(KOKOPOP_ENABLE_CUDA "Enable CUDA (GPU) backend" OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -38,6 +39,9 @@ FetchContent_Declare(
     COMMAND
     ${CMAKE_COMMAND} -DPATCH_FILE=${CMAKE_SOURCE_DIR}/patches/ggml-conv-transpose-1d-simd.patch -P ${CMAKE_SOURCE_DIR}/tools/apply_patch_if_needed.cmake
 )
+if(KOKOPOP_ENABLE_CUDA)
+  set(GGML_CUDA ON CACHE BOOL "" FORCE)
+endif()
 FetchContent_MakeAvailable(ggml)
 
 FetchContent_Declare(
@@ -126,6 +130,9 @@ if(KOKOPOP_ENABLE_METAL)
   list(APPEND _kokopop_backend_sources src/backend/metal_lstm.mm)
   list(APPEND _kokopop_backend_sources src/backend/metal_stft.mm)
   list(APPEND _kokopop_backend_sources src/backend/metal_vocoder.mm)
+endif()
+if(KOKOPOP_ENABLE_CUDA)
+  list(APPEND _kokopop_backend_sources src/backend/cuda.cpp)
 endif()
 
 # Model module (GGUF loading)
@@ -251,6 +258,13 @@ if(KOKOPOP_ENABLE_METAL)
   message(STATUS "kokopop: Metal backend enabled")
 else()
   message(STATUS "kokopop: Metal backend disabled (CPU-only)")
+endif()
+
+if(KOKOPOP_ENABLE_CUDA)
+  target_compile_definitions(kokopop PUBLIC KOKOPOP_HAS_CUDA)
+  message(STATUS "kokopop: CUDA backend enabled")
+else()
+  message(STATUS "kokopop: CUDA backend disabled")
 endif()
 
 if(MSVC)

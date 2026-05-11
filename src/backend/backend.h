@@ -154,7 +154,8 @@ struct MetalVocoderConvTransposeParams {
 std::unique_ptr<Backend> create_cpu_backend(int32_t n_threads);
 
 // Factory: create the backend for the given request.
-// requested: KOKOPOP_BACKEND_AUTO (0), KOKOPOP_BACKEND_CPU (1), KOKOPOP_BACKEND_METAL (2)
+// requested: KOKOPOP_BACKEND_AUTO (0), KOKOPOP_BACKEND_CPU (1),
+//            KOKOPOP_BACKEND_METAL (2), KOKOPOP_BACKEND_CUDA (3)
 std::unique_ptr<Backend> create_backend(
     int32_t requested, int32_t n_threads, std::string & error);
 
