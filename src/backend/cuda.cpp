@@ -34,8 +34,8 @@ class CudaBackend : public Backend {
             sched_capacity_ = 0;
         }
         // ggml's scheduler requires a CPU backend as the last entry — it's
-        // used as a fallback for ops not supported on the GPU. CUDA runs
-        // the vast majority of nodes; the CPU backend only catches strays.
+        // used as a fallback for ops not supported on the GPU and as the
+        // execution backend for nodes pinned via pin_cpu_fallbacks().
         ggml_backend_t backends[] = { backend_, cpu_backend_ };
         sched_ = ggml_backend_sched_new(backends, nullptr, 2, required, false, true);
         sched_capacity_ = sched_ == nullptr ? 0 : required;
@@ -86,15 +86,52 @@ public:
         }
     }
 
-    // Pin nodes CUDA cannot execute (custom ops, integer types, etc.) to the
-    // CPU backend so their callbacks run on host pointers. The scheduler
-    // inserts host<->device copies around CPU islands automatically.
+    static bool op_in_list(const char * csv, const char * name) {
+        if (csv == nullptr || name == nullptr) return false;
+        const size_t nlen = std::strlen(name);
+        const char * p = csv;
+        while (*p) {
+            while (*p == ' ' || *p == ',') ++p;
+            const char * start = p;
+            while (*p && *p != ',') ++p;
+            const size_t len = static_cast<size_t>(p - start);
+            if (len == nlen && std::strncmp(start, name, nlen) == 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Pin nodes that must run on the CPU backend so their callbacks read
+    // host-resident data. Three layers, evaluated in order:
+    //   1. Hard pin: CUDA cannot execute the op (custom ops, integer types).
+    //   2. Default pin: ops known to produce numerically incorrect results
+    //      on ggml-cuda for Kokoro shapes — currently MUL_MAT. Pinning
+    //      matmul to CPU restores correct audio at a modest perf cost.
+    //   3. Soft pin: KOKOPOP_CUDA_PIN_OP (CSV) lets the user pin extra ops.
+    // KOKOPOP_CUDA_ALLOW_OP (CSV) overrides default/soft pins for testing.
     void pin_cpu_fallbacks(ggml_cgraph * graph) {
+        const char * pin_env   = std::getenv("KOKOPOP_CUDA_PIN_OP");
+        const char * allow_env = std::getenv("KOKOPOP_CUDA_ALLOW_OP");
         const int n_nodes = ggml_graph_n_nodes(graph);
         for (int i = 0; i < n_nodes; ++i) {
             ggml_tensor * node = ggml_graph_node(graph, i);
             if (node == nullptr) continue;
-            if (!ggml_backend_supports_op(backend_, node)) {
+            const char * op_name = ggml_op_name(node->op);
+            const char * unary_name = (node->op == GGML_OP_UNARY)
+                                    ? ggml_unary_op_name(ggml_get_unary_op(node))
+                                    : nullptr;
+            const bool hard_pin = !ggml_backend_supports_op(backend_, node);
+            const bool default_pin = (node->op == GGML_OP_MUL_MAT);
+            const bool soft_pin   = pin_env && (op_in_list(pin_env, op_name) ||
+                                                (unary_name && op_in_list(pin_env, unary_name)));
+            const bool allowed    = allow_env && (op_in_list(allow_env, op_name) ||
+                                                  (unary_name && op_in_list(allow_env, unary_name)));
+            bool pin = hard_pin;
+            if (!pin && !allowed) {
+                pin = default_pin || soft_pin;
+            }
+            if (pin) {
                 ggml_backend_sched_set_tensor_backend(sched_, node, cpu_backend_);
             }
         }
@@ -185,16 +222,13 @@ public:
     }
 
     ggml_backend_buffer_type_t weight_buffer_type() const override {
-        // Weights must live in host-accessible memory: a few Kokoro custom
-        // ops (fused LSTM, Snake1D, vocoder ConvTranspose) capture raw
-        // tensor->data pointers at graph build time and dereference them
-        // from CPU callbacks. Pinned host memory keeps these pointers
-        // dereferenceable while still allowing fast async DMA from the
-        // CUDA backend when running matmul/conv on the GPU.
-        ggml_backend_buffer_type_t pinned = ggml_backend_cuda_host_buffer_type();
-        if (pinned != nullptr) {
-            return pinned;
-        }
+        // Weights live in plain CPU memory for two reasons:
+        //   1. Kokoro custom ops (fused LSTM, Snake1D, vocoder
+        //      ConvTranspose) capture raw tensor->data pointers at graph
+        //      build time and dereference them from CPU callbacks.
+        //   2. MUL_MAT is pinned to CPU by default (see pin_cpu_fallbacks),
+        //      and CPU matmul needs the weights host-accessible.
+        // CUDA ops still read these tensors via cross-buffer DMA.
         return ggml_backend_get_default_buffer_type(cpu_backend_);
     }
 
