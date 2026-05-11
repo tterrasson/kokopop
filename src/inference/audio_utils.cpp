@@ -16,6 +16,13 @@
 #include <new>
 #include <numeric>
 
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
+
 namespace kokopop {
 
 // ---------------------------------------------------------------------------
@@ -168,13 +175,147 @@ static bool fill_harmonic_stft(
         const float base_f0 = f0[static_cast<size_t>(seg)];
 
         if (base_f0 > 10.0f) {
-            float sin_delta[harmonic];
-            float cos_delta[harmonic];
+            // Per-segment trigonometric deltas — computed once outside the j-loop;
+            // the j-loop only does a vectorisable phase rotation.
+            // Pad to 16 lanes (AVX2 width × 2) so loads past h=8 are well-defined zeros
+            // and don't contribute to the merged sum.
+            alignas(32) float sin_delta[16] = {};
+            alignas(32) float cos_delta[16] = {};
+            alignas(32) float mw_scaled[16] = {};
             for (int h = 0; h < harmonic; ++h) {
                 const float delta = 2.0f * M_PI * base_f0 * static_cast<float>(h + 1) / static_cast<float>(sample_rate);
                 sin_delta[h] = std::sin(delta);
                 cos_delta[h] = std::cos(delta);
+                mw_scaled[h] = mw[h] * sine_amp;
             }
+
+#if defined(__ARM_NEON)
+            // NEON 4-wide × 2 covers h=0..7; h=8 handled scalar.
+            static_assert(KOKOPOP_HARMONIC_COUNT == 9,
+                          "vectorised harmonic update assumes HARMONIC_COUNT == 9");
+            const float32x4_t cd0 = vld1q_f32(cos_delta);
+            const float32x4_t cd1 = vld1q_f32(cos_delta + 4);
+            const float32x4_t sd0 = vld1q_f32(sin_delta);
+            const float32x4_t sd1 = vld1q_f32(sin_delta + 4);
+            const float32x4_t mw0 = vld1q_f32(mw_scaled);
+            const float32x4_t mw1 = vld1q_f32(mw_scaled + 4);
+            const float cd8 = cos_delta[8];
+            const float sd8 = sin_delta[8];
+            const float mw8 = mw_scaled[8];
+
+            // Vectorise the phase rotation only; keep the merged accumulation
+            // scalar to preserve the exact left-to-right reduction order of
+            // the original code (which the compiler lowers to a chain of
+            // sequential fmadd's). Mixing SIMD horizontal-sum into the
+            // accumulator perturbs results enough to drop SNR below 60 dB on
+            // long chunks, even when each lane is computed with FMA semantics
+            // matching the scalar fallback.
+            //
+            // Use mul+sub/mul+add rather than vfma/vfms so that each NEON lane
+            // does the same three-rounding sequence as the scalar fallback
+            // would produce under -ffp-contract=off. Phase magnitude drift
+            // therefore stays at the ULP level and resyncs to 1.0 every 16
+            // segments via the existing renormalisation block.
+            for (int64_t j = 0; j < seg_len; ++j) {
+                float32x4_t ps0 = vld1q_f32(phase_sin);
+                float32x4_t ps1 = vld1q_f32(phase_sin + 4);
+                float32x4_t pc0 = vld1q_f32(phase_cos);
+                float32x4_t pc1 = vld1q_f32(phase_cos + 4);
+
+                // Match the scalar codegen exactly: clang lowers
+                //   `s*cd + c*sd`  → `fmul c,sd; fmadd s,cd,t`  (c*sd rounded; s*cd fused)
+                //   `c*cd - s*sd`  → `fnmul s,sd; fmadd c,cd,t` (-s*sd rounded; c*cd fused)
+                // Mismatching this pattern accumulates ~1 ULP/step of phase
+                // angle drift, which over a multi-thousand-step chunk degrades
+                // audio SNR below 60 dB.
+                float32x4_t ns0 = vfmaq_f32(vmulq_f32(pc0, sd0), ps0, cd0);
+                float32x4_t ns1 = vfmaq_f32(vmulq_f32(pc1, sd1), ps1, cd1);
+                float32x4_t nc0 = vfmaq_f32(vnegq_f32(vmulq_f32(ps0, sd0)), pc0, cd0);
+                float32x4_t nc1 = vfmaq_f32(vnegq_f32(vmulq_f32(ps1, sd1)), pc1, cd1);
+
+                vst1q_f32(phase_sin,     ns0);
+                vst1q_f32(phase_sin + 4, ns1);
+                vst1q_f32(phase_cos,     nc0);
+                vst1q_f32(phase_cos + 4, nc1);
+
+                // Scalar tail for h=8.
+                const float ps8 = phase_sin[8], pc8 = phase_cos[8];
+                const float ns8 = ps8 * cd8 + pc8 * sd8;
+                const float nc8 = pc8 * cd8 - ps8 * sd8;
+                phase_sin[8] = ns8;
+                phase_cos[8] = nc8;
+
+                // Sequential accumulation — same order as the scalar loop.
+                float merged = mb;
+                merged += mw_scaled[0] * vgetq_lane_f32(ns0, 0);
+                merged += mw_scaled[1] * vgetq_lane_f32(ns0, 1);
+                merged += mw_scaled[2] * vgetq_lane_f32(ns0, 2);
+                merged += mw_scaled[3] * vgetq_lane_f32(ns0, 3);
+                merged += mw_scaled[4] * vgetq_lane_f32(ns1, 0);
+                merged += mw_scaled[5] * vgetq_lane_f32(ns1, 1);
+                merged += mw_scaled[6] * vgetq_lane_f32(ns1, 2);
+                merged += mw_scaled[7] * vgetq_lane_f32(ns1, 3);
+                merged += mw8 * ns8;
+                source[static_cast<size_t>(seg_start + j)] = std::tanh(merged);
+            }
+#elif defined(__AVX2__)
+            static_assert(KOKOPOP_HARMONIC_COUNT == 9,
+                          "vectorised harmonic update assumes HARMONIC_COUNT == 9");
+            const __m256 cd_v = _mm256_load_ps(cos_delta);
+            const __m256 sd_v = _mm256_load_ps(sin_delta);
+            const __m256 mw_v = _mm256_load_ps(mw_scaled);
+            const float cd8 = cos_delta[8];
+            const float sd8 = sin_delta[8];
+            const float mw8 = mw_scaled[8];
+
+            alignas(32) float ps_buf[16] = {};
+            alignas(32) float pc_buf[16] = {};
+            for (int h = 0; h < harmonic; ++h) { ps_buf[h] = phase_sin[h]; pc_buf[h] = phase_cos[h]; }
+
+            // Match the scalar FMA contraction pattern lane-for-lane (same as
+            // NEON path):
+            //   next_sin = (pc*sd rounded) + (ps*cd fused)
+            //   next_cos = (-(ps*sd) rounded) + (pc*cd fused)
+            // Mixing SIMD horizontal-sum into the merged accumulator breaks
+            // bit-equivalence and degrades audio SNR over long chunks, so the
+            // accumulation runs scalar over the SIMD lane outputs.
+            const __m256 sign_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x80000000));
+            for (int64_t j = 0; j < seg_len; ++j) {
+                __m256 ps = _mm256_load_ps(ps_buf);
+                __m256 pc = _mm256_load_ps(pc_buf);
+
+                __m256 t_pcsd     = _mm256_mul_ps(pc, sd_v);
+                __m256 ns         = _mm256_fmadd_ps(ps, cd_v, t_pcsd);
+                __m256 neg_pssd   = _mm256_xor_ps(_mm256_mul_ps(ps, sd_v), sign_mask);
+                __m256 nc         = _mm256_fmadd_ps(pc, cd_v, neg_pssd);
+
+                _mm256_store_ps(ps_buf, ns);
+                _mm256_store_ps(pc_buf, nc);
+
+                // Scalar tail for h=8.
+                const float ps8 = phase_sin[8], pc8 = phase_cos[8];
+                const float ns8 = ps8 * cd8 + pc8 * sd8;
+                const float nc8 = pc8 * cd8 - ps8 * sd8;
+                phase_sin[8] = ns8;
+                phase_cos[8] = nc8;
+
+                // Sequential accumulation matches the scalar reduction order.
+                float merged = mb;
+                merged += mw_scaled[0] * ps_buf[0];
+                merged += mw_scaled[1] * ps_buf[1];
+                merged += mw_scaled[2] * ps_buf[2];
+                merged += mw_scaled[3] * ps_buf[3];
+                merged += mw_scaled[4] * ps_buf[4];
+                merged += mw_scaled[5] * ps_buf[5];
+                merged += mw_scaled[6] * ps_buf[6];
+                merged += mw_scaled[7] * ps_buf[7];
+                merged += mw8 * ns8;
+                source[static_cast<size_t>(seg_start + j)] = std::tanh(merged);
+            }
+            // Copy back lanes 0..7 only; phase_sin[8] / phase_cos[8] are kept
+            // up to date in place by the scalar tail above.
+            for (int h = 0; h < 8; ++h) { phase_sin[h] = ps_buf[h]; phase_cos[h] = pc_buf[h]; }
+#else
             for (int64_t j = 0; j < seg_len; ++j) {
                 float merged = mb;
                 for (int h = 0; h < harmonic; ++h) {
@@ -184,10 +325,11 @@ static bool fill_harmonic_stft(
                     const float next_cos = cos_val * cos_delta[h] - sin_val * sin_delta[h];
                     phase_sin[h] = next_sin;
                     phase_cos[h] = next_cos;
-                    merged += mw[h] * sine_amp * next_sin;
+                    merged += mw_scaled[h] * next_sin;
                 }
                 source[static_cast<size_t>(seg_start + j)] = std::tanh(merged);
             }
+#endif
             // 7.2 — Phase normalisation every K segments instead of every segment.
             // Full normalisation (sqrt) after every upsample-step is expensive.
             // Every 16 segments (~4800 samples at 300 upsamp.) keeps float drift

@@ -31,6 +31,11 @@ OggOpusEncoder::OggOpusEncoder(int sample_rate, int channels) {
     // Small enough for responsive streaming, large enough for ffplay to
     // buffer without skipping between pages.
     ope_encoder_ctl(_enc, OPE_SET_MUXING_DELAY(200));
+
+    // A typical Opus page is well under 4 KB; reserving 16 KB covers the first
+    // few pages emitted in a streaming session and avoids tiny incremental
+    // allocations from std::vector::insert.
+    _page_buffer.reserve(16 * 1024);
 }
 
 OggOpusEncoder::~OggOpusEncoder() {

@@ -183,6 +183,12 @@ struct Model {
     // Pre-populate the tensor cache with frequently used tensors.
     void preload_tensor_cache();
 
+    // Pre-reserve scratch buffers used by the inference pipeline so that the
+    // first chunk does not pay an allocate-from-zero cost.  Sizes are tuned
+    // for typical chunks (~target_max_tokens=180); larger chunks still grow
+    // these vectors lazily via resize().
+    void prereserve_scratch_buffers();
+
     // Get tensor with caching (faster than tensor() for repeated accesses).
     ggml_tensor * cached_tensor(const std::string & logical_name) const;
 

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <future>
 #include <memory>
 #include <string>
 #include <thread>
@@ -109,9 +110,9 @@ std::vector<float> infer_chunk(
         return {};
     }
 
-    // Copy to vector for postprocessing
-    std::vector<float> raw_audio(raw.n_samples);
-    std::copy(raw.samples, raw.samples + raw.n_samples, raw_audio.begin());
+    // Move samples into a vector for postprocessing in a single uninitialised
+    // memcpy (constructor form skips the zero-init pass of resize/std::copy).
+    std::vector<float> raw_audio(raw.samples, raw.samples + raw.n_samples);
     kokopop_audio_free(&raw);
 
     std::fprintf(stderr, "[kokopop] chunk[%d] synthesized: %zu samples (%.1fms)\n",
@@ -193,32 +194,114 @@ StreamHandle stream_synthesize(
                 return;
             }
 
-            // Phase 2: infer each chunk
+            // Phase 2: pipelined inference.
+            //
+            // Two-stage pipeline: a single async worker produces the next
+            // chunk's raw audio while this thread post-processes / crossfades
+            // / runs the user callback for the current chunk. The worker uses
+            // the model (not thread-safe), this thread does not — so only one
+            // thread touches the model at a time.
+            //
+            // Queue depth = 1 lookahead, which bounds peak memory and keeps
+            // stop-on-cancel responsive: at most one chunk of inference is
+            // running ahead when the callback returns false.
+            const int n_chunks    = static_cast<int>(plan.chunks.size());
+            const int sample_rate = model->sample_rate;
+
+            struct RawResult {
+                std::vector<float> samples;
+                std::string        error;
+            };
+
+            auto synthesize_one = [&](int idx) -> RawResult {
+                RawResult r;
+                if (state_shared->stopped.load()) {
+                    r.error = "stopped";
+                    return r;
+                }
+                kokopop_audio raw{};
+                if (!synthesize_phonemes(*model,
+                                          plan.chunks[static_cast<size_t>(idx)].phonemes,
+                                          plan.voice, plan.speed, raw, r.error)) {
+                    return r;
+                }
+                if (raw.n_samples > 0 && raw.samples != nullptr) {
+                    r.samples.assign(raw.samples, raw.samples + raw.n_samples);
+                }
+                kokopop_audio_free(&raw);
+                return r;
+            };
+
             std::vector<float> prev_tail;
+            std::future<RawResult> next_future;
+            if (n_chunks > 0) {
+                next_future = std::async(std::launch::async, synthesize_one, 0);
+            }
 
-            for (int i = 0; i < static_cast<int>(plan.chunks.size()); ++i) {
-                if (state_shared->stopped.load()) break;
+            for (int i = 0; i < n_chunks; ++i) {
+                if (state_shared->stopped.load()) {
+                    // Drain the in-flight future so its worker thread exits
+                    // cleanly before we leave the scope.
+                    if (next_future.valid()) (void)next_future.get();
+                    break;
+                }
 
-                std::vector<float> out_tail;
-                auto processed = infer_chunk(
-                    *model, plan, i, prev_tail, out_tail, error);
+                RawResult cur = next_future.get();
 
-                if (processed.empty()) {
+                // Kick off inference for chunk i+1 in parallel with this
+                // chunk's post-processing and callback.
+                if (i + 1 < n_chunks && !state_shared->stopped.load()) {
+                    next_future = std::async(std::launch::async, synthesize_one, i + 1);
+                }
+
+                if (!cur.error.empty() || cur.samples.empty()) {
                     std::fprintf(stderr, "[kokopop] WARNING chunk[%d]: %s — skipping\n",
-                                i, error.c_str());
+                                i, cur.error.empty() ? "no audio" : cur.error.c_str());
                     continue;
                 }
 
-                prev_tail = std::move(out_tail);
+                std::fprintf(stderr, "[kokopop] chunk[%d] synthesized: %zu samples (%.1fms)\n",
+                            i + 1, cur.samples.size(),
+                            (double)cur.samples.size() / sample_rate * 1000.0);
 
-                // Call callback
-                bool continue_streaming = (*cb_shared)(
+                auto processed = postprocess_chunk_audio(
+                    cur.samples, plan.chunks[static_cast<size_t>(i)], i,
+                    n_chunks, plan.config, sample_rate);
+
+                if (!prev_tail.empty() && !processed.empty()) {
+                    processed = apply_crossfade_smart(
+                        prev_tail, processed,
+                        plan.chunks[static_cast<size_t>(i)].boundary_after,
+                        plan.config.crossfade_ms, sample_rate);
+                }
+
+                // Save tail for next chunk's crossfade.
+                const int crossfade_samples =
+                    (plan.config.crossfade_ms * sample_rate) / 1000;
+                if (!processed.empty() && crossfade_samples > 0) {
+                    const size_t tail_start =
+                        processed.size() > static_cast<size_t>(crossfade_samples)
+                            ? processed.size() - static_cast<size_t>(crossfade_samples)
+                            : 0;
+                    prev_tail.assign(processed.begin() + static_cast<ptrdiff_t>(tail_start),
+                                     processed.end());
+                } else {
+                    prev_tail.clear();
+                }
+
+                const bool continue_streaming = (*cb_shared)(
                     processed.data(), processed.size(), i, user_data);
                 if (!continue_streaming) {
                     state_shared->stopped.store(true);
-                    break;
+                    // Let the in-flight worker finish; it will see the flag
+                    // and return quickly (synthesize_phonemes is not
+                    // interruptible mid-graph but the next iteration will
+                    // exit before doing any more work).
                 }
             }
+
+            // Ensure any lingering worker is reaped before declaring done.
+            if (next_future.valid()) (void)next_future.get();
 
             state_shared->done.store(true);
         });

@@ -160,10 +160,13 @@ bool synthesize_phonemes(
             }
 
             synthesized = true;
-            last_audio = audio;
             if (!is_pathological_audio(audio)) {
                 break;
             }
+            // Audio is pathological — keep it as a fallback before retrying.
+            // Moving out of `audio` is safe: the next iteration calls
+            // audio.clear() then run_real_synthesis overwrites it.
+            last_audio = std::move(audio);
         }
 
         if (!synthesized) {

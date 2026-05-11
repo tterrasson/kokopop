@@ -349,3 +349,75 @@ TEST_CASE("postprocess_chunk_audio_empty_audio") {
     auto result = postprocess_chunk_audio(audio, chunk, 0, 1, cfg, 24000);
     CHECK(result.empty());
 }
+
+// ---- Regression coverage for the single-allocation fused postprocess path ----
+
+TEST_CASE("postprocess_chunk_audio_all_silence_trimmed_with_pause_yields_pause_zeros") {
+    // The fused path computes (start, end) offsets in-place and then allocates
+    // body+pause in one shot. When the audio is fully silent (start == end),
+    // body=0 and only the pause-zero tail must remain. Earlier copy-based
+    // path produced the same result via a chain of empty vectors; this test
+    // pins down the contract.
+    std::vector<float> audio(2400, 0.0f);  // 100 ms of silence at 24 kHz
+    Chunk chunk;
+    chunk.is_first      = false;          // leading trim allowed
+    chunk.is_last       = false;          // pause appended
+    chunk.boundary_after = Boundary::ClauseWeak;
+
+    ChunkConfig cfg;
+    cfg.trim_silence       = true;
+    cfg.max_silence_trim_ms = 500;        // window wider than audio
+    cfg.comma_pause_ms     = 50;
+
+    auto result = postprocess_chunk_audio(audio, chunk, 1, 3, cfg, 24000);
+    const size_t pause_n = static_cast<size_t>((50 * 24000) / 1000);
+    CHECK_EQ(result.size(), pause_n);
+    for (float v : result) CHECK_EQ(v, 0.0f);
+}
+
+TEST_CASE("postprocess_chunk_audio_no_op_when_trim_off_and_no_pause") {
+    // Disabled trim, no boundary pause → output must equal input bit-exact.
+    // Guards against the fused path inadvertently copying through a path
+    // that re-quantizes or zero-fills.
+    std::vector<float> audio = {0.123456f, -0.7f, 0.0f, 1e-9f, -1e-9f, 0.999f};
+    Chunk chunk;
+    chunk.is_first       = true;
+    chunk.is_last        = true;
+    chunk.boundary_after = Boundary::None;
+
+    ChunkConfig cfg;
+    cfg.trim_silence = false;
+
+    auto result = postprocess_chunk_audio(audio, chunk, 0, 1, cfg, 24000);
+    REQUIRE_EQ(result.size(), audio.size());
+    for (size_t i = 0; i < audio.size(); ++i) {
+        // Bit-exact: postprocess must not mutate the signal in the no-op path.
+        CHECK_EQ(result[i], audio[i]);
+    }
+}
+
+TEST_CASE("postprocess_chunk_audio_matches_chained_trim_calls_for_middle_chunk") {
+    // The fused postprocess and the public trim_*_silence helpers must agree
+    // sample-by-sample when no boundary pause is appended. This pins the
+    // refactored fused path against the still-public trim helpers, so any
+    // future drift between them gets caught immediately.
+    std::vector<float> audio(6000, 0.0f);
+    for (int i = 1000; i < 5000; ++i) {
+        audio[static_cast<size_t>(i)] = 0.3f * std::sin(0.01f * i);
+    }
+
+    Chunk chunk;
+    chunk.is_first       = false;
+    chunk.is_last        = true;   // no pause appended
+    chunk.boundary_after = Boundary::None;
+
+    ChunkConfig cfg;
+    cfg.trim_silence        = true;
+    cfg.max_silence_trim_ms = 200;
+
+    auto fused = postprocess_chunk_audio(audio, chunk, 1, 3, cfg, 24000);
+    auto chained = trim_leading_silence(audio, cfg.max_silence_trim_ms, 24000);
+    chained = trim_trailing_silence(chained, cfg.max_silence_trim_ms, 24000);
+    REQUIRE_EQ(fused.size(), chained.size());
+    for (size_t i = 0; i < fused.size(); ++i) CHECK_EQ(fused[i], chained[i]);
+}

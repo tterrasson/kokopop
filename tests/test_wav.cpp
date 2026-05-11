@@ -1,6 +1,9 @@
 #include "test_helpers.h"
 #include "core/wav.h"
 
+#include <limits>
+#include <random>
+
 // ---- Écriture WAV ----
 // WAV layout (little-endian):
 //   0-3:   "RIFF"
@@ -274,4 +277,136 @@ TEST_CASE("write_wav_file_null_samples_with_count") {
     std::string error;
     CHECK(!kokopop::write_wav_file("kokopop_test_null.wav", audio, error));
     CHECK(!error.empty());
+}
+
+// ---- Regression coverage for the SIMD float→int16 conversion path ----
+//
+// The SIMD path in pcm_f32_to_s16_le processes 8 lanes per iteration (NEON
+// pair of 4-wide, or one AVX2 vector); inputs shorter than 8 use the scalar
+// tail. These tests cover the SIMD loop body, the tail handler, and the
+// boundary cases (clamping, NaN/Inf in-the-middle-of-a-vector) that would
+// have been masked if only short inputs were tested.
+
+TEST_CASE("wav_bytes_simd_bulk_mixed_extreme_and_normal") {
+    // 25 samples: not a SIMD multiple, exercises both vector body and tail.
+    // Spread NaN / Inf / overflow / underflow across vector and tail regions
+    // to catch a path that only handled extreme values in the scalar fallback.
+    constexpr size_t N = 25;
+    kokopop_audio audio{};
+    audio.samples = new float[N];
+    audio.n_samples = N;
+    audio.sample_rate = 24000;
+    const float nan_v  = std::nanf("");
+    const float pinf_v =  std::numeric_limits<float>::infinity();
+    const float ninf_v = -std::numeric_limits<float>::infinity();
+    // Sample plan (indices):
+    //  0..3:  normal floats
+    //  4:     +1.0  → +32767
+    //  5:     -1.0  → -32767
+    //  6:     +2.0  (clamp)  → +32767
+    //  7:     -3.5  (clamp)  → -32767
+    //  8..11: more normal floats
+    //  12:    NaN   → 0
+    //  13:    +inf  → 0
+    //  14:    -inf  → 0
+    //  15..23: zeros & small finite values (still inside SIMD body for N≥24)
+    //  24:    scalar tail — clamp +2.0 → +32767
+    audio.samples[0] = 0.1f;
+    audio.samples[1] = -0.2f;
+    audio.samples[2] = 0.3f;
+    audio.samples[3] = -0.4f;
+    audio.samples[4] = 1.0f;
+    audio.samples[5] = -1.0f;
+    audio.samples[6] = 2.0f;
+    audio.samples[7] = -3.5f;
+    audio.samples[8] = 0.5f;
+    audio.samples[9] = -0.5f;
+    audio.samples[10] = 0.25f;
+    audio.samples[11] = -0.25f;
+    audio.samples[12] = nan_v;
+    audio.samples[13] = pinf_v;
+    audio.samples[14] = ninf_v;
+    audio.samples[15] = 0.0f;
+    audio.samples[16] = -0.0f;
+    audio.samples[17] = 1e-6f;
+    audio.samples[18] = -1e-6f;
+    audio.samples[19] = 0.999f;
+    audio.samples[20] = -0.999f;
+    audio.samples[21] = 0.5f;
+    audio.samples[22] = -0.5f;
+    audio.samples[23] = 0.123f;
+    audio.samples[24] = 2.0f;  // tail clamp
+
+    auto bytes = kokopop::wav_bytes(audio);
+    REQUIRE(bytes.size() >= 44 + N * 2);
+
+    auto read_i16 = [&](size_t idx) -> int16_t {
+        const size_t off = 44 + idx * 2;
+        return static_cast<int16_t>(
+            static_cast<uint16_t>(bytes[off]) |
+            (static_cast<uint16_t>(bytes[off + 1]) << 8));
+    };
+
+    // Sanity reference: scalar lrintf(clamp(x, ±1)*32767).
+    auto ref = [](float x) -> int16_t {
+        if (!std::isfinite(x)) x = 0.0f;
+        if (x >  1.0f) x =  1.0f;
+        if (x < -1.0f) x = -1.0f;
+        return static_cast<int16_t>(std::lrintf(x * 32767.0f));
+    };
+
+    for (size_t i = 0; i < N; ++i) {
+        CHECK_EQ(read_i16(i), ref(audio.samples[i]));
+    }
+    // Spot-check the critical fixed expectations against the spec.
+    CHECK_EQ(read_i16(4),  32767);
+    CHECK_EQ(read_i16(5), -32767);
+    CHECK_EQ(read_i16(6),  32767);
+    CHECK_EQ(read_i16(7), -32767);
+    CHECK_EQ(read_i16(12), 0);
+    CHECK_EQ(read_i16(13), 0);
+    CHECK_EQ(read_i16(14), 0);
+    CHECK_EQ(read_i16(24), 32767);
+
+    delete[] audio.samples;
+}
+
+TEST_CASE("wav_bytes_simd_long_buffer_matches_scalar") {
+    // Stress the SIMD body with a long pseudorandom buffer. Compare every
+    // produced int16 against the scalar reference — any divergence (wrong
+    // rounding mode, signed-saturation bug, NaN handling) shows up as a
+    // mismatch on at least one sample.
+    constexpr size_t N = 2048 + 7;  // not a multiple of 8 → tail exercised
+    kokopop_audio audio{};
+    audio.samples = new float[N];
+    audio.n_samples = N;
+    audio.sample_rate = 24000;
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> dist(-1.5f, 1.5f); // includes some clamp territory
+    for (size_t i = 0; i < N; ++i) audio.samples[i] = dist(rng);
+    // Inject a few non-finite values mid-buffer to test the masking path.
+    audio.samples[100] = std::nanf("");
+    audio.samples[256] = std::numeric_limits<float>::infinity();
+    audio.samples[1000] = -std::numeric_limits<float>::infinity();
+
+    auto bytes = kokopop::wav_bytes(audio);
+    REQUIRE(bytes.size() >= 44 + N * 2);
+
+    auto ref = [](float x) -> int16_t {
+        if (!std::isfinite(x)) x = 0.0f;
+        if (x >  1.0f) x =  1.0f;
+        if (x < -1.0f) x = -1.0f;
+        return static_cast<int16_t>(std::lrintf(x * 32767.0f));
+    };
+
+    for (size_t i = 0; i < N; ++i) {
+        const size_t off = 44 + i * 2;
+        const int16_t got = static_cast<int16_t>(
+            static_cast<uint16_t>(bytes[off]) |
+            (static_cast<uint16_t>(bytes[off + 1]) << 8));
+        REQUIRE_MESSAGE(got == ref(audio.samples[i]),
+                        "sample mismatch at i=", i);
+    }
+
+    delete[] audio.samples;
 }

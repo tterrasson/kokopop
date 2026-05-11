@@ -109,6 +109,7 @@ endif()
 # Core utilities
 set(_kokopop_core_sources
   src/core/error.cpp
+  src/core/file_mapping.cpp
   src/core/replace.cpp
   src/core/utf8.cpp
   src/core/wav.cpp

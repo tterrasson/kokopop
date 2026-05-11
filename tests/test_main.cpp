@@ -22,3 +22,5 @@
 #include "test_zh_g2p.cpp"
 #include "test_unicode_inputs.cpp"
 #include "test_chunker.cpp"
+#include "test_file_mapping.cpp"
+#include "test_streaming_pipeline.cpp"

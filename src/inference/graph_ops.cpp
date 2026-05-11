@@ -283,6 +283,53 @@ ggml_tensor * conv1d(
     return out;
 }
 
+// Same as conv1d() but returns the result in channel-first layout
+// [OC, L', N] instead of [L', OC, N]. This lets downstream callers that need
+// the channel-first layout (e.g. for ggml_norm over channels) skip the
+// transpose+cont normally required after conv1d().
+//
+// Only the quantized (Path B) path saves a cont — for F16/3D weights the
+// underlying ggml_conv_1d still produces [L', OC], so we have to materialize
+// the transpose ourselves. The function therefore returns the same result as
+// `ggml_cont(ggml_transpose(conv1d(...)))` in all cases, but is cheaper when
+// the kernel is 2D quantized.
+ggml_tensor * conv1d_chfirst(
+    ggml_context * ctx, ggml_tensor * weight, ggml_tensor * input,
+    int stride, int padding, int dilation, int kernel_size) {
+    GGML_ASSERT(kernel_size > 0);
+    const bool kernel_is_3d = (weight->ne[2] > 1) ||
+                              (weight->ne[0] == kernel_size);
+
+    if (kernel_is_3d || weight->type == GGML_TYPE_F16) {
+        // No shortcut available: fall back to standard conv1d + materialize.
+        ggml_tensor * out = conv1d(ctx, weight, input, stride, padding, dilation, kernel_size);
+        return ggml_cont(ctx, ggml_transpose(ctx, out));
+    }
+
+    const int64_t ick = weight->ne[0];
+    const int64_t oc  = weight->ne[1];
+    GGML_ASSERT(ick % kernel_size == 0);
+    const int64_t ic = ick / kernel_size;
+
+    ggml_tensor * shape_proxy = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_F16, kernel_size, ic, oc);
+    ggml_tensor * im2col = ggml_im2col(
+        ctx, shape_proxy, input,
+        stride, 0, padding, 0, dilation, 0,
+        /*is_2D=*/false, GGML_TYPE_F32);
+
+    const int64_t ol = im2col->ne[1];
+    const int64_t n  = im2col->ne[2];
+    GGML_ASSERT(ol > 0);
+
+    ggml_tensor * im2col_2d = ggml_reshape_2d(ctx, im2col, ick, ol * n);
+
+    ggml_tensor * out = ggml_mul_mat(ctx, weight, im2col_2d);
+    // Skip the final permute+cont: out is already [oc, ol*n] which reshapes
+    // directly to the channel-first [oc, ol, n] layout we want.
+    return ggml_reshape_3d(ctx, out, oc, ol, n);
+}
+
 ggml_tensor * conv_transpose1d_crop(
     ggml_context * ctx,
     ggml_tensor * weight,
@@ -844,14 +891,12 @@ ggml_tensor * text_encoder(
         return nullptr;
     }
     ggml_tensor * cur = ggml_get_rows(ctx, emb, token_ids);
-    // Layout per CNN block: [ch, time] → T+cont → [time, ch] → conv1d → [time', ch'] → T+cont → [ch', time']
-    // The outer transpose+cont is required because ggml_norm normalizes over axis 0
-    // (per-token layer norm needs [channel, time]), while conv1d expects [time, channel].
-    // On GPU each ggml_cont() materializes a copy → 6 extra copies per forward pass.
-    // TODO: pick a stable layout ([ch, time] or [time, ch]) and either:
-    //   - transpose the norm weights instead of cur, or
-    //   - pre-transpose the conv weights at model load time,
-    //   - or write a fused conv1d+layer_norm kernel that avoids layout switches.
+    // Layout per CNN block: [ch, time] → T+cont → [time, ch] → conv1d_chfirst → [ch', time'] (no extra cont)
+    // The inner transpose+cont remains because ggml_im2col expects the spatial
+    // (time) axis to be ne[0]. The outer transpose+cont normally required to
+    // prepare ggml_norm (which normalizes over ne[0] = channels) is folded
+    // into conv1d_chfirst, which returns the channel-first layout directly
+    // from the underlying mul_mat output.
     for (int i = 0; i < 3; ++i) {
         const std::string prefix = "kokopop.text_encoder.cnn." + std::to_string(i);
         ggml_tensor * conv_w = require_tensor(model, (prefix + ".0.weight").c_str(), error);
@@ -861,8 +906,9 @@ ggml_tensor * text_encoder(
         if (!error.empty()) {
             return nullptr;
         }
-        cur = ggml_cont(ctx, ggml_transpose(ctx,
-            add_channel_bias(ctx, conv1d(ctx, conv_w, ggml_cont(ctx, ggml_transpose(ctx, cur)), 1, 2, 1, 5), conv_b)));
+        ggml_tensor * input_tw = ggml_cont(ctx, ggml_transpose(ctx, cur));
+        cur = add_channel_bias(ctx,
+            conv1d_chfirst(ctx, conv_w, input_tw, 1, 2, 1, 5), conv_b);
         cur = ggml_add(ctx, ggml_mul(ctx, ggml_norm(ctx, cur, 1e-5f), norm_w), norm_b);
         cur = ggml_leaky_relu(ctx, cur, 0.2f, false);
     }

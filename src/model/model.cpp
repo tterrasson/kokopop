@@ -1,6 +1,7 @@
 #include "model/model.h"
 
 #include "core/constants.h"
+#include "core/file_mapping.h"
 #include "core/utf8.h"
 
 #include <algorithm>
@@ -72,15 +73,48 @@ bool load_tensor_data_to_backend(
     ggml_context * weights,
     Backend & backend,
     std::string & error) {
+    const int64_t n_tensors    = gguf_get_n_tensors(meta);
+    const size_t  data_origin  = gguf_get_data_offset(meta);
+
+    // Fast path: memory-map the GGUF file and hand pointers directly to the
+    // backend. Single syscall instead of 1 fopen + N fseeks + N freads;
+    // unified memory targets can skip the kernel→userspace copy entirely.
+    FileMapping mapping(path);
+    if (mapping.ok()) {
+        const uint8_t * base       = mapping.data();
+        const size_t    total_size = mapping.size();
+        for (int64_t i = 0; i < n_tensors; ++i) {
+            const char * name = gguf_get_tensor_name(meta, i);
+            ggml_tensor * tensor = ggml_get_tensor(weights, name);
+            if (tensor == nullptr) {
+                error = std::string("GGUF tensor missing from weight context: ") + (name ? name : "");
+                return false;
+            }
+            const size_t offset = data_origin + gguf_get_tensor_offset(meta, i);
+            const size_t nbytes = ggml_nbytes(tensor);
+            if (offset + nbytes > total_size) {
+                error = std::string("GGUF tensor extends past EOF: ") + (name ? name : "");
+                return false;
+            }
+            backend.tensor_set(tensor, base + offset, 0, nbytes);
+        }
+        // Subsequent file access (if any) will be random, not sequential —
+        // switch the kernel hint so it stops pre-fetching.
+        mapping.advise_random();
+        return true;
+    }
+
+    // Fallback: classic fopen/fseek/fread. Used when mmap fails (exotic
+    // filesystems, files larger than the address space, etc.).
     std::FILE * file = std::fopen(path.c_str(), "rb");
     if (file == nullptr) {
-        error = "failed to reopen GGUF model for tensor data: " + path;
+        error = "failed to reopen GGUF model for tensor data: " + path
+              + " (mmap also failed: " + mapping.error() + ")";
         return false;
     }
 
     constexpr size_t buf_size = KOKOPOP_IO_BUF_SIZE;
     std::vector<uint8_t> buffer(buf_size);
-    const int64_t n_tensors = gguf_get_n_tensors(meta);
     for (int64_t i = 0; i < n_tensors; ++i) {
         const char * name = gguf_get_tensor_name(meta, i);
         ggml_tensor * tensor = ggml_get_tensor(weights, name);
@@ -90,7 +124,7 @@ bool load_tensor_data_to_backend(
             return false;
         }
 
-        const size_t offset = gguf_get_data_offset(meta) + gguf_get_tensor_offset(meta, i);
+        const size_t offset = data_origin + gguf_get_tensor_offset(meta, i);
         if (std::fseek(file, static_cast<long>(offset), SEEK_SET) != 0) {
             std::fclose(file);
             error = std::string("failed to seek GGUF tensor data: ") + (name ? name : "");
@@ -350,36 +384,105 @@ void Model::preload_tensor_cache() {
         }
     }
 
-    // Dequantize all LSTM w_hh tensors (Q5_K → F32) for the fused LSTM kernel.
-    // Iterates the full tensor map once; only matches "weight_hh_l0" entries.
-    // On Metal, also uploads each matrix into a persistent MTLBuffer via the backend.
-    // Also produces a rowwise transposition for SIMD-friendly dot-product access.
+    // Dequantize all LSTM w_hh tensors (Q5_K → F32) for the fused LSTM kernel
+    // and produce a rowwise transposition for SIMD-friendly dot-product access.
+    //
+    // Phase 1 (parallel): each worker thread reads its assigned tensor from the
+    //   immutable weight buffer (tensor_get is a memcpy of read-only data),
+    //   dequantizes to F32, and computes the rowwise transpose. Threads write
+    //   to disjoint slots in the `results` array — no synchronization needed.
+    //
+    // Phase 2 (sequential): backend->preload_lstm_whh uploads to GPU on the
+    //   Metal backend, which is not necessarily safe to call concurrently; map
+    //   inserts (unordered_map) are also not concurrency-safe. Both run serially.
     lstm_w_hh_f32.clear();
     lstm_w_hh_rowwise.clear();
+
+    struct LstmWhhTask {
+        std::string         name;
+        ggml_tensor       * tensor = nullptr;
+        std::vector<float>  f32;
+        std::vector<float>  rowwise;
+        int                 H      = 0;
+        int                 four_H = 0;
+        bool                ok     = false;
+    };
+
+    std::vector<LstmWhhTask> tasks;
+    tasks.reserve(16);
     for (const auto & kv : tensors) {
-        const std::string & name = kv.first;
-        if (name.find("weight_hh_l0") == std::string::npos) continue;
-        ggml_tensor * t = kv.second;
-        if (t == nullptr) continue;
-        std::vector<float> f32;
-        if (tensor_to_f32(*backend, t, f32)) {
-            const int H      = static_cast<int>(t->ne[0]);
-            const int four_H = static_cast<int>(t->ne[1]);
-
-            // Original layout (column-major): f32[k + H*j], k∈[0,H), j∈[0,4*H)
-            // Transposed layout (row-major):  rowwise[j*H + k], contiguous over k
-            std::vector<float> rowwise(H * four_H);
-            for (int j = 0; j < four_H; ++j) {
-                for (int k = 0; k < H; ++k) {
-                    rowwise[j * H + k] = f32[k + H * j];
-                }
-            }
-
-            backend->preload_lstm_whh(name, f32.data(), H, four_H);
-            lstm_w_hh_f32.emplace(name, std::move(f32));
-            lstm_w_hh_rowwise.emplace(name, std::move(rowwise));
-        }
+        if (kv.first.find("weight_hh_l0") == std::string::npos) continue;
+        if (kv.second == nullptr) continue;
+        tasks.push_back({kv.first, kv.second, {}, {}, 0, 0, false});
     }
+
+    auto run_one = [&](LstmWhhTask & task) {
+        if (!tensor_to_f32(*backend, task.tensor, task.f32)) return;
+        task.H      = static_cast<int>(task.tensor->ne[0]);
+        task.four_H = static_cast<int>(task.tensor->ne[1]);
+        // Original layout (col-major): f32[k + H*j], k∈[0,H), j∈[0,4*H)
+        // Transposed   (row-major):    rowwise[j*H + k], contiguous over k
+        task.rowwise.resize(static_cast<size_t>(task.H) * static_cast<size_t>(task.four_H));
+        for (int j = 0; j < task.four_H; ++j) {
+            const float * src = task.f32.data() + static_cast<size_t>(task.H) * j;
+            float       * dst = task.rowwise.data() + static_cast<size_t>(task.H) * j;
+            std::memcpy(dst, src, static_cast<size_t>(task.H) * sizeof(float));
+        }
+        task.ok = true;
+    };
+
+    const unsigned hw = std::thread::hardware_concurrency();
+    const unsigned n_threads = std::min<unsigned>(
+        std::max(1u, hw), std::min<unsigned>(4u, static_cast<unsigned>(tasks.size())));
+
+    if (tasks.size() <= 1 || n_threads <= 1) {
+        for (auto & t : tasks) run_one(t);
+    } else {
+        std::vector<std::thread> threads;
+        threads.reserve(n_threads);
+        for (unsigned tid = 0; tid < n_threads; ++tid) {
+            threads.emplace_back([&, tid] {
+                for (size_t i = tid; i < tasks.size(); i += n_threads) {
+                    run_one(tasks[i]);
+                }
+            });
+        }
+        for (auto & th : threads) th.join();
+    }
+
+    for (auto & t : tasks) {
+        if (!t.ok) continue;
+        backend->preload_lstm_whh(t.name, t.f32.data(), t.H, t.four_H);
+        lstm_w_hh_f32.emplace(t.name, std::move(t.f32));
+        lstm_w_hh_rowwise.emplace(t.name, std::move(t.rowwise));
+    }
+}
+
+void Model::prereserve_scratch_buffers() {
+    // Decoder style tensor has a fixed size of 128 floats per inference — set
+    // it directly so the resize(128) call inside generation is a no-op.
+    tmp_decoder_style_f32.assign(128, 0.0f);
+
+    // Sizing rationale: typical chunks are bounded by target_max_tokens (~180)
+    // and a moderate frame-per-token ratio. Reserving (not resizing) here only
+    // pre-allocates capacity — vectors stay logically empty so semantics are
+    // unchanged. Larger chunks still trigger growth via resize() as before.
+    constexpr size_t typ_tokens     = 256;        // covers target_max_tokens with margin
+    constexpr size_t typ_frames     = 12000;      // ~60 frames/token × 200 tokens
+    constexpr size_t typ_mask       = 1u << 20;   // 1 M floats ≈ 4 MB cap for the mask
+    constexpr size_t typ_audio_f32  = typ_frames * 32;  // post/decoder/audio: small multi-MB
+    constexpr size_t typ_stft       = 22 * typ_frames;
+
+    tmp_ids_i32.reserve(typ_tokens);
+    tmp_pos_i32.reserve(typ_tokens);
+    tmp_mask_f32.reserve(typ_mask);
+    tmp_post_f32.reserve(typ_audio_f32);
+    tmp_decoder_cpu_f32.reserve(typ_audio_f32);
+    tmp_audio_f32.reserve(typ_audio_f32);
+    tmp_stft_source_f32.reserve(typ_frames * 16);
+    tmp_stft_har_f32.reserve(typ_stft);
+    tmp_istft_y_f32.reserve(typ_audio_f32);
+    tmp_istft_denom_f32.reserve(typ_audio_f32);
 }
 
 ggml_tensor * Model::cached_tensor(const std::string & logical_name) const {
@@ -550,6 +653,10 @@ bool load_model_from_gguf(
 
     // Pre-populate tensor cache for faster inference
     m->preload_tensor_cache();
+
+    // Pre-reserve inference scratch buffers so the first chunk does not pay
+    // an allocate-from-zero cost.
+    m->prereserve_scratch_buffers();
 
     model = std::move(m);
     return true;

@@ -47,40 +47,49 @@ static bool any_above_threshold(const float * data, size_t count) {
     return false;
 }
 
-static size_t find_leading_edge(const std::vector<float> & audio, size_t max_samples) {
-    const size_t check  = std::min(audio.size(), max_samples);
+// Pointer-based variants — operate on a raw range so callers can scan a view of
+// a larger buffer without materialising it first.
+static size_t scan_leading_edge(const float * data, size_t count, size_t max_samples) {
+    const size_t check  = std::min(count, max_samples);
     if (check == 0) return 0;
     const size_t window = static_cast<size_t>(50 * KOKOPOP_SAMPLE_RATE / 1000);
     const size_t step   = std::max(size_t(1), window / 4);
     for (size_t i = 0; i < check; i += step) {
-        if (any_above_threshold(audio.data() + i, std::min(window, check - i))) return i;
+        if (any_above_threshold(data + i, std::min(window, check - i))) return i;
     }
     return check;
 }
 
 // Returns the position past the last non-silent sample, considering only the
-// trailing `max_samples` of audio. If the entire trailing region is silent,
-// returns audio.size() - max_samples (or 0 if the audio is shorter).
-// If the audio's last sample is non-silent, returns audio.size() (no trim).
-static size_t find_trailing_edge(const std::vector<float> & audio, size_t max_samples) {
-    const size_t audio_size = audio.size();
-    if (audio_size == 0 || max_samples == 0) return audio_size;
-    const size_t scan_floor = audio_size > max_samples ? audio_size - max_samples : 0;
+// trailing `max_samples` of the range. If the entire trailing region is silent,
+// returns count - max_samples (or 0 if count is shorter). If the last sample is
+// non-silent, returns count (no trim).
+static size_t scan_trailing_edge(const float * data, size_t count, size_t max_samples) {
+    if (count == 0 || max_samples == 0) return count;
+    const size_t scan_floor = count > max_samples ? count - max_samples : 0;
 
     // Walk backwards in blocks; SIMD-skip blocks that are entirely silent,
     // then locate the exact non-silent sample within the first hit.
     constexpr size_t BLOCK = 256;
-    size_t end = audio_size;
+    size_t end = count;
     while (end > scan_floor) {
         const size_t block_start = (end > scan_floor + BLOCK) ? end - BLOCK : scan_floor;
-        if (any_above_threshold(audio.data() + block_start, end - block_start)) {
+        if (any_above_threshold(data + block_start, end - block_start)) {
             for (size_t i = end; i > block_start; --i) {
-                if (std::fabs(audio[i - 1]) > SILENCE_THRESHOLD) return i;
+                if (std::fabs(data[i - 1]) > SILENCE_THRESHOLD) return i;
             }
         }
         end = block_start;
     }
     return scan_floor;
+}
+
+static size_t find_leading_edge(const std::vector<float> & audio, size_t max_samples) {
+    return scan_leading_edge(audio.data(), audio.size(), max_samples);
+}
+
+static size_t find_trailing_edge(const std::vector<float> & audio, size_t max_samples) {
+    return scan_trailing_edge(audio.data(), audio.size(), max_samples);
 }
 
 } // namespace
@@ -254,30 +263,44 @@ std::vector<float> postprocess_chunk_audio(
     int /*total_chunks*/,
     const ChunkConfig & config,
     int sample_rate) {
-    std::vector<float> result = audio;
-    if (result.empty()) return result;
+    if (audio.empty()) return {};
 
-    // Trim leading silence (skip on first chunk to preserve natural intro)
-    if (config.trim_silence && !chunk.is_first) {
-        result = trim_leading_silence(result, config.max_silence_trim_ms, sample_rate);
-    }
+    // Compute trim offsets on the input directly — no intermediate allocations.
+    size_t start = 0;
+    size_t end   = audio.size();
 
-    // Trim trailing silence (less aggressively if there's a boundary pause)
     if (config.trim_silence) {
+        // Leading trim: skipped on the very first chunk to preserve natural intro.
+        if (!chunk.is_first) {
+            const size_t max_lead = static_cast<size_t>(
+                ms_to_samples(config.max_silence_trim_ms, sample_rate));
+            start = scan_leading_edge(audio.data(), audio.size(), max_lead);
+        }
+
+        // Trailing trim is performed on the post-leading-trim view (matches
+        // the legacy sequential behaviour bit-for-bit).
         int trim_ms = config.max_silence_trim_ms;
         if (chunk.boundary_after != Boundary::None) {
             trim_ms = std::max(1, trim_ms / 2);
         }
-        result = trim_trailing_silence(result, trim_ms, sample_rate);
+        const size_t max_trail = static_cast<size_t>(ms_to_samples(trim_ms, sample_rate));
+        const size_t view_size = audio.size() - start;
+        const size_t edge = scan_trailing_edge(audio.data() + start, view_size, max_trail);
+        end = start + edge;
     }
 
-    // Append boundary pause
-    int pause_ms = pause_for_boundary(chunk.boundary_after, config);
-    // Don't add pause after the last chunk
+    // Boundary pause samples (don't append after the last chunk).
+    size_t pause_n = 0;
+    const int pause_ms = pause_for_boundary(chunk.boundary_after, config);
     if (pause_ms > 0 && !chunk.is_last) {
-        append_silence(result, pause_ms, sample_rate);
+        pause_n = static_cast<size_t>(ms_to_samples(pause_ms, sample_rate));
     }
 
+    const size_t body = (end > start) ? (end - start) : 0;
+    std::vector<float> result(body + pause_n);  // pause tail zero-initialised
+    if (body > 0) {
+        std::memcpy(result.data(), audio.data() + start, body * sizeof(float));
+    }
     return result;
 }
 
