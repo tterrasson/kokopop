@@ -86,10 +86,25 @@ public:
         }
     }
 
+    // Pin nodes CUDA cannot execute (custom ops, integer types, etc.) to the
+    // CPU backend so their callbacks run on host pointers. The scheduler
+    // inserts host<->device copies around CPU islands automatically.
+    void pin_cpu_fallbacks(ggml_cgraph * graph) {
+        const int n_nodes = ggml_graph_n_nodes(graph);
+        for (int i = 0; i < n_nodes; ++i) {
+            ggml_tensor * node = ggml_graph_node(graph, i);
+            if (node == nullptr) continue;
+            if (!ggml_backend_supports_op(backend_, node)) {
+                ggml_backend_sched_set_tensor_backend(sched_, node, cpu_backend_);
+            }
+        }
+    }
+
     bool sched_alloc_graph(ggml_cgraph * graph) override {
         if (!ensure_scheduler(graph)) {
             return false;
         }
+        pin_cpu_fallbacks(graph);
         return ggml_backend_sched_alloc_graph(sched_, graph);
     }
 
