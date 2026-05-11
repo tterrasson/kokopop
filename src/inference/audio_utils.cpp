@@ -197,8 +197,6 @@ static bool fill_harmonic_stft(
             const float32x4_t cd1 = vld1q_f32(cos_delta + 4);
             const float32x4_t sd0 = vld1q_f32(sin_delta);
             const float32x4_t sd1 = vld1q_f32(sin_delta + 4);
-            const float32x4_t mw0 = vld1q_f32(mw_scaled);
-            const float32x4_t mw1 = vld1q_f32(mw_scaled + 4);
             const float cd8 = cos_delta[8];
             const float sd8 = sin_delta[8];
             const float mw8 = mw_scaled[8];
