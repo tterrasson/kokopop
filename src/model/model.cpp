@@ -525,7 +525,8 @@ bool load_model_from_gguf(
     const int32_t requested_backend = options ? options->backend : KOKOPOP_BACKEND_AUTO;
     if (requested_backend != KOKOPOP_BACKEND_AUTO &&
         requested_backend != KOKOPOP_BACKEND_CPU &&
-        requested_backend != KOKOPOP_BACKEND_METAL) {
+        requested_backend != KOKOPOP_BACKEND_METAL &&
+        requested_backend != KOKOPOP_BACKEND_CUDA) {
         error = "invalid kokopop backend option";
         return false;
     }
