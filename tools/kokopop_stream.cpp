@@ -33,7 +33,7 @@ void usage(const char * argv0) {
     std::fputs("usage: ", stderr);
     std::fputs(argv0, stderr);
     std::fputs(" --model kokoro.gguf --voice ff_siwis "
-        "[--speed 1.0] [--mode interactive|long_form] [--threads N] [--backend cpu|metal]\n"
+        "[--speed 1.0] [--mode interactive|long_form] [--threads N] [--backend cpu|metal|cuda]\n"
         "       [--out out.wav]\n"
         "\n"
         "stdio mode (default):\n"
@@ -57,7 +57,7 @@ void usage(const char * argv0) {
         "  --mode MODE     interactive (default) or long_form\n"
         "  --out PATH      Save full audio to WAV file (stdio mode)\n"
         "  --threads N     Number of threads (default: min(4, hw_concurrency))\n"
-        "  --backend       Use CPU or Metal backend (default: auto)\n"
+        "  --backend       Use CPU, Metal, or CUDA backend (default: auto)\n"
         "  --http          Run in HTTP server mode (async, event-driven)\n"
         "  --port N        HTTP server port (default: 8080)\n"
         "  --bind ADDR     HTTP server bind address (default: 127.0.0.1)\n"
@@ -242,8 +242,10 @@ int main(int argc, char ** argv) {
                     backend = KOKOPOP_BACKEND_CPU;
                 } else if (std::strcmp(v, "metal") == 0) {
                     backend = KOKOPOP_BACKEND_METAL;
+                } else if (std::strcmp(v, "cuda") == 0) {
+                    backend = KOKOPOP_BACKEND_CUDA;
                 } else {
-                    std::fprintf(stderr, "error: invalid backend '%s' (use 'cpu' or 'metal')\n", v);
+                    std::fprintf(stderr, "error: invalid backend '%s' (use 'cpu', 'metal', or 'cuda')\n", v);
                     return 2;
                 }
             } else if (std::strcmp(argv[i], "--http") == 0) {
