@@ -278,25 +278,6 @@ static void cpu_lstm(
         tensor_is_f32_2d_contiguous(pre_gates, H4, N) &&
         tensor_is_f32_2d_contiguous(output, H, N);
 
-    if (H <= 256) {
-        float h[256] = {};
-        float c[256] = {};
-        float gates[1024];
-
-        if (contiguous) {
-            cpu_lstm_contiguous(
-                p,
-                static_cast<const float *>(pre_gates->data),
-                static_cast<float *>(output->data),
-                h,
-                c,
-                gates);
-        } else {
-            cpu_lstm_strided(p, pre_gates, output, h, c, gates);
-        }
-        return;
-    }
-
     std::vector<float> h(static_cast<size_t>(H), 0.0f);
     std::vector<float> c(static_cast<size_t>(H), 0.0f);
     std::vector<float> gates(static_cast<size_t>(H4));

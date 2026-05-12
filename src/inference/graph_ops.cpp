@@ -354,6 +354,10 @@ static ggml_tensor * conv1d_im2col_mulmat(
     bool channel_first,
     bool force_contiguous_im2col) {
 
+#ifdef __AVX2__
+    force_contiguous_im2col = true;
+#endif
+
     GGML_ASSERT(ctx != nullptr);
     GGML_ASSERT(weight != nullptr);
     GGML_ASSERT(input != nullptr);
