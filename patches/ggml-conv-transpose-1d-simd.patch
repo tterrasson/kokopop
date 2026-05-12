@@ -5,65 +5,69 @@ index 5fa162c..27b4864 100644
 @@ -3829,7 +3829,8 @@ int ggml_metal_op_conv_transpose_1d(ggml_metal_op_t ctx, int idx) {
      ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
      ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
-
+ 
 -    ggml_metal_encoder_dispatch_threadgroups(enc, OL, OC, 1, 1, 1, 1);
 +    // 32 threads per group: each thread handles IC/32 channels, simd_sum reduces.
 +    ggml_metal_encoder_dispatch_threadgroups(enc, OL, OC, 1, 32, 1, 1);
-
+ 
      return 1;
  }
 diff --git a/src/ggml-metal/ggml-metal.metal b/src/ggml-metal/ggml-metal.metal
-index c372eae..66b722e 100644
+index 5c2ec8a..44df169 100644
 --- a/src/ggml-metal/ggml-metal.metal
 +++ b/src/ggml-metal/ggml-metal.metal
-@@ -4848,11 +4848,13 @@ kernel void kernel_conv_transpose_1d(
+@@ -4848,7 +4848,8 @@ kernel void kernel_conv_transpose_1d(
          device const float * src1,
          device        char * dst,
          uint3   tgpig[[threadgroup_position_in_grid]],
 -        uint3   tgpg[[threadgroups_per_grid]]) {
 +        uint3   tgpg[[threadgroups_per_grid]],
 +        ushort  tiitg[[thread_index_in_threadgroup]]) {
-
+ 
+     // For output position j on the time axis, only input positions
+     //   i such that i*s0 <= j < i*s0 + K
+@@ -4870,7 +4871,8 @@ kernel void kernel_conv_transpose_1d(
+ 
      float v = 0.0f;
-
--    for (int64_t c = 0; c < args.IC; c++) {
-+    // 32 threads split the IC loop; simd_sum reduces across the SIMD group.
-+    for (int64_t c = tiitg; c < args.IC; c += 32) {
-         const int32_t kernel_offset = c * tgpg[1] * args.K + args.K * tgpig[1];
-         const int32_t input_offset = c * args.IL;
-
-@@ -4863,9 +4865,12 @@ kernel void kernel_conv_transpose_1d(
+     if (i_min <= i_max) {
+-        for (int64_t c = 0; c < args.IC; c++) {
++        // 32 threads split the IC loop; simd_sum reduces across the SIMD group.
++        for (int64_t c = tiitg; c < args.IC; c += 32) {
+             const int32_t kernel_offset = c * tgpg[1] * K + K * tgpig[1];
+             const int32_t input_offset  = c * IL;
+ 
+@@ -4880,9 +4882,12 @@ kernel void kernel_conv_transpose_1d(
          }
      }
-
+ 
 -    device float * dst_ptr = (device float *) (dst + tgpig[0] * args.nb0 + tgpig[1] * args.nb1);
 +    v = simd_sum(v);
-
+ 
 -    dst_ptr[0] = v;
 +    if (tiitg == 0) {
 +        device float * dst_ptr = (device float *) (dst + tgpig[0] * args.nb0 + tgpig[1] * args.nb1);
 +        dst_ptr[0] = v;
 +    }
  }
-
+ 
  template [[host_name("kernel_conv_transpose_1d_f32_f32")]]
-@@ -4875,7 +4880,8 @@ kernel void kernel_conv_transpose_1d<float>(
+@@ -4892,7 +4897,8 @@ kernel void kernel_conv_transpose_1d<float>(
      device const float * src1,
      device        char * dst,
      uint3   tgpig[[threadgroup_position_in_grid]],
 -    uint3    tgpg[[threadgroups_per_grid]]);
 +    uint3    tgpg[[threadgroups_per_grid]],
 +    ushort  tiitg[[thread_index_in_threadgroup]]);
-
+ 
  template [[host_name("kernel_conv_transpose_1d_f16_f32")]]
  kernel void kernel_conv_transpose_1d<half>(
-@@ -4884,7 +4890,8 @@ kernel void kernel_conv_transpose_1d<half>(
+@@ -4901,7 +4907,8 @@ kernel void kernel_conv_transpose_1d<half>(
      device const float * src1,
      device        char * dst,
      uint3   tgpig[[threadgroup_position_in_grid]],
 -    uint3    tgpg[[threadgroups_per_grid]]);
 +    uint3    tgpg[[threadgroups_per_grid]],
 +    ushort  tiitg[[thread_index_in_threadgroup]]);
-
-
+ 
+ 
  typedef void (conv_transpose_2d_t)(

@@ -26,10 +26,8 @@ include(FetchContent)
 FetchContent_Declare(
   ggml
   GIT_REPOSITORY https://github.com/ggml-org/ggml.git
-  GIT_TAG        ac6f7b44f60fde0091f0b3d99afde48f8c99b13a
+  GIT_TAG        a056a26f508b6160438ddd8aabbc859d2a2e7a97
   GIT_SHALLOW    TRUE
-  # Fix 3: force scalar (non-float4) NORM kernel — the float4 path corrupts
-  #         values for certain token patterns (e.g. comma phrases).
   # Fix 4: dispatch CONV_TRANSPOSE_1D with 32 threads/group and simd_sum
   #         reduction, avoiding GPU watchdog on large generator dims.
   # Apply only when the patch still matches. This keeps re-configure
@@ -37,9 +35,8 @@ FetchContent_Declare(
   # Fix 5 (CUDA): IM2COL crashes with "invalid argument" when OW exceeds 65535
   #         (long vocoder sequences). Clamp grid Y dim and loop the kernel
   #         over OW chunks of MAX_GRIDDIM_Z.
+  # Note: Fix 3 (scalar NORM kernel) is now merged upstream in GGML a056a26.
   PATCH_COMMAND
-    ${CMAKE_COMMAND} -DPATCH_FILE=${CMAKE_SOURCE_DIR}/patches/ggml-metal-norm-scalar.patch -P ${CMAKE_SOURCE_DIR}/tools/apply_patch_if_needed.cmake
-    COMMAND
     ${CMAKE_COMMAND} -DPATCH_FILE=${CMAKE_SOURCE_DIR}/patches/ggml-conv-transpose-1d-simd.patch -P ${CMAKE_SOURCE_DIR}/tools/apply_patch_if_needed.cmake
     COMMAND
     ${CMAKE_COMMAND} -DPATCH_FILE=${CMAKE_SOURCE_DIR}/patches/ggml-cuda-im2col-griddim.patch -P ${CMAKE_SOURCE_DIR}/tools/apply_patch_if_needed.cmake
@@ -336,6 +333,18 @@ if(KOKOPOP_BUILD_TOOLS)
       $<BUILD_INTERFACE:${ggml_SOURCE_DIR}/include>
     )
     target_link_libraries(cuda_mulmat_repro PRIVATE ggml)
+
+    add_executable(cuda_sched_repro tools/cuda_sched_repro.cpp)
+    target_include_directories(cuda_sched_repro PRIVATE
+      $<BUILD_INTERFACE:${ggml_SOURCE_DIR}/include>
+    )
+    target_link_libraries(cuda_sched_repro PRIVATE ggml)
+
+    add_executable(cuda_mulmat_diag tools/cuda_mulmat_diag.cpp)
+    target_include_directories(cuda_mulmat_diag PRIVATE
+      $<BUILD_INTERFACE:${ggml_SOURCE_DIR}/include>
+    )
+    target_link_libraries(cuda_mulmat_diag PRIVATE ggml)
   endif()
 
   # Audio playback tool
