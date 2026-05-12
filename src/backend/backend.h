@@ -137,6 +137,33 @@ inline size_t backend_graph_capacity(ggml_cgraph * graph) {
     return std::max<size_t>(GGML_DEFAULT_GRAPH_SIZE, need + 1024);
 }
 
+inline uint64_t backend_graph_signature(ggml_cgraph * graph) {
+    uint64_t h = 1469598103934665603ull;
+    const int n_nodes = graph != nullptr ? ggml_graph_n_nodes(graph) : 0;
+
+    auto mix = [&h](uint64_t v) {
+        h ^= v;
+        h *= 1099511628211ull;
+    };
+
+    mix(static_cast<uint64_t>(n_nodes));
+    for (int i = 0; i < n_nodes; ++i) {
+        const ggml_tensor * node = ggml_graph_node(graph, i);
+        if (node == nullptr) {
+            mix(0);
+            continue;
+        }
+
+        mix(static_cast<uint64_t>(node->op));
+        mix(static_cast<uint64_t>(node->type));
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            mix(static_cast<uint64_t>(node->ne[d]));
+        }
+    }
+
+    return h;
+}
+
 struct PendingInit {
     ggml_tensor * tensor = nullptr;
     std::vector<uint8_t> bytes;

@@ -141,6 +141,10 @@ bool build_duration_mask(
     return true;
 }
 
+ggml_tensor * ensure_contiguous(ggml_context * ctx, ggml_tensor * tensor) {
+    return ggml_is_contiguous(tensor) ? tensor : ggml_cont(ctx, tensor);
+}
+
 } // anonymous namespace
 
 int duration_to_frames(float value) {
@@ -296,8 +300,8 @@ bool run_kokoro_frontend_probe(
     ggml_tensor * pred_dur = ggml_sum_rows(ctx, ggml_sigmoid(ctx, dur_logits));
 
     // Make host-read outputs explicit and materialized.
-    d = ggml_cont(ctx, d);
-    pred_dur = ggml_cont(ctx, pred_dur);
+    d = ensure_contiguous(ctx, d);
+    pred_dur = ensure_contiguous(ctx, pred_dur);
 
     ggml_set_name(d, "kokopop_duration_hidden_probe");
     ggml_set_name(pred_dur, "kokopop_duration_probe");
@@ -477,7 +481,7 @@ bool run_kokoro_generation_probe(
         }
     }
     f0_curve = ggml_cont(ctx, ggml_transpose(ctx, f0_curve));
-    f0_curve = add_channel_bias(ctx, conv1d(ctx, f0_proj_w, ggml_cont(ctx, ggml_transpose(ctx, f0_curve)), 1, 0, 1, 1), f0_proj_b);
+    f0_curve = add_channel_bias(ctx, conv1d(ctx, f0_proj_w, ggml_cont(ctx, ggml_transpose(ctx, f0_curve)), 1, 0, 1, 1, model.backend_type == KOKOPOP_BACKEND_CUDA), f0_proj_b);
     f0_curve = ggml_cont(ctx, ggml_view_1d(ctx, f0_curve, f0_curve->ne[0], 0));
 
     ggml_tensor * n_curve = ggml_cont(ctx, ggml_transpose(ctx, cur));
@@ -489,7 +493,7 @@ bool run_kokoro_generation_probe(
         }
     }
     n_curve = ggml_cont(ctx, ggml_transpose(ctx, n_curve));
-    n_curve = add_channel_bias(ctx, conv1d(ctx, n_proj_w, ggml_cont(ctx, ggml_transpose(ctx, n_curve)), 1, 0, 1, 1), n_proj_b);
+    n_curve = add_channel_bias(ctx, conv1d(ctx, n_proj_w, ggml_cont(ctx, ggml_transpose(ctx, n_curve)), 1, 0, 1, 1, model.backend_type == KOKOPOP_BACKEND_CUDA), n_proj_b);
     n_curve = ggml_cont(ctx, ggml_view_1d(ctx, n_curve, n_curve->ne[0], 0));
 
     ggml_tensor * asr = text_encoder(ctx, model, token_ids, duration_mask, n_tokens, error);
@@ -517,8 +521,8 @@ bool run_kokoro_generation_probe(
     ggml_tensor * f0_dec_in = ggml_reshape_2d(ctx, f0_curve, f0_curve->ne[0], 1);
     ggml_tensor * n_dec_in  = ggml_reshape_2d(ctx, n_curve,  n_curve->ne[0],  1);
 
-    ggml_tensor * f0_dec = add_channel_bias(ctx, conv1d(ctx, f0_conv_w, f0_dec_in, 2, 1, 1, 3), f0_conv_b);
-    ggml_tensor * n_dec  = add_channel_bias(ctx, conv1d(ctx, n_conv_w,  n_dec_in,  2, 1, 1, 3), n_conv_b);
+    ggml_tensor * f0_dec = add_channel_bias(ctx, conv1d(ctx, f0_conv_w, f0_dec_in, 2, 1, 1, 3, model.backend_type == KOKOPOP_BACKEND_CUDA), f0_conv_b);
+    ggml_tensor * n_dec  = add_channel_bias(ctx, conv1d(ctx, n_conv_w,  n_dec_in,  2, 1, 1, 3, model.backend_type == KOKOPOP_BACKEND_CUDA), n_conv_b);
 
     ggml_tensor * decoder_cur = ggml_concat(
         ctx,
@@ -532,7 +536,7 @@ bool run_kokoro_generation_probe(
         return false;
     }
 
-    ggml_tensor * asr_res = add_channel_bias(ctx, conv1d(ctx, asr_res_w, ggml_cont(ctx, ggml_transpose(ctx, asr)), 1, 0, 1, 1), asr_res_b);
+    ggml_tensor * asr_res = add_channel_bias(ctx, conv1d(ctx, asr_res_w, ggml_cont(ctx, ggml_transpose(ctx, asr)), 1, 0, 1, 1, model.backend_type == KOKOPOP_BACKEND_CUDA), asr_res_b);
 
     for (int i = 0; i < 4; ++i) {
         decoder_cur = ggml_concat(ctx, ggml_concat(ctx, ggml_concat(ctx, decoder_cur, asr_res, 1), f0_dec, 1), n_dec, 1);
@@ -544,10 +548,10 @@ bool run_kokoro_generation_probe(
     }
 
     // Make all host-read outputs explicit and materialized.
-    f0_curve    = ggml_cont(ctx, f0_curve);
-    n_curve     = ggml_cont(ctx, n_curve);
-    asr         = ggml_cont(ctx, asr);
-    decoder_cur = ggml_cont(ctx, decoder_cur);
+    f0_curve    = ensure_contiguous(ctx, f0_curve);
+    n_curve     = ensure_contiguous(ctx, n_curve);
+    asr         = ensure_contiguous(ctx, asr);
+    decoder_cur = ensure_contiguous(ctx, decoder_cur);
 
     ggml_set_name(f0_curve, "kokopop_f0_probe");
     ggml_set_name(n_curve, "kokopop_noise_probe");

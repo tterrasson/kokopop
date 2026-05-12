@@ -675,7 +675,7 @@ bool ggml_generator(
 
         ggml_tensor * x_source = add_channel_bias(
             ctx,
-            conv1d(ctx, noise_conv_w[stage], har_t, sp.noise_stride, sp.noise_padding, 1, sp.noise_kernel),
+            conv1d(ctx, noise_conv_w[stage], har_t, sp.noise_stride, sp.noise_padding, 1, sp.noise_kernel, model.backend_type == KOKOPOP_BACKEND_CUDA),
             noise_conv_b[stage]);
 
         x_source = graph_generator_resblock(ctx, model, x_source, style_t, sp.noise_prefix, sp.kernel, error);
@@ -723,8 +723,10 @@ bool ggml_generator(
         return false;
     }
 
-    ggml_tensor * post = add_channel_bias(ctx, conv1d(ctx, post_w, x, 1, 3, 1, 7), post_b);
-    post = ggml_cont(ctx, post);
+    ggml_tensor * post = add_channel_bias(ctx, conv1d(ctx, post_w, x, 1, 3, 1, 7, model.backend_type == KOKOPOP_BACKEND_CUDA), post_b);
+    if (!ggml_is_contiguous(post)) {
+        post = ggml_cont(ctx, post);
+    }
     ggml_set_name(post, "kokopop_generator_post");
     ggml_set_output(post);
 

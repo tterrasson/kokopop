@@ -20,6 +20,8 @@ class CudaBackend final : public Backend {
     ggml_backend_t backend_ = nullptr;
     ggml_backend_t cpu_backend_ = nullptr;
     ggml_backend_sched_t sched_ = nullptr;
+    size_t sched_capacity_ = 0;
+    uint64_t sched_signature_ = 0;
     int device_id_ = 0;
     std::vector<PendingInit> pending_inits_;
 
@@ -28,17 +30,21 @@ class CudaBackend final : public Backend {
         GGML_ASSERT(backend_ != nullptr);
         GGML_ASSERT(cpu_backend_ != nullptr);
 
-        // Kokoro builds different tensor shapes for each chunk. Recreate the
-        // scheduler for each graph so ggml's allocator never carries stale
-        // shape/allocation state across runs.
-        if (sched_ != nullptr) {
-            ggml_backend_sched_free(sched_);
-            sched_ = nullptr;
-        }
-
         const size_t required = std::max<size_t>(
             GGML_DEFAULT_GRAPH_SIZE,
             backend_graph_capacity(graph));
+        const uint64_t signature = backend_graph_signature(graph);
+
+        if (sched_ != nullptr && (sched_signature_ != signature || sched_capacity_ < required)) {
+            ggml_backend_sched_free(sched_);
+            sched_ = nullptr;
+            sched_capacity_ = 0;
+            sched_signature_ = 0;
+        }
+
+        if (sched_ != nullptr) {
+            return true;
+        }
 
         // ggml's scheduler expects the CPU backend last: it is used for ops not
         // supported by CUDA and for cross-backend fallback/copies.
@@ -58,6 +64,10 @@ class CudaBackend final : public Backend {
             false,
             parallel);
 
+        if (sched_ != nullptr) {
+            sched_capacity_ = required;
+            sched_signature_ = signature;
+        }
         return sched_ != nullptr;
     }
 
@@ -93,6 +103,8 @@ public:
         if (sched_ != nullptr) {
             ggml_backend_sched_free(sched_);
             sched_ = nullptr;
+            sched_capacity_ = 0;
+            sched_signature_ = 0;
         }
 
         if (backend_ != nullptr) {

@@ -22,56 +22,6 @@
 namespace kokopop {
 namespace {
 
-static bool is_integer_type(ggml_type type) {
-    return type == GGML_TYPE_I8  ||
-           type == GGML_TYPE_I16 ||
-           type == GGML_TYPE_I32 ||
-           type == GGML_TYPE_I64;
-}
-
-static bool list_contains(const char * csv, const char * needle) {
-    if (csv == nullptr || needle == nullptr) {
-        return false;
-    }
-
-    const size_t needle_len = std::strlen(needle);
-    const char * p = csv;
-
-    while (*p) {
-        while (*p == ' ' || *p == ',') {
-            ++p;
-        }
-
-        const char * start = p;
-        while (*p != '\0' && *p != ',') {
-            ++p;
-        }
-
-        const size_t len = static_cast<size_t>(p - start);
-        if (len == needle_len && std::strncmp(start, needle, len) == 0) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-static bool node_op_in_list(ggml_tensor * node, const char * csv) {
-    if (node == nullptr || csv == nullptr) {
-        return false;
-    }
-
-    if (list_contains(csv, ggml_op_name(node->op))) {
-        return true;
-    }
-
-    if (node->op == GGML_OP_UNARY) {
-        return list_contains(csv, ggml_unary_op_name(ggml_get_unary_op(node)));
-    }
-
-    return false;
-}
-
 static int label_level(const char * label) {
     if (label == nullptr) {
         return 99;
@@ -92,19 +42,17 @@ class MetalBackend final : public Backend {
     ggml_backend_t metal_backend_ = nullptr;
     ggml_backend_t cpu_backend_ = nullptr;
     ggml_backend_sched_t sched_ = nullptr;
+    size_t sched_capacity_ = 0;
+    uint64_t sched_signature_ = 0;
 
     MetalLstmKernelState * lstm_kernel_ = nullptr;
     MetalStftState * stft_kernel_ = nullptr;
     MetalVocoderState * vocoder_kernel_ = nullptr;
 
     std::string active_label_;
-    int n_input_tokens_ = 0;
     std::vector<PendingInit> pending_inits_;
 
     // Cached env vars. Read once at construction.
-    const char * env_force_cpu_ = nullptr;   // KOKOPOP_METAL_FORCE_CPU=frontend,generation,generator,none
-    const char * env_pin_op_    = nullptr;   // KOKOPOP_METAL_PIN_OP=SIN,REPEAT,...
-    const char * env_allow_op_  = nullptr;   // KOKOPOP_METAL_ALLOW_OP=SIN,...
     const char * env_run_only_  = nullptr;   // KOKOPOP_METAL_RUN_ONLY=frontend|generation|generator
 
     bool env_log_sched_ = false;             // KOKOPOP_METAL_LOG_SCHED=1
@@ -117,20 +65,27 @@ class MetalBackend final : public Backend {
         GGML_ASSERT(metal_backend_ != nullptr);
         GGML_ASSERT(cpu_backend_ != nullptr);
 
-        if (sched_ != nullptr) {
-            ggml_backend_sched_free(sched_);
-            sched_ = nullptr;
-        }
-
         const size_t required = std::max<size_t>(
             GGML_DEFAULT_GRAPH_SIZE,
             backend_graph_capacity(graph));
+        const uint64_t signature = backend_graph_signature(graph);
+
+        if (sched_ != nullptr && (sched_signature_ != signature || sched_capacity_ < required)) {
+            ggml_backend_sched_free(sched_);
+            sched_ = nullptr;
+            sched_capacity_ = 0;
+            sched_signature_ = 0;
+        }
+
+        if (sched_ != nullptr) {
+            return true;
+        }
 
         // CPU backend must be last. It handles unsupported ops and fallback copies.
         ggml_backend_t backends[] = { metal_backend_, cpu_backend_ };
 
-        // Keep op_offload=false. Kokoro has many hybrid graphs; forcing offload can
-        // create noisy Metal/CPU transitions. Nodes that need CPU are pinned below.
+        // Keep op_offload=false. Kokoro has many hybrid graphs; the scheduler
+        // can still split unsupported ops to the CPU backend as needed.
         sched_ = ggml_backend_sched_new(
             backends,
             nullptr,
@@ -139,6 +94,10 @@ class MetalBackend final : public Backend {
             false,
             false);
 
+        if (sched_ != nullptr) {
+            sched_capacity_ = required;
+            sched_signature_ = signature;
+        }
         return sched_ != nullptr;
     }
 
@@ -146,49 +105,6 @@ class MetalBackend final : public Backend {
         return tensor != nullptr &&
                (tensor->buffer != nullptr ||
                 (tensor->view_src != nullptr && tensor->view_src->buffer != nullptr));
-    }
-
-    bool force_cpu_for_active_graph() const {
-        if (active_label_.empty()) {
-            return false;
-        }
-
-        if (env_force_cpu_ == nullptr) {
-            return false;
-        }
-
-        if (std::strcmp(env_force_cpu_, "none") == 0) {
-            return false;
-        }
-
-        return list_contains(env_force_cpu_, active_label_.c_str());
-    }
-
-    bool is_default_unsafe_op(ggml_tensor * node) const {
-        (void) node;
-        return false;
-    }
-
-    void pin_graph_cpu_fallbacks(ggml_cgraph * graph) {
-        const int n_nodes = ggml_graph_n_nodes(graph);
-        const bool force_cpu = force_cpu_for_active_graph();
-
-        for (int i = 0; i < n_nodes; ++i) {
-            ggml_tensor * node = ggml_graph_node(graph, i);
-            if (node == nullptr) {
-                continue;
-            }
-
-            const bool hard_pin = is_integer_type(node->type) ||
-                                  !ggml_backend_supports_op(metal_backend_, node);
-            const bool default_unsafe = is_default_unsafe_op(node);
-            const bool soft_pin = force_cpu || node_op_in_list(node, env_pin_op_);
-            const bool allowed = node_op_in_list(node, env_allow_op_);
-
-            if (hard_pin || ((default_unsafe || soft_pin) && !allowed)) {
-                ggml_backend_sched_set_tensor_backend(sched_, node, cpu_backend_);
-            }
-        }
     }
 
     void log_sched_sizes(const char * stage) const {
@@ -246,9 +162,6 @@ class MetalBackend final : public Backend {
 
 public:
     explicit MetalBackend(int32_t n_threads) {
-        env_force_cpu_ = std::getenv("KOKOPOP_METAL_FORCE_CPU");
-        env_pin_op_ = std::getenv("KOKOPOP_METAL_PIN_OP");
-        env_allow_op_ = std::getenv("KOKOPOP_METAL_ALLOW_OP");
         env_run_only_ = std::getenv("KOKOPOP_METAL_RUN_ONLY");
 
         env_log_sched_ = std::getenv("KOKOPOP_METAL_LOG_SCHED") != nullptr;
@@ -288,6 +201,8 @@ public:
         if (sched_ != nullptr) {
             ggml_backend_sched_free(sched_);
             sched_ = nullptr;
+            sched_capacity_ = 0;
+            sched_signature_ = 0;
         }
 
         if (lstm_kernel_ != nullptr) {
@@ -334,8 +249,6 @@ public:
         if (env_op_trace_) {
             ggml_backend_sched_set_eval_callback(sched_, eval_trace_cb, sched_);
         }
-
-        pin_graph_cpu_fallbacks(graph);
 
         // Do not call ggml_backend_sched_reserve() separately. alloc_graph()
         // handles allocation and split reservation for the current graph.
@@ -477,7 +390,7 @@ public:
     }
 
     void set_input_tokens(int n) override {
-        n_input_tokens_ = n;
+        (void) n;
     }
 
     void preload_lstm_whh(const std::string & key, const float * w_hh_f32, int H, int four_H) override {
@@ -492,7 +405,7 @@ public:
 
     bool use_metal_lstm(int64_t n_steps) const override {
         (void) n_steps;
-        return lstm_kernel_ != nullptr && !force_cpu_for_active_graph();
+        return lstm_kernel_ != nullptr;
     }
 
     void * metal_stft_kernel() const override {

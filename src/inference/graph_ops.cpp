@@ -9,6 +9,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -56,7 +57,9 @@ static inline bool tensor_is_f32_2d_contiguous(const ggml_tensor * t) {
            t->nb[1] == static_cast<size_t>(t->ne[0]) * sizeof(float);
 }
 
-#ifdef KOKOPOP_HAS_METAL
+static inline bool backend_needs_contiguous_im2col(const Model & model) {
+    return model.backend_type == KOKOPOP_BACKEND_CUDA;
+}
 
 static float tensor_get_weight_f32_3d(const ggml_tensor * weight, int64_t k, int64_t oc, int64_t ic) {
     const char * base = tensor_data_c(weight)
@@ -76,7 +79,9 @@ void convt_crop_bias_cpu_fallback(
     const ggml_tensor * weight,
     const ggml_tensor * bias,
     int stride,
-    int crop_left) {
+    int crop_left,
+    int ith = 0,
+    int nth = 1) {
 
     GGML_ASSERT(dst != nullptr);
     GGML_ASSERT(input != nullptr);
@@ -91,37 +96,36 @@ void convt_crop_bias_cpu_fallback(
     const int64_t k_count  = weight->ne[0];
     const int64_t oc_count = weight->ne[1];
     const int64_t ol       = dst->ne[0];
+    const int64_t oc_begin = (oc_count * ith) / nth;
+    const int64_t oc_end   = (oc_count * (ith + 1)) / nth;
 
-    for (int64_t oc = 0; oc < oc_count; ++oc) {
+    for (int64_t oc = oc_begin; oc < oc_end; ++oc) {
         const float b = *reinterpret_cast<const float *>(
             tensor_data_c(bias) + static_cast<size_t>(oc) * bias->nb[0]);
 
         for (int64_t t = 0; t < ol; ++t) {
-            const int64_t full_t = t + crop_left;
-            float acc = b;
+            tensor_set_f32_2d(dst, t, oc, b);
+        }
 
-            for (int64_t ic = 0; ic < ic_count; ++ic) {
+        for (int64_t ic = 0; ic < ic_count; ++ic) {
+            for (int64_t ti = 0; ti < il; ++ti) {
+                const float x = tensor_get_f32_2d(input, ti, ic);
                 for (int64_t k = 0; k < k_count; ++k) {
-                    const int64_t src_num = full_t - k;
-                    if (src_num < 0 || (src_num % stride) != 0) {
+                    const int64_t t = ti * stride + k - crop_left;
+                    if (t < 0 || t >= ol) {
                         continue;
                     }
 
-                    const int64_t ti = src_num / stride;
-                    if (ti < 0 || ti >= il) {
-                        continue;
-                    }
-
-                    const float x = tensor_get_f32_2d(input, ti, ic);
-                    const float w = tensor_get_weight_f32_3d(weight, k, oc, ic);
-                    acc += w * x;
+                    float cur = tensor_get_f32_2d(dst, t, oc);
+                    cur += tensor_get_weight_f32_3d(weight, k, oc, ic) * x;
+                    tensor_set_f32_2d(dst, t, oc, cur);
                 }
             }
-
-            tensor_set_f32_2d(dst, t, oc, acc);
         }
     }
 }
+
+#ifdef KOKOPOP_HAS_METAL
 
 void metal_vocoder_convt_callback(
     ggml_tensor * dst,
@@ -153,6 +157,22 @@ void metal_vocoder_convt_callback(
 }
 
 #endif // KOKOPOP_HAS_METAL
+
+void cpu_vocoder_convt_callback(
+    ggml_tensor * dst,
+    const ggml_tensor * output_storage,
+    const ggml_tensor * input,
+    const ggml_tensor * weight,
+    int ith,
+    int nth,
+    void * userdata) {
+
+    (void) output_storage;
+    const auto * params = static_cast<const MetalVocoderConvTransposeParams *>(userdata);
+    GGML_ASSERT(params != nullptr);
+    GGML_ASSERT(params->bias != nullptr);
+    convt_crop_bias_cpu_fallback(dst, input, weight, params->bias, params->stride, params->crop_left, ith, nth);
+}
 
 // ---------------------------------------------------------------------------
 // Snake1D fused callback
@@ -326,7 +346,8 @@ static ggml_tensor * conv1d_im2col_mulmat(
     int padding,
     int dilation,
     int kernel_size,
-    bool channel_first) {
+    bool channel_first,
+    bool force_contiguous_im2col) {
 
     GGML_ASSERT(ctx != nullptr);
     GGML_ASSERT(weight != nullptr);
@@ -359,9 +380,9 @@ static ggml_tensor * conv1d_im2col_mulmat(
 
     ggml_tensor * im2col_2d = ggml_reshape_2d(ctx, im2col, ick, ol * n);
 
-    // Keep this for the CUDA path until the corruption is fully isolated.
-    // If removing it does not change results, remove it later for performance.
-    im2col_2d = ggml_cont(ctx, im2col_2d);
+    if (force_contiguous_im2col) {
+        im2col_2d = ggml_cont(ctx, im2col_2d);
+    }
 
     ggml_tensor * out = ggml_mul_mat(ctx, weight, im2col_2d);
 
@@ -433,7 +454,8 @@ ggml_tensor * conv1d(
     int stride,
     int padding,
     int dilation,
-    int kernel_size) {
+    int kernel_size,
+    bool force_contiguous_im2col) {
 
     GGML_ASSERT(kernel_size > 0);
 
@@ -456,7 +478,7 @@ ggml_tensor * conv1d(
         return ggml_conv_1d(ctx, w3d, input, stride, padding, dilation);
     }
 
-    return conv1d_im2col_mulmat(ctx, weight, input, stride, padding, dilation, kernel_size, false);
+    return conv1d_im2col_mulmat(ctx, weight, input, stride, padding, dilation, kernel_size, false, force_contiguous_im2col);
 }
 
 ggml_tensor * conv1d_chfirst(
@@ -466,7 +488,8 @@ ggml_tensor * conv1d_chfirst(
     int stride,
     int padding,
     int dilation,
-    int kernel_size) {
+    int kernel_size,
+    bool force_contiguous_im2col = false) {
 
     GGML_ASSERT(kernel_size > 0);
 
@@ -479,7 +502,7 @@ ggml_tensor * conv1d_chfirst(
         return ggml_cont(ctx, ggml_transpose(ctx, out));
     }
 
-    return conv1d_im2col_mulmat(ctx, weight, input, stride, padding, dilation, kernel_size, true);
+    return conv1d_im2col_mulmat(ctx, weight, input, stride, padding, dilation, kernel_size, true, force_contiguous_im2col);
 }
 
 // ---------------------------------------------------------------------------
@@ -511,6 +534,35 @@ ggml_tensor * conv_transpose1d_crop_bias(
     int stride,
     int crop_left,
     int out_len) {
+
+    if (std::getenv("KOKOPOP_CPU_VOCODER_CONVT") != nullptr &&
+        model.backend_type == KOKOPOP_BACKEND_CPU &&
+        input->type == GGML_TYPE_F32 &&
+        (weight->type == GGML_TYPE_F32 || weight->type == GGML_TYPE_F16) &&
+        bias->type == GGML_TYPE_F32 &&
+        input->ne[1] == weight->ne[2] &&
+        bias->ne[0] == weight->ne[1] &&
+        out_len > 0) {
+
+        model.metal_vocoder_convt_params.push_back({
+            nullptr,
+            bias,
+            stride,
+            crop_left,
+        });
+
+        const MetalVocoderConvTransposeParams * params = &model.metal_vocoder_convt_params.back();
+        ggml_tensor * out = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, out_len, weight->ne[1]);
+
+        return ggml_map_custom3_inplace(
+            ctx,
+            out,
+            input,
+            weight,
+            cpu_vocoder_convt_callback,
+            GGML_N_TASKS_MAX,
+            const_cast<MetalVocoderConvTransposeParams *>(params));
+    }
 
 #ifdef KOKOPOP_HAS_METAL
     if (model.backend != nullptr &&
@@ -717,7 +769,7 @@ ggml_tensor * adain_resblk1d(
         }
     }
 
-    cur = add_channel_bias(ctx, conv1d(ctx, conv1, cur, 1, 1, 1, 3), conv1_b);
+    cur = add_channel_bias(ctx, conv1d(ctx, conv1, cur, 1, 1, 1, 3, backend_needs_contiguous_im2col(model)), conv1_b);
 
     cur = cached != nullptr
         ? adain_1d(ctx, cur, style, cached->norm2)
@@ -727,12 +779,12 @@ ggml_tensor * adain_resblk1d(
     }
 
     cur = ggml_leaky_relu(ctx, cur, 0.2f, false);
-    cur = add_channel_bias(ctx, conv1d(ctx, conv2, cur, 1, 1, 1, 3), conv2_b);
+    cur = add_channel_bias(ctx, conv1d(ctx, conv2, cur, 1, 1, 1, 3, backend_needs_contiguous_im2col(model)), conv2_b);
 
     ggml_tensor * residual = maybe_upsample_nearest(ctx, x, upsample);
     ggml_tensor * conv1x1 = cached != nullptr ? cached->conv1x1_w : model.cached_tensor(prefix + ".conv1x1.weight");
     if (conv1x1 != nullptr) {
-        residual = conv1d(ctx, conv1x1, residual, 1, 0, 1, 1);
+        residual = conv1d(ctx, conv1x1, residual, 1, 0, 1, 1, backend_needs_contiguous_im2col(model));
     }
 
     return ggml_scale(ctx, ggml_add(ctx, cur, residual), KOKOPOP_INV_SQRT2);
@@ -750,7 +802,8 @@ ggml_tensor * graph_generator_resblock(
     int kernel_size,
     const GeneratorResblockWeights & weights,
     std::string & error,
-    bool fused_snake) {
+    bool fused_snake,
+    bool force_contiguous_im2col) {
 
     for (int i = 0; i < 3; ++i) {
         const size_t idx = static_cast<size_t>(i);
@@ -763,7 +816,7 @@ ggml_tensor * graph_generator_resblock(
 
         cur = add_channel_bias(
             ctx,
-            conv1d(ctx, weights.convs1_w[idx], cur, 1, weights.paddings[idx], KOKOPOP_RESBLOCK_DILATIONS[i], kernel_size),
+            conv1d(ctx, weights.convs1_w[idx], cur, 1, weights.paddings[idx], KOKOPOP_RESBLOCK_DILATIONS[i], kernel_size, force_contiguous_im2col),
             weights.convs1_b[idx]);
 
         cur = adain_1d(ctx, cur, style, weights.adain2[idx]);
@@ -774,7 +827,7 @@ ggml_tensor * graph_generator_resblock(
 
         cur = add_channel_bias(
             ctx,
-            conv1d(ctx, weights.convs2_w[idx], cur, 1, kernel_size / 2, 1, kernel_size),
+            conv1d(ctx, weights.convs2_w[idx], cur, 1, kernel_size / 2, 1, kernel_size, force_contiguous_im2col),
             weights.convs2_b[idx]);
 
         x = ggml_add(ctx, x, cur);
@@ -802,7 +855,8 @@ ggml_tensor * graph_generator_resblock(
             kernel_size,
             cached->second,
             error,
-            model.backend_type == KOKOPOP_BACKEND_CPU);
+            model.backend_type == KOKOPOP_BACKEND_CPU,
+            backend_needs_contiguous_im2col(model));
     }
 
     int paddings[3];
@@ -830,7 +884,7 @@ ggml_tensor * graph_generator_resblock(
 
         cur = add_channel_bias(
             ctx,
-            conv1d(ctx, conv1_w, cur, 1, paddings[i], KOKOPOP_RESBLOCK_DILATIONS[i], kernel_size),
+            conv1d(ctx, conv1_w, cur, 1, paddings[i], KOKOPOP_RESBLOCK_DILATIONS[i], kernel_size, backend_needs_contiguous_im2col(model)),
             conv1_b);
 
         cur = adain_1d(ctx, model, cur, style, prefix + ".adain2." + std::to_string(i), error);
@@ -851,7 +905,7 @@ ggml_tensor * graph_generator_resblock(
 
         cur = add_channel_bias(
             ctx,
-            conv1d(ctx, conv2_w, cur, 1, kernel_size / 2, 1, kernel_size),
+            conv1d(ctx, conv2_w, cur, 1, kernel_size / 2, 1, kernel_size, backend_needs_contiguous_im2col(model)),
             conv2_b);
 
         x = ggml_add(ctx, x, cur);
@@ -1101,7 +1155,7 @@ ggml_tensor * text_encoder(
         }
 
         ggml_tensor * input_tw = ggml_cont(ctx, ggml_transpose(ctx, cur));
-        cur = add_channel_bias(ctx, conv1d_chfirst(ctx, conv_w, input_tw, 1, 2, 1, 5), conv_b);
+        cur = add_channel_bias(ctx, conv1d_chfirst(ctx, conv_w, input_tw, 1, 2, 1, 5, backend_needs_contiguous_im2col(model)), conv_b);
         cur = ggml_add(ctx, ggml_mul(ctx, ggml_norm(ctx, cur, 1e-5f), norm_w), norm_b);
         cur = ggml_leaky_relu(ctx, cur, 0.2f, false);
     }
