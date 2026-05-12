@@ -58,6 +58,11 @@ static inline bool tensor_is_f32_2d_contiguous(const ggml_tensor * t) {
 }
 
 static inline bool backend_needs_contiguous_im2col(const Model & model) {
+#ifdef __AVX2__
+    if (model.backend_type == KOKOPOP_BACKEND_CPU) {
+        return true;
+    }
+#endif
     return model.backend_type == KOKOPOP_BACKEND_CUDA;
 }
 

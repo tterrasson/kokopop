@@ -16,8 +16,6 @@ namespace {
 class CpuBackend final : public Backend {
     ggml_backend_t backend_ = nullptr;
     ggml_backend_sched_t sched_ = nullptr;
-    size_t sched_capacity_ = 0;
-    uint64_t sched_signature_ = 0;
     std::vector<PendingInit> pending_inits_;
 
     bool ensure_scheduler(ggml_cgraph * graph) {
@@ -27,19 +25,12 @@ class CpuBackend final : public Backend {
         const size_t required = std::max<size_t>(
             GGML_DEFAULT_GRAPH_SIZE,
             backend_graph_capacity(graph));
-        const uint64_t signature = backend_graph_signature(graph);
 
-        // Chunk shapes vary, so stale alloc state is unsafe. Reuse only when
-        // the graph signature is identical and the existing capacity fits.
-        if (sched_ != nullptr && (sched_signature_ != signature || sched_capacity_ < required)) {
+        // CPU uses ggml's graph allocator directly; recreate per graph so
+        // chunk-dependent shapes cannot reuse stale allocation state on x86.
+        if (sched_ != nullptr) {
             ggml_backend_sched_free(sched_);
             sched_ = nullptr;
-            sched_capacity_ = 0;
-            sched_signature_ = 0;
-        }
-
-        if (sched_ != nullptr) {
-            return true;
         }
 
         ggml_backend_t backends[] = { backend_ };
@@ -51,10 +42,6 @@ class CpuBackend final : public Backend {
             false,
             true);
 
-        if (sched_ != nullptr) {
-            sched_capacity_ = required;
-            sched_signature_ = signature;
-        }
         return sched_ != nullptr;
     }
 
@@ -76,8 +63,6 @@ public:
         if (sched_ != nullptr) {
             ggml_backend_sched_free(sched_);
             sched_ = nullptr;
-            sched_capacity_ = 0;
-            sched_signature_ = 0;
         }
 
         if (backend_ != nullptr) {
