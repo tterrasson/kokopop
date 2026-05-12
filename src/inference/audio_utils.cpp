@@ -530,205 +530,6 @@ bool cpu_istft(Model & model, const CpuTensor & post, std::vector<float> & out) 
 }
 
 // ---------------------------------------------------------------------------
-// Generator graph (GGML-based audio synthesis)
-// ---------------------------------------------------------------------------
-
-bool ggml_generator(
-    Model & model, const CpuTensor & decoder,
-    const std::vector<float> & f0,
-    const std::vector<float> & style,
-    std::vector<float> & audio,
-    std::string & error) {
-    const int64_t har_len = decoder.length * 60 + 1;
-    std::vector<float> & har_data = model.tmp_stft_har_f32;
-    if (!fill_harmonic_stft(model, f0, har_len, har_data, error)) {
-        return false;
-    }
-
-    const size_t mem_size = model.backend->generator_context_bytes(decoder.length);
-    model.backend->clear_pending_inits();
-    ggml_context * ctx = init_scratch_context(model, model.generator_scratch, mem_size, true, "generator", error);
-    if (ctx == nullptr) {
-        return false;
-    }
-
-    ggml_tensor * x       = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, decoder.length, decoder.channels);
-    ggml_tensor * style_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, static_cast<int64_t>(style.size()));
-    ggml_tensor * har_t   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, har_len, 22);
-    ggml_set_input(x);
-    ggml_set_input(style_t);
-    ggml_set_input(har_t);
-
-    model.metal_vocoder_convt_params.clear();
-    model.metal_vocoder_convt_params.reserve(4);
-
-    struct StageParams {
-        int kernel;
-        int up_stride;
-        int up_padding;
-        int noise_stride;
-        int noise_padding;
-        int noise_kernel;
-        const char * noise_prefix;
-        const char * up_weight;
-        const char * up_bias;
-    };
-    static constexpr StageParams stage_params[2] = {
-        {
-            7, 10, 5, 6, 3, 12,
-            "kokopop.decoder.generator.noise_res.0",
-            "kokopop.decoder.generator.ups.0.weight",
-            "kokopop.decoder.generator.ups.0.bias"
-        },
-        {
-            11, 6, 3, 1, 0, 1,
-            "kokopop.decoder.generator.noise_res.1",
-            "kokopop.decoder.generator.ups.1.weight",
-            "kokopop.decoder.generator.ups.1.bias"
-        }
-    };
-
-    static const char * noise_conv_weights[2][2] = {
-        {"kokopop.decoder.generator.noise_convs.0.weight", "kokopop.decoder.generator.noise_convs.0.bias"},
-        {"kokopop.decoder.generator.noise_convs.1.weight", "kokopop.decoder.generator.noise_convs.1.bias"}
-    };
-    ggml_tensor * noise_conv_w[2] = {nullptr, nullptr};
-    ggml_tensor * noise_conv_b[2] = {nullptr, nullptr};
-    for (int stage = 0; stage < 2; ++stage) {
-        noise_conv_w[stage] = require_tensor(model, noise_conv_weights[stage][0], error);
-        noise_conv_b[stage] = require_tensor(model, noise_conv_weights[stage][1], error);
-        if (!error.empty()) {
-            ggml_free(ctx);
-            return false;
-        }
-    }
-
-    for (int stage = 0; stage < 2; ++stage) {
-        const StageParams & sp = stage_params[stage];
-        x = ggml_leaky_relu(ctx, x, 0.1f, false);
-        ggml_tensor * x_source = add_channel_bias(ctx,
-            conv1d(ctx, noise_conv_w[stage], har_t,
-                sp.noise_stride,
-                sp.noise_padding,
-                1,
-                sp.noise_kernel),
-            noise_conv_b[stage]);
-        x_source = graph_generator_resblock(ctx, model, x_source, style_t, sp.noise_prefix, sp.kernel, error);
-        if (x_source == nullptr) {
-            ggml_free(ctx);
-            return false;
-        }
-
-        ggml_tensor * up_w = require_tensor(model, sp.up_weight, error);
-        ggml_tensor * up_b = require_tensor(model, sp.up_bias, error);
-        if (!error.empty()) {
-            ggml_free(ctx);
-            return false;
-        }
-        const int64_t out_len = (x->ne[0] - 1) * sp.up_stride - 2 * sp.up_padding + up_w->ne[0];
-        x = conv_transpose1d_crop_bias(ctx, model, up_w, x, up_b, sp.up_stride,
-            sp.up_padding, static_cast<int>(out_len));
-        if (stage == 1) {
-            x = ggml_pad_reflect_1d(ctx, x, 1, 0);
-        }
-        x = ggml_add(ctx, x, x_source);
-
-        ggml_tensor * accum = nullptr;
-        for (int k = 0; k < 3; ++k) {
-            const std::string resblock_prefix = "kokopop.decoder.generator.resblocks." + std::to_string(stage * 3 + k);
-            ggml_tensor * branch = graph_generator_resblock(
-                ctx, model, x, style_t, resblock_prefix,
-                KOKOPOP_RESBLOCK_KERNELS[k], error);
-            if (branch == nullptr) {
-                ggml_free(ctx);
-                return false;
-            }
-            accum = accum == nullptr ? branch : ggml_add(ctx, accum, branch);
-        }
-        x = ggml_scale(ctx, accum, 1.0f / 3.0f);
-    }
-
-    x = ggml_leaky_relu(ctx, x, 0.01f, false);
-    ggml_tensor * post = add_channel_bias(ctx,
-        conv1d(ctx,
-            require_tensor(model, "kokopop.decoder.generator.conv_post.weight", error),
-            x,
-            1,
-            3,
-            1,
-            7),
-        require_tensor(model, "kokopop.decoder.generator.conv_post.bias", error));
-    if (!error.empty()) {
-        ggml_free(ctx);
-        return false;
-    }
-
-    const bool gen_profile = std::getenv("KOKOPOP_GEN_PROFILE") != nullptr;
-
-    int64_t t0g = gen_profile ? ggml_time_us() : 0;
-    ggml_cgraph * gf = ggml_new_graph_custom(ctx, generator_graph_size(decoder.length), false);
-    ggml_set_output(post);
-    ggml_build_forward_expand(gf, post);
-    if (gen_profile) {
-        std::fprintf(stderr, "[gen-profile] generator n_nodes=%d  build=%.1fms\n",
-            ggml_graph_n_nodes(gf), (ggml_time_us() - t0g) / 1000.0);
-    }
-
-    model.backend->set_active_label("generator");
-    model.backend->sched_reset();
-    t0g = gen_profile ? ggml_time_us() : 0;
-    if (!model.backend->sched_alloc_graph(gf)) {
-        ggml_free(ctx);
-        error = "ggml generator backend allocation failed";
-        return false;
-    }
-    if (gen_profile) {
-        std::fprintf(stderr, "[gen-profile] generator sched_alloc=%.1fms\n",
-            (ggml_time_us() - t0g) / 1000.0);
-    }
-    if (!model.backend->apply_pending_inits()) {
-        ggml_free(ctx);
-        error = "ggml generator backend tensor initialization failed";
-        return false;
-    }
-    model.backend->tensor_set(
-        x,
-        decoder.data.data(),
-        0,
-        static_cast<size_t>(decoder.length * decoder.channels) * sizeof(float)
-    );
-    model.backend->tensor_set(style_t, style.data(),        0, style.size()        * sizeof(float));
-    model.backend->tensor_set(har_t,   har_data.data(),     0, ggml_nbytes(har_t));
-    t0g = gen_profile ? ggml_time_us() : 0;
-    ggml_status status = model.backend->compute(ctx, gf);
-    if (gen_profile) {
-        std::fprintf(stderr, "[gen-profile] generator compute=%.1fms\n",
-            (ggml_time_us() - t0g) / 1000.0);
-    }
-
-    if (status != GGML_STATUS_SUCCESS) {
-        ggml_free(ctx);
-        error = "ggml generator graph compute failed";
-        return false;
-    }
-
-    const size_t post_size = static_cast<size_t>(post->ne[0] * post->ne[1]);
-    std::vector<float> & post_data = model.tmp_post_f32;
-    if (post_data.size() < post_size) {
-        post_data.resize(post_size);
-    }
-    model.backend->tensor_get(post, post_data.data(), 0, post_size * sizeof(float));
-    // 7.3 — Pass the output buffer; cpu_istft writes directly into it.
-    if (!cpu_istft_data(model, post_data.data(), post->ne[0], audio)) {
-        ggml_free(ctx);
-        error = "cpu_istft failed";
-        return false;
-    }
-    ggml_free(ctx);
-    return !audio.empty();
-}
-
-// ---------------------------------------------------------------------------
 // Graph sizing helpers
 // ---------------------------------------------------------------------------
 
@@ -778,6 +579,219 @@ ggml_context * init_scratch_context(
         return nullptr;
     }
     return ctx;
+}
+
+// ---------------------------------------------------------------------------
+// Generator graph
+// ---------------------------------------------------------------------------
+
+bool ggml_generator(
+    Model & model,
+    const CpuTensor & decoder,
+    const std::vector<float> & f0,
+    const std::vector<float> & style,
+    std::vector<float> & audio,
+    std::string & error) {
+
+    const int64_t har_len = decoder.length * 60 + 1;
+
+    std::vector<float> & har_data = model.tmp_stft_har_f32;
+    if (!fill_harmonic_stft(model, f0, har_len, har_data, error)) {
+        return false;
+    }
+
+    const size_t mem_size = model.backend->generator_context_bytes(decoder.length);
+    model.backend->clear_pending_inits();
+
+    ggml_context * ctx = init_scratch_context(model, model.generator_scratch, mem_size, true, "generator", error);
+    if (ctx == nullptr) {
+        return false;
+    }
+
+    // CRITICAL: keep a stable pointer to the graph input tensor.
+    // Do not reuse this variable for intermediate nodes, otherwise tensor_set()
+    // will upload decoder data into the wrong tensor.
+    ggml_tensor * decoder_input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, decoder.length, decoder.channels);
+    ggml_tensor * style_t       = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, static_cast<int64_t>(style.size()));
+    ggml_tensor * har_t         = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, har_len, 22);
+
+    ggml_set_input(decoder_input);
+    ggml_set_input(style_t);
+    ggml_set_input(har_t);
+
+    ggml_tensor * x = decoder_input;
+
+    model.metal_vocoder_convt_params.clear();
+    model.metal_vocoder_convt_params.reserve(4);
+
+    struct StageParams {
+        int kernel;
+        int up_stride;
+        int up_padding;
+        int noise_stride;
+        int noise_padding;
+        int noise_kernel;
+        const char * noise_prefix;
+        const char * up_weight;
+        const char * up_bias;
+    };
+
+    static constexpr StageParams stage_params[2] = {
+        {
+            7, 10, 5, 6, 3, 12,
+            "kokopop.decoder.generator.noise_res.0",
+            "kokopop.decoder.generator.ups.0.weight",
+            "kokopop.decoder.generator.ups.0.bias",
+        },
+        {
+            11, 6, 3, 1, 0, 1,
+            "kokopop.decoder.generator.noise_res.1",
+            "kokopop.decoder.generator.ups.1.weight",
+            "kokopop.decoder.generator.ups.1.bias",
+        },
+    };
+
+    static const char * noise_conv_weights[2][2] = {
+        {"kokopop.decoder.generator.noise_convs.0.weight", "kokopop.decoder.generator.noise_convs.0.bias"},
+        {"kokopop.decoder.generator.noise_convs.1.weight", "kokopop.decoder.generator.noise_convs.1.bias"},
+    };
+
+    ggml_tensor * noise_conv_w[2] = {nullptr, nullptr};
+    ggml_tensor * noise_conv_b[2] = {nullptr, nullptr};
+
+    for (int stage = 0; stage < 2; ++stage) {
+        noise_conv_w[stage] = require_tensor(model, noise_conv_weights[stage][0], error);
+        noise_conv_b[stage] = require_tensor(model, noise_conv_weights[stage][1], error);
+        if (!error.empty()) {
+            ggml_free(ctx);
+            return false;
+        }
+    }
+
+    for (int stage = 0; stage < 2; ++stage) {
+        const StageParams & sp = stage_params[stage];
+
+        x = ggml_leaky_relu(ctx, x, 0.1f, false);
+
+        ggml_tensor * x_source = add_channel_bias(
+            ctx,
+            conv1d(ctx, noise_conv_w[stage], har_t, sp.noise_stride, sp.noise_padding, 1, sp.noise_kernel),
+            noise_conv_b[stage]);
+
+        x_source = graph_generator_resblock(ctx, model, x_source, style_t, sp.noise_prefix, sp.kernel, error);
+        if (x_source == nullptr) {
+            ggml_free(ctx);
+            return false;
+        }
+
+        ggml_tensor * up_w = require_tensor(model, sp.up_weight, error);
+        ggml_tensor * up_b = require_tensor(model, sp.up_bias, error);
+        if (!error.empty()) {
+            ggml_free(ctx);
+            return false;
+        }
+
+        const int64_t out_len = (x->ne[0] - 1) * sp.up_stride - 2 * sp.up_padding + up_w->ne[0];
+        x = conv_transpose1d_crop_bias(ctx, model, up_w, x, up_b, sp.up_stride, sp.up_padding, static_cast<int>(out_len));
+
+        if (stage == 1) {
+            x = ggml_pad_reflect_1d(ctx, x, 1, 0);
+        }
+
+        x = ggml_add(ctx, x, x_source);
+
+        ggml_tensor * accum = nullptr;
+        for (int k = 0; k < 3; ++k) {
+            const std::string resblock_prefix = "kokopop.decoder.generator.resblocks." + std::to_string(stage * 3 + k);
+            ggml_tensor * branch = graph_generator_resblock(ctx, model, x, style_t, resblock_prefix, KOKOPOP_RESBLOCK_KERNELS[k], error);
+            if (branch == nullptr) {
+                ggml_free(ctx);
+                return false;
+            }
+            accum = accum == nullptr ? branch : ggml_add(ctx, accum, branch);
+        }
+
+        x = ggml_scale(ctx, accum, 1.0f / 3.0f);
+    }
+
+    x = ggml_leaky_relu(ctx, x, 0.01f, false);
+
+    ggml_tensor * post_w = require_tensor(model, "kokopop.decoder.generator.conv_post.weight", error);
+    ggml_tensor * post_b = require_tensor(model, "kokopop.decoder.generator.conv_post.bias", error);
+    if (!error.empty()) {
+        ggml_free(ctx);
+        return false;
+    }
+
+    ggml_tensor * post = add_channel_bias(ctx, conv1d(ctx, post_w, x, 1, 3, 1, 7), post_b);
+    post = ggml_cont(ctx, post);
+    ggml_set_name(post, "kokopop_generator_post");
+    ggml_set_output(post);
+
+    const bool gen_profile = std::getenv("KOKOPOP_GEN_PROFILE") != nullptr;
+
+    int64_t t0g = gen_profile ? ggml_time_us() : 0;
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, generator_graph_size(decoder.length), false);
+    ggml_build_forward_expand(gf, post);
+
+    if (gen_profile) {
+        std::fprintf(stderr, "[gen-profile] generator n_nodes=%d build=%.1fms\n", ggml_graph_n_nodes(gf), (ggml_time_us() - t0g) / 1000.0);
+    }
+
+    model.backend->set_active_label("generator");
+    model.backend->sched_reset();
+
+    t0g = gen_profile ? ggml_time_us() : 0;
+    if (!model.backend->sched_alloc_graph(gf)) {
+        ggml_free(ctx);
+        error = "ggml generator backend allocation failed";
+        return false;
+    }
+
+    if (gen_profile) {
+        std::fprintf(stderr, "[gen-profile] generator sched_alloc=%.1fms\n", (ggml_time_us() - t0g) / 1000.0);
+    }
+
+    if (!model.backend->apply_pending_inits()) {
+        ggml_free(ctx);
+        error = "ggml generator backend tensor initialization failed";
+        return false;
+    }
+
+    const size_t decoder_bytes = static_cast<size_t>(decoder.length * decoder.channels) * sizeof(float);
+    model.backend->tensor_set(decoder_input, decoder.data.data(), 0, decoder_bytes);
+    model.backend->tensor_set(style_t,       style.data(),        0, style.size() * sizeof(float));
+    model.backend->tensor_set(har_t,         har_data.data(),     0, ggml_nbytes(har_t));
+
+    t0g = gen_profile ? ggml_time_us() : 0;
+    const ggml_status status = model.backend->compute(ctx, gf);
+
+    if (gen_profile) {
+        std::fprintf(stderr, "[gen-profile] generator compute=%.1fms\n", (ggml_time_us() - t0g) / 1000.0);
+    }
+
+    if (status != GGML_STATUS_SUCCESS) {
+        ggml_free(ctx);
+        error = "ggml generator graph compute failed";
+        return false;
+    }
+
+    const size_t post_size = static_cast<size_t>(ggml_nelements(post));
+    std::vector<float> & post_data = model.tmp_post_f32;
+    if (post_data.size() < post_size) {
+        post_data.resize(post_size);
+    }
+
+    model.backend->tensor_get(post, post_data.data(), 0, post_size * sizeof(float));
+
+    if (!cpu_istft_data(model, post_data.data(), post->ne[0], audio)) {
+        ggml_free(ctx);
+        error = "cpu_istft failed";
+        return false;
+    }
+
+    ggml_free(ctx);
+    return !audio.empty();
 }
 
 } // namespace kokopop
