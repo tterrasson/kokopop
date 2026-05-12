@@ -6,7 +6,8 @@ A standalone C++ library and toolkit for running [Kokoro](https://github.com/hex
 
 - **Zero dependencies beyond libespeak-ng and ggml** — no Python, no heavy ML frameworks
 - **CPU inference** with configurable thread count
-- **Metal GPU backend** (macOS) for accelerated inference (experimental)
+- **Metal GPU backend** (macOS) for accelerated inference
+- **CUDA backend** (Linux/Windows) for accelerated inference on NVIDIA GPUs
 - **Streaming API** for real-time audio generation
 - **Chunked synthesis** for long-form text processing
 - **WAV output** and optional direct playback (Core Audio on macOS)
@@ -45,6 +46,13 @@ cmake --build build
 
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DKOKOPOP_ENABLE_METAL=ON
+cmake --build build
+```
+
+### Build with CUDA support
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DKOKOPOP_ENABLE_CUDA=ON
 cmake --build build
 ```
 
@@ -320,7 +328,7 @@ kokopop_model_free(model);
 include/     — Public headers (kokopop.h)
 src/         — Source code
   core/      — Error handling, string utilities, WAV I/O
-  backend/   — CPU and Metal backend implementations
+  backend/   — CPU, Metal, and CUDA backend implementations
   inference/ — Kokoro graph operations and audio utilities
   synthesis/ — Phonemizer, text chunking, G2P (zh_g2p, pinyin), and main synthesis pipeline
   audio/     — Audio post-processing
@@ -375,6 +383,7 @@ Kokopop supports the following languages:
 | `KOKOPOP_BUILD_TESTS` | `ON`    | Build unit tests                 |
 | `KOKOPOP_BUILD_TOOLS` | `ON`    | Build CLI tools                  |
 | `KOKOPOP_ENABLE_METAL`| `OFF`   | Enable Metal GPU backend (macOS) |
+| `KOKOPOP_ENABLE_CUDA` | `OFF`   | Enable CUDA backend (NVIDIA GPUs) |
 | `KOKOPOP_BUILD_BENCH` | `OFF`   | Build benchmarks (requires model)|
 
 ## Testing
