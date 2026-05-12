@@ -49,7 +49,7 @@ class MetalBackend final : public Backend {
     MetalStftState * stft_kernel_ = nullptr;
     MetalVocoderState * vocoder_kernel_ = nullptr;
 
-    std::string active_label_;
+    const char * active_label_ = nullptr;
     std::vector<PendingInit> pending_inits_;
 
     // Cached env vars. Read once at construction.
@@ -119,7 +119,7 @@ class MetalBackend final : public Backend {
         std::fprintf(
             stderr,
             "[metal-sched %s/%s] splits=%d metal_buf=%.1f MiB cpu_buf=%.1f MiB\n",
-            active_label_.empty() ? "?" : active_label_.c_str(),
+            active_label_ != nullptr ? active_label_ : "?",
             stage,
             n_splits,
             metal_bytes / 1048576.0,
@@ -345,7 +345,7 @@ public:
         }
 
         if (env_run_only_ != nullptr &&
-            label_level(active_label_.c_str()) > label_level(env_run_only_)) {
+            label_level(active_label_) > label_level(env_run_only_)) {
             ggml_backend_sched_synchronize(sched_);
             log_sched_sizes("skip-compute");
             return GGML_STATUS_SUCCESS;
@@ -386,7 +386,7 @@ public:
     }
 
     void set_active_label(const char * label) override {
-        active_label_ = label != nullptr ? label : "";
+        active_label_ = label;
     }
 
     void set_input_tokens(int n) override {

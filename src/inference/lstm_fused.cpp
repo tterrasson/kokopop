@@ -191,14 +191,15 @@ static inline float dot_product(
 static void cpu_lstm_contiguous(
     const LstmCustomParams & p,
     const float * __restrict__ pre_gates,
-    float * __restrict__ output,
-    float * __restrict__ h,
-    float * __restrict__ c,
-    float * __restrict__ gates) {
+    float * __restrict__ output) {
 
     const int64_t H  = p.hidden;
     const int64_t N  = p.n_steps;
     const int64_t H4 = 4 * H;
+
+    std::vector<float> h(static_cast<size_t>(H), 0.0f);
+    std::vector<float> c(static_cast<size_t>(H), 0.0f);
+    std::vector<float> gates(static_cast<size_t>(H4));
 
     const float * w_base = p.w_hh_rowwise ? p.w_hh_rowwise : p.w_hh_f32;
 
@@ -207,20 +208,21 @@ static void cpu_lstm_contiguous(
         const float * pg_t = pre_gates + H4 * t;
 
         for (int64_t j = 0; j < H4; ++j) {
-            gates[j] = p.b_hh[j] + pg_t[j] + dot_product(w_base + j * H, h, H);
+            gates[static_cast<size_t>(j)] =
+                p.b_hh[j] + pg_t[j] + dot_product(w_base + j * H, h.data(), H);
         }
 
         float * out_t = output + H * t;
         for (int64_t i = 0; i < H; ++i) {
-            const float i_gate = sigmoidf_stable(gates[i]);
-            const float f_gate = sigmoidf_stable(gates[H + i]);
-            const float g_gate = std::tanh(gates[2 * H + i]);
-            const float o_gate = sigmoidf_stable(gates[3 * H + i]);
+            const float i_gate = sigmoidf_stable(gates[static_cast<size_t>(i)]);
+            const float f_gate = sigmoidf_stable(gates[static_cast<size_t>(H + i)]);
+            const float g_gate = std::tanh(gates[static_cast<size_t>(2 * H + i)]);
+            const float o_gate = sigmoidf_stable(gates[static_cast<size_t>(3 * H + i)]);
 
-            const float c_new = clamp_cell(f_gate * c[i] + i_gate * g_gate);
-            c[i] = c_new;
-            h[i] = o_gate * std::tanh(c_new);
-            out_t[i] = h[i];
+            const float c_new = clamp_cell(f_gate * c[static_cast<size_t>(i)] + i_gate * g_gate);
+            c[static_cast<size_t>(i)] = c_new;
+            h[static_cast<size_t>(i)] = o_gate * std::tanh(c_new);
+            out_t[i] = h[static_cast<size_t>(i)];
         }
     }
 }
@@ -232,14 +234,15 @@ static void cpu_lstm_contiguous(
 static void cpu_lstm_strided(
     const LstmCustomParams & p,
     const ggml_tensor * pre_gates,
-    ggml_tensor * output,
-    float * __restrict__ h,
-    float * __restrict__ c,
-    float * __restrict__ gates) {
+    ggml_tensor * output) {
 
     const int64_t H  = p.hidden;
     const int64_t N  = p.n_steps;
     const int64_t H4 = 4 * H;
+
+    std::vector<float> h(static_cast<size_t>(H), 0.0f);
+    std::vector<float> c(static_cast<size_t>(H), 0.0f);
+    std::vector<float> gates(static_cast<size_t>(H4));
 
     const float * w_base = p.w_hh_rowwise ? p.w_hh_rowwise : p.w_hh_f32;
 
@@ -248,19 +251,20 @@ static void cpu_lstm_strided(
 
         for (int64_t j = 0; j < H4; ++j) {
             const float pg_jt = tensor_get_f32_2d(pre_gates, j, t);
-            gates[j] = p.b_hh[j] + pg_jt + dot_product(w_base + j * H, h, H);
+            gates[static_cast<size_t>(j)] =
+                p.b_hh[j] + pg_jt + dot_product(w_base + j * H, h.data(), H);
         }
 
         for (int64_t i = 0; i < H; ++i) {
-            const float i_gate = sigmoidf_stable(gates[i]);
-            const float f_gate = sigmoidf_stable(gates[H + i]);
-            const float g_gate = std::tanh(gates[2 * H + i]);
-            const float o_gate = sigmoidf_stable(gates[3 * H + i]);
+            const float i_gate = sigmoidf_stable(gates[static_cast<size_t>(i)]);
+            const float f_gate = sigmoidf_stable(gates[static_cast<size_t>(H + i)]);
+            const float g_gate = std::tanh(gates[static_cast<size_t>(2 * H + i)]);
+            const float o_gate = sigmoidf_stable(gates[static_cast<size_t>(3 * H + i)]);
 
-            const float c_new = clamp_cell(f_gate * c[i] + i_gate * g_gate);
-            c[i] = c_new;
-            h[i] = o_gate * std::tanh(c_new);
-            tensor_set_f32_2d(output, i, t, h[i]);
+            const float c_new = clamp_cell(f_gate * c[static_cast<size_t>(i)] + i_gate * g_gate);
+            c[static_cast<size_t>(i)] = c_new;
+            h[static_cast<size_t>(i)] = o_gate * std::tanh(c_new);
+            tensor_set_f32_2d(output, i, t, h[static_cast<size_t>(i)]);
         }
     }
 }
@@ -278,20 +282,13 @@ static void cpu_lstm(
         tensor_is_f32_2d_contiguous(pre_gates, H4, N) &&
         tensor_is_f32_2d_contiguous(output, H, N);
 
-    std::vector<float> h(static_cast<size_t>(H), 0.0f);
-    std::vector<float> c(static_cast<size_t>(H), 0.0f);
-    std::vector<float> gates(static_cast<size_t>(H4));
-
     if (contiguous) {
         cpu_lstm_contiguous(
             p,
             static_cast<const float *>(pre_gates->data),
-            static_cast<float *>(output->data),
-            h.data(),
-            c.data(),
-            gates.data());
+            static_cast<float *>(output->data));
     } else {
-        cpu_lstm_strided(p, pre_gates, output, h.data(), c.data(), gates.data());
+        cpu_lstm_strided(p, pre_gates, output);
     }
 }
 

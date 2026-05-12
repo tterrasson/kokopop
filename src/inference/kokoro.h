@@ -42,8 +42,7 @@ ggml_tensor * linear(ggml_context * ctx, ggml_tensor * weight, ggml_tensor * bia
 ggml_tensor * add_channel_bias(ggml_context * ctx, ggml_tensor * x, ggml_tensor * bias);
 ggml_tensor * conv1d(
     ggml_context * ctx, ggml_tensor * weight, ggml_tensor * input,
-    int stride, int padding, int dilation, int kernel_size,
-    bool force_contiguous_im2col = false);
+    int stride, int padding, int dilation, int kernel_size);
 ggml_tensor * conv_transpose1d_crop(
     ggml_context * ctx,
     ggml_tensor * weight,
@@ -113,8 +112,7 @@ ggml_tensor * graph_generator_resblock(
     int kernel_size,
     const GeneratorResblockWeights & weights,
     std::string & error,
-    bool fused_snake = false,
-    bool force_contiguous_im2col = false);
+    bool fused_snake = false);
 ggml_tensor * graph_generator_resblock(
     ggml_context * ctx,
     Model & model,
