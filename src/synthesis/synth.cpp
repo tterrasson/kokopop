@@ -35,49 +35,6 @@ bool allocate_audio(size_t n, int32_t sr, kokopop_audio & out) {
     return true;
 }
 
-struct AudioHealth {
-    double rms = 0.0;
-    double clipped_ratio = 0.0;
-    float peak = 0.0f;
-    bool finite = true;
-};
-
-AudioHealth audio_health(const std::vector<float> & audio) {
-    AudioHealth health;
-    if (audio.empty()) {
-        return health;
-    }
-
-    double sum_sq = 0.0;
-    size_t clipped = 0;
-    for (float sample : audio) {
-        if (!std::isfinite(sample)) {
-            health.finite = false;
-            continue;
-        }
-        const float abs_sample = std::fabs(sample);
-        health.peak = std::max(health.peak, abs_sample);
-        sum_sq += static_cast<double>(sample) * static_cast<double>(sample);
-        if (abs_sample > 0.98f) {
-            ++clipped;
-        }
-    }
-    health.rms = std::sqrt(sum_sq / static_cast<double>(audio.size()));
-    health.clipped_ratio = static_cast<double>(clipped) / static_cast<double>(audio.size());
-    return health;
-}
-
-bool is_pathological_audio(const std::vector<float> & audio) {
-    if (audio.empty()) {
-        return true;
-    }
-    const AudioHealth health = audio_health(audio);
-    if (!health.finite) {
-        return true;
-    }
-    return health.rms > 0.95 && health.peak >= 0.99f && health.clipped_ratio > 0.10;
-}
-
 bool run_real_synthesis(
     Model & model,
     const std::string & phonemes,
@@ -136,46 +93,9 @@ bool synthesize_phonemes(
     }
 
     if (!model.is_mock) {
-        static const char * kProsodyRetries[] = {
-            "",
-            " ,",
-            " , ,",
-            " , , , ,",
-            " , , , , , ,",
-        };
-
         std::vector<float> audio;
-        std::vector<float> last_audio;
-        std::string last_error;
-        bool synthesized = false;
-        for (const char * suffix : kProsodyRetries) {
-            std::string attempt = phonemes;
-            attempt += suffix;
-
-            std::string attempt_error;
-            audio.clear();
-            if (!run_real_synthesis(model, attempt, voice, speed, audio, attempt_error)) {
-                last_error = attempt_error;
-                continue;
-            }
-
-            synthesized = true;
-            if (!is_pathological_audio(audio)) {
-                break;
-            }
-            // Audio is pathological — keep it as a fallback before retrying.
-            // Moving out of `audio` is safe: the next iteration calls
-            // audio.clear() then run_real_synthesis overwrites it.
-            last_audio = std::move(audio);
-        }
-
-        if (!synthesized) {
-            error = last_error.empty() ? "Kokoro generator produced no audio" : last_error;
+        if (!run_real_synthesis(model, phonemes, voice, speed, audio, error)) {
             return false;
-        }
-
-        if ((audio.empty() || is_pathological_audio(audio)) && !last_audio.empty()) {
-            audio = std::move(last_audio);
         }
 
         if (!allocate_audio(audio.size(), model.sample_rate, out)) {

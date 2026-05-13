@@ -1,4 +1,5 @@
 #include "test_helpers.h"
+#include "synthesis/chunker/chunker.h"
 
 // ---- Tests avec modèle réel kokoro.gguf ----
 // Le modèle est chargé une seule fois via shared_real_model() et réutilisé
@@ -85,16 +86,27 @@ TEST_CASE("real_kokoro_generation_probe") {
     CHECK(audio.peak > 0.1f);
 }
 
-TEST_CASE("real_kokoro_synthesize_stabilizes_af_heart_short_unpunctuated_text") {
+TEST_CASE("real_kokoro_text_frontend_adds_stable_end_for_short_unpunctuated_text") {
     auto * model = shared_real_model();
     if (!model) { MESSAGE("skipping: models/kokoro-md.gguf not found"); return; }
 
-    std::string phonemes;
     std::string error;
-    CHECK(kokopop::phonemize_text("Hello world", "af_heart", phonemes, error));
+    kokopop::TokenizeFn tokenize_fn =
+        [model](const std::string & phonemes,
+                std::vector<uint32_t> & ids,
+                std::string & token_error) {
+            return model->tokenize_phonemes(phonemes, ids, token_error);
+        };
+
+    auto chunks = kokopop::chunk_text(
+        "Hello world", "af_heart",
+        kokopop::make_long_form_config(), tokenize_fn, error);
+    REQUIRE_EQ(chunks.size(), 1);
+    CHECK_EQ(chunks.front().boundary_after, kokopop::Boundary::Sentence);
+    CHECK(chunks.front().phonemes.find('.') != std::string::npos);
 
     kokopop_audio audio{};
-    CHECK(kokopop::synthesize_phonemes(*model, phonemes, "af_heart", 1.0f, audio, error));
+    CHECK(kokopop::synthesize_phonemes(*model, chunks.front().phonemes, "af_heart", 1.0f, audio, error));
 
     std::vector<float> samples(audio.samples, audio.samples + audio.n_samples);
     kokopop_audio_free(&audio);

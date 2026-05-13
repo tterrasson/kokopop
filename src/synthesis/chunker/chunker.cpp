@@ -104,6 +104,14 @@ bool make_unit(const std::string & text,
     return true;
 }
 
+std::string ensure_terminal_sentence_boundary(std::string text) {
+    if (infer_boundary_type(text) != Boundary::None) {
+        return text;
+    }
+    text.push_back('.');
+    return text;
+}
+
 /// Phonemize and tokenize with a small cache to avoid repeated work.
 /// When force_split_unit recurses, the same substring can be phonemized
 /// multiple times; the cache intercepts identical text keys.
@@ -313,7 +321,7 @@ std::vector<Chunk> chunk_text(
     std::string & error) {
 
     // Step 1: Normalize text
-    std::string normalized = normalize_text(text);
+    std::string normalized = ensure_terminal_sentence_boundary(normalize_text(text));
 
     // Step 2: Split into candidate units
     auto raw_units = split_into_candidate_units(normalized);

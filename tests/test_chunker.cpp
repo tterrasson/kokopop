@@ -103,6 +103,25 @@ TEST_CASE("prepare_synthesis_no_override_uses_mode_defaults") {
              kokopop::make_long_form_config().target_min_tokens);
 }
 
+TEST_CASE("chunk_text_adds_terminal_sentence_boundary_for_complete_text") {
+    std::string error;
+    auto tokenize = [](const std::string & phonemes,
+                       std::vector<uint32_t> & ids,
+                       std::string &) {
+        ids.assign(std::max<size_t>(1, phonemes.size() / 2), 1);
+        return true;
+    };
+
+    auto chunks = kokopop::chunk_text(
+        "Hello world", "af_heart",
+        kokopop::make_long_form_config(), tokenize, error);
+
+    REQUIRE_EQ(chunks.size(), 1);
+    CHECK_EQ(chunks.front().text, std::string("Hello world."));
+    CHECK_EQ(chunks.front().boundary_after, kokopop::Boundary::Sentence);
+    CHECK(chunks.front().phonemes.find('.') != std::string::npos);
+}
+
 // ---- /voices: model exposes its voices map ----
 
 TEST_CASE("mock_model_has_voices") {
