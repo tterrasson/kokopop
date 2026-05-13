@@ -469,6 +469,19 @@ void Model::preload_tensor_cache() {
             lstm_b_hh_f32.emplace(kv.first, std::move(data));
         }
     }
+
+    // LSTM input weights feed the gate pre-activation matmul. Keep host F32
+    // copies so CPU/Metal graphs can bypass quantized backend matmul for this
+    // numerically sensitive path while CUDA keeps using its faster kernels.
+    lstm_w_ih_f32.clear();
+    for (const auto & kv : tensors) {
+        if (kv.first.find("weight_ih_l0") == std::string::npos) continue;
+        if (kv.second == nullptr) continue;
+        std::vector<float> data;
+        if (tensor_to_f32(*backend, kv.second, data)) {
+            lstm_w_ih_f32.emplace(kv.first, std::move(data));
+        }
+    }
 }
 
 void Model::prereserve_scratch_buffers() {

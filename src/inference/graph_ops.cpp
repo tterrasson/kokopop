@@ -959,9 +959,29 @@ ggml_tensor * lstm_direction(
 
     const int64_t hidden = w.hidden;
 
+    ggml_tensor * w_ih = w.w_ih_packed;
+    if (model.backend_type != KOKOPOP_BACKEND_CUDA) {
+        const std::string wih_key = prefix + ".weight_ih_l0" + (reverse ? "_reverse" : "");
+        const auto wih_it = model.lstm_w_ih_f32.find(wih_key);
+        if (wih_it == model.lstm_w_ih_f32.end()) {
+            error = "fused LSTM: w_ih not preloaded for " + wih_key;
+            return nullptr;
+        }
+
+        w_ih = ggml_new_tensor_2d(
+            ctx,
+            GGML_TYPE_F32,
+            w.w_ih_packed->ne[0],
+            w.w_ih_packed->ne[1]);
+        model.backend->queue_tensor_data(
+            w_ih,
+            wih_it->second.data(),
+            wih_it->second.size() * sizeof(float));
+    }
+
     ggml_tensor * pre_input_gates_packed = ggml_add(
         ctx,
-        ggml_mul_mat(ctx, w.w_ih_packed, input),
+        ggml_mul_mat(ctx, w_ih, input),
         w.b_ih_packed);
 
     const std::string whh_key = prefix + ".weight_hh_l0" + (reverse ? "_reverse" : "");

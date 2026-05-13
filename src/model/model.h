@@ -156,6 +156,13 @@ struct Model {
     // Key = tensor logical name (e.g. "kokopop.text_encoder.lstm.bias_hh_l0").
     std::unordered_map<std::string, std::vector<float>> lstm_b_hh_f32;
 
+    // Pre-dequantized LSTM input matrices. CPU and Metal both showed
+    // saturation on long multi-chunk synthesis when these gates were computed
+    // through quantized backend matmul; CUDA uses its own kernels and can keep
+    // the original quantized tensors.
+    // Key = tensor logical name (e.g. "kokopop.text_encoder.lstm.weight_ih_l0").
+    std::unordered_map<std::string, std::vector<float>> lstm_w_ih_f32;
+
     // Scratch storage for LstmCustomParams instances built during graph
     // construction.  Reserve 24 slots before building the generation graph
     // (12 LSTM directions × safety margin) so no reallocation occurs and

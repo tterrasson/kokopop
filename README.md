@@ -13,6 +13,8 @@ A standalone C++ library and toolkit for running [Kokoro](https://github.com/hex
 - **WAV output** and optional direct playback (Core Audio on macOS)
 - **Full C & C++ API** — usable from C, C++, Rust, Go, and other languages via FFI
 
+📊 See [Benchmarks](#benchmarks)
+
 ## Quick Start
 
 ### Prerequisites
@@ -480,6 +482,38 @@ Run `kokopop_rt` to get a detailed per-chunk real-time factor breakdown:
   Overall RT:         4.41x
   TTFB (1st chunk):  1273.4 ms
   → 4.4x faster than real-time
+```
+
+**Hardware:** NVIDIA GeForce RTX 4090, **Backend:** CUDA, **Threads:** 16
+
+```
+  Backend:     CUDA
+  Voice:       af_heart
+  Threads:     16
+  Sample Rate: 24000 Hz
+  Sentences:   10 → 9 chunk(s) (874 tokens)
+
+  Prepare time:       3.5 ms (chunking + phonemization)
+
+  ┌──────┬────────┬────────────┬──────────┬──────────┬──────────┐
+  │ Chunk│ Tokens │  Gen Time  │ Duration │    RT    │ Samples  │
+  ├──────┼────────┼────────────┼──────────┼──────────┼──────────┤
+  │     1│     183│    829.5ms │    11.84s│    14.27x│    284040│
+  │     2│      25│     97.1ms │     2.04s│    21.01x│     48960│
+  │     3│     127│    445.3ms │     7.79s│    17.49x│    186960│
+  │     4│      38│    126.0ms │     2.52s│    19.96x│     60360│
+  │     5│     233│   1095.9ms │    15.24s│    13.91x│    365760│
+  │     6│      40│    133.9ms │     2.59s│    19.34x│     62160│
+  │     7│      92│    311.0ms │     5.71s│    18.38x│    137160│
+  │     8│      63│    205.4ms │     3.84s│    18.69x│     92160│
+  │     9│      73│    230.2ms │     4.17s│    18.11x│    100080│
+  └──────┴────────┴────────────┴──────────┴──────────┴──────────┘
+
+  Total Generation:  3474.4 ms
+  Total Audio:        55.74 s  (1337640 samples @ 24000 Hz)
+  Overall RT:        16.04x
+  TTFB (1st chunk):   829.5 ms
+  → 16.0x faster than real-time
 ```
 
 ## License

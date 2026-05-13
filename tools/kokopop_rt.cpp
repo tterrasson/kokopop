@@ -251,7 +251,7 @@ void print_table_footer() {
 
 void print_summary(const std::vector<ChunkResult> & results,
                    double total_gen_ms, double total_audio_s,
-                   double overall_rt, double ttfb_ms, int sample_rate) {
+                   double overall_rt, double ttfb_warm_ms, double ttfb_cold_ms, int sample_rate) {
     std::printf("\n");
     std::printf("  Total Generation:  %6.1f ms\n", total_gen_ms);
     std::printf("  Total Audio:       %6.2f s  (%7zu samples @ %d Hz)\n",
@@ -260,7 +260,8 @@ void print_summary(const std::vector<ChunkResult> & results,
                    [](size_t acc, const ChunkResult & cr) { return acc + cr.n_samples; }),
                sample_rate);
     std::printf("  Overall RT:        %5.2fx\n", overall_rt);
-    std::printf("  TTFB (1st chunk):  %6.1f ms\n", ttfb_ms);
+    std::printf("  TTFB warm-start:   %6.1f ms (1st chunk inference)\n", ttfb_warm_ms);
+    std::printf("  TTFB cold-start:   %6.1f ms (load + prepare + 1st chunk)\n", ttfb_cold_ms);
 
     if (total_audio_s <= 0.0) {
         std::printf("  → no audio generated (check voice/model compatibility)\n");
@@ -310,6 +311,8 @@ int main(int argc, char ** argv) {
     model_opts.n_threads = opts.threads;
     model_opts.backend = opts.backend;
 
+    const auto t_cold_start = now_us();
+    const auto t_load_start = t_cold_start;
     kokopop_model * model_handle = nullptr;
     {
         std::fprintf(stderr, "[kokopop_rt] Loading model: %s\n", opts.model_path.c_str());
@@ -319,6 +322,7 @@ int main(int argc, char ** argv) {
             return 1;
         }
     }
+    const double t_load_ms = ms(now_us() - t_load_start);
 
     auto model_guard = std::unique_ptr<kokopop_model, void(*)(kokopop_model *)>(
         model_handle, kokopop_model_free);
@@ -363,7 +367,13 @@ int main(int argc, char ** argv) {
     // ---- Print header ----
     print_header(backend_name, voice.c_str(), opts.threads, sample_rate,
                 opts.n_sentences, n_chunks, total_tokens);
+    std::printf("  Model load time: %6.1f ms\n", t_load_ms);
     std::printf("  Prepare time:    %6.1f ms (chunking + phonemization)\n\n", t_prepare_ms);
+
+    // ---- Capture cold-start breakdown ----
+    const double t_load_prepare_ms = ms(now_us() - t_cold_start);
+    std::fprintf(stderr, "[kokopop_rt] cold-start breakdown: load=%.1fms prepare=%.1fms total=%.1fms\n",
+                t_load_ms, t_prepare_ms, t_load_prepare_ms);
 
     // ---- Infer each chunk (Phase 2) with timing ----
     print_table_header();
@@ -371,7 +381,8 @@ int main(int argc, char ** argv) {
     std::vector<ChunkResult> results;
     results.reserve(n_chunks);
 
-    double ttfb_ms = 0.0;  // Time to first byte (first chunk gen time)
+    double ttfb_warm_ms = 0.0;  // 1st chunk inference only
+    double ttfb_cold_ms = 0.0;  // model load → 1st chunk complete
     double total_gen_ms = 0.0;
     double total_audio_s = 0.0;
 
@@ -404,7 +415,8 @@ int main(int argc, char ** argv) {
         cr.rt_ratio = rt_ratio;
 
         if (i == 0) {
-            ttfb_ms = t_chunk_ms;
+            ttfb_warm_ms = t_chunk_ms;
+            ttfb_cold_ms = t_load_prepare_ms + t_chunk_ms;
         }
 
         total_gen_ms += t_chunk_ms;
@@ -423,7 +435,7 @@ int main(int argc, char ** argv) {
         ? (total_audio_s / (total_gen_ms / 1000.0))
         : 0.0;
 
-    print_summary(results, total_gen_ms, total_audio_s, overall_rt, ttfb_ms, sample_rate);
+    print_summary(results, total_gen_ms, total_audio_s, overall_rt, ttfb_warm_ms, ttfb_cold_ms, sample_rate);
 
     // ---- Suppress streaming stderr noise (already printed during infer) ----
     // The streaming module prints to stderr; we leave that visible for debugging.
