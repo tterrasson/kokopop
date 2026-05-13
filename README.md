@@ -88,12 +88,13 @@ uv run python tools/convert_kokoro_to_gguf.py \
 
 > **Note:** The Kokoro PyTorch model is automatically downloaded from [Hugging Face](https://huggingface.co/hexgrad/Kokoro-82M) on first run.
 
-Two tiers are available:
+Three tiers are available:
 
-| Tier        | Description                          |
-|-------------|--------------------------------------|
-| `kokoro-md` | Balanced (Q5_K/Q6_K, ~default)       |
-| `kokoro-lg` | Quality first (Q6_K/Q8_0)            |
+| Tier         | Description                                   |
+|--------------|-----------------------------------------------|
+| `kokoro-md`  | Balanced (Q5_K/Q6_K, ~default)                |
+| `kokoro-lg`  | Quality first (Q6_K/Q8_0)                     |
+| `kokoro-f16` | Diagnostic — all quantizable tensors at F16   |
 
 ### Usage
 
