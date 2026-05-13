@@ -480,19 +480,6 @@ static bool cpu_istft_data(Model & model, const float * post_data, int64_t n_fra
         return post_data[static_cast<size_t>(c * n_frames + t)];
     };
 
-    double log_mag_sum = 0.0;
-    int64_t log_mag_count = 0;
-    for (int64_t frame = 0; frame < n_frames; ++frame) {
-        for (int k = 0; k <= n_fft / 2; ++k) {
-            log_mag_sum += post_at(k, frame);
-            ++log_mag_count;
-        }
-    }
-    const float log_mag_mean = log_mag_count > 0
-        ? static_cast<float>(log_mag_sum / static_cast<double>(log_mag_count))
-        : -6.0f;
-    const float log_mag_offset = log_mag_mean > -3.0f ? log_mag_mean + 5.0f : 0.0f;
-
     // Precompute window² once per thread — same for every frame.
     static thread_local float win_sq[n_fft];
     static thread_local bool  win_sq_init = false;
@@ -505,8 +492,7 @@ static bool cpu_istft_data(Model & model, const float * post_data, int64_t n_fra
         float real[n_fft / 2 + 1]{};
         float imag[n_fft / 2 + 1]{};
         for (int k = 0; k <= n_fft / 2; ++k) {
-            const float log_mag = post_at(k, frame) - log_mag_offset;
-            const float mag = std::exp(std::clamp(log_mag, -20.0f, 3.0f));
+            const float mag = std::exp(std::clamp(post_at(k, frame), -20.0f, 8.0f));
             const float phase = std::sin(post_at(k + n_fft / 2 + 1, frame));
             const float sin_ph = std::sin(phase);
             const float cos_ph = std::cos(phase);
@@ -529,28 +515,12 @@ static bool cpu_istft_data(Model & model, const float * post_data, int64_t n_fra
         }
     }
     out.resize(static_cast<size_t>(out_len));
-    double out_sum_sq = 0.0;
-    float out_peak = 0.0f;
     for (int64_t i = 0; i < out_len; ++i) {
         const int64_t src = i + center_pad;
         const float d = denom[static_cast<size_t>(src)];
-        const float v = d > 1e-8f ? y[static_cast<size_t>(src)] / d : 0.0f;
-        out[static_cast<size_t>(i)] = v;
-        out_sum_sq += static_cast<double>(v) * static_cast<double>(v);
-        out_peak = std::max(out_peak, std::fabs(v));
-    }
-
-    const float out_rms = static_cast<float>(
-        std::sqrt(out_sum_sq / static_cast<double>(std::max<int64_t>(1, out_len))));
-    float gain = 1.0f;
-    if (out_peak > 0.95f) {
-        gain = std::min(gain, 0.8f / out_peak);
-    }
-    if (out_rms > 0.12f) {
-        gain = std::min(gain, 0.08f / out_rms);
-    }
-    for (float & v : out) {
-        v = std::clamp(v * gain, -1.0f, 1.0f);
+        out[static_cast<size_t>(i)] = std::clamp(
+            d > 1e-8f ? y[static_cast<size_t>(src)] / d : 0.0f,
+            -1.0f, 1.0f);
     }
     return !out.empty();
 }
@@ -690,6 +660,11 @@ bool ggml_generator(
     ggml_tensor * noise_conv_b[2] = {nullptr, nullptr};
 
     ggml_tensor * stage_debug[2] = {nullptr, nullptr};
+    ggml_tensor * dbg_noise_conv[2] = {nullptr, nullptr};
+    ggml_tensor * dbg_noise_res[2]  = {nullptr, nullptr};
+    ggml_tensor * dbg_ups[2]        = {nullptr, nullptr};
+    ggml_tensor * dbg_pre_rb[2]     = {nullptr, nullptr};
+    const bool post_stats = std::getenv("KOKOPOP_POST_STATS") != nullptr;
     for (int stage = 0; stage < 2; ++stage) {
         noise_conv_w[stage] = require_tensor(model, noise_conv_weights[stage][0], error);
         noise_conv_b[stage] = require_tensor(model, noise_conv_weights[stage][1], error);
@@ -708,11 +683,23 @@ bool ggml_generator(
             ctx,
             conv1d(ctx, noise_conv_w[stage], har_t, sp.noise_stride, sp.noise_padding, 1, sp.noise_kernel),
             noise_conv_b[stage]);
+        if (post_stats) {
+            x_source = ggml_cont(ctx, x_source);
+            ggml_set_name(x_source, stage == 0 ? "dbg_noise_conv0" : "dbg_noise_conv1");
+            ggml_set_output(x_source);
+            dbg_noise_conv[stage] = x_source;
+        }
 
         x_source = graph_generator_resblock(ctx, model, x_source, style_t, sp.noise_prefix, sp.kernel, error);
         if (x_source == nullptr) {
             ggml_free(ctx);
             return false;
+        }
+        if (post_stats) {
+            x_source = ggml_cont(ctx, x_source);
+            ggml_set_name(x_source, stage == 0 ? "dbg_noise_res0" : "dbg_noise_res1");
+            ggml_set_output(x_source);
+            dbg_noise_res[stage] = x_source;
         }
 
         ggml_tensor * up_w = require_tensor(model, sp.up_weight, error);
@@ -724,12 +711,24 @@ bool ggml_generator(
 
         const int64_t out_len = (x->ne[0] - 1) * sp.up_stride - 2 * sp.up_padding + up_w->ne[0];
         x = conv_transpose1d_crop_bias(ctx, model, up_w, x, up_b, sp.up_stride, sp.up_padding, static_cast<int>(out_len));
+        if (post_stats) {
+            x = ggml_cont(ctx, x);
+            ggml_set_name(x, stage == 0 ? "dbg_ups0" : "dbg_ups1");
+            ggml_set_output(x);
+            dbg_ups[stage] = x;
+        }
 
         if (stage == 1) {
             x = ggml_pad_reflect_1d(ctx, x, 1, 0);
         }
 
         x = ggml_add(ctx, x, x_source);
+        if (post_stats) {
+            x = ggml_cont(ctx, x);
+            ggml_set_name(x, stage == 0 ? "dbg_pre_rb0" : "dbg_pre_rb1");
+            ggml_set_output(x);
+            dbg_pre_rb[stage] = x;
+        }
 
         ggml_tensor * accum = nullptr;
         for (int k = 0; k < 3; ++k) {
@@ -775,11 +774,13 @@ bool ggml_generator(
     int64_t t0g = gen_profile ? ggml_time_us() : 0;
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, generator_graph_size(decoder.length), false);
     ggml_build_forward_expand(gf, post);
-    if (std::getenv("KOKOPOP_POST_STATS") != nullptr) {
+    if (post_stats) {
         for (int stage = 0; stage < 2; ++stage) {
-            if (stage_debug[stage] != nullptr) {
-                ggml_build_forward_expand(gf, stage_debug[stage]);
-            }
+            if (stage_debug[stage] != nullptr) ggml_build_forward_expand(gf, stage_debug[stage]);
+            if (dbg_noise_conv[stage]) ggml_build_forward_expand(gf, dbg_noise_conv[stage]);
+            if (dbg_noise_res[stage])  ggml_build_forward_expand(gf, dbg_noise_res[stage]);
+            if (dbg_ups[stage])        ggml_build_forward_expand(gf, dbg_ups[stage]);
+            if (dbg_pre_rb[stage])     ggml_build_forward_expand(gf, dbg_pre_rb[stage]);
         }
         ggml_build_forward_expand(gf, pre_post);
     }
@@ -835,9 +836,21 @@ bool ggml_generator(
     model.backend->tensor_get(post, post_data.data(), 0, post_size * sizeof(float));
 
     if (std::getenv("KOKOPOP_POST_STATS") != nullptr) {
+        const char * dump_dir = std::getenv("KOKOPOP_DUMP_DIR");
         auto print_tensor_stats = [&](const char * label, ggml_tensor * t) {
             std::vector<float> data(static_cast<size_t>(ggml_nelements(t)));
             model.backend->tensor_get(t, data.data(), 0, data.size() * sizeof(float));
+            if (dump_dir) {
+                char path[512];
+                std::snprintf(path, sizeof(path), "%s/cpp_%s.bin", dump_dir, label);
+                if (FILE * f = std::fopen(path, "wb")) {
+                    int32_t hdr[4] = {static_cast<int32_t>(t->ne[0]), static_cast<int32_t>(t->ne[1]),
+                                      static_cast<int32_t>(t->ne[2]), static_cast<int32_t>(t->ne[3])};
+                    std::fwrite(hdr, sizeof(hdr), 1, f);
+                    std::fwrite(data.data(), sizeof(float), data.size(), f);
+                    std::fclose(f);
+                }
+            }
             double sum = 0.0;
             double sum_sq = 0.0;
             float min_v = std::numeric_limits<float>::infinity();
@@ -859,6 +872,11 @@ bool ggml_generator(
                          max_v);
         };
         for (int stage = 0; stage < 2; ++stage) {
+            char buf[32];
+            if (dbg_noise_conv[stage]) { std::snprintf(buf, sizeof(buf), "noise_conv%d", stage); print_tensor_stats(buf, dbg_noise_conv[stage]); }
+            if (dbg_noise_res[stage])  { std::snprintf(buf, sizeof(buf), "noise_res%d",  stage); print_tensor_stats(buf, dbg_noise_res[stage]);  }
+            if (dbg_ups[stage])        { std::snprintf(buf, sizeof(buf), "ups%d",        stage); print_tensor_stats(buf, dbg_ups[stage]);        }
+            if (dbg_pre_rb[stage])     { std::snprintf(buf, sizeof(buf), "pre_rb%d",     stage); print_tensor_stats(buf, dbg_pre_rb[stage]);     }
             if (stage_debug[stage] != nullptr) {
                 print_tensor_stats(stage == 0 ? "stage0" : "stage1", stage_debug[stage]);
             }

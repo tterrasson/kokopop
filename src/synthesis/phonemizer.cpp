@@ -301,7 +301,15 @@ bool phonemize_text(const std::string & text, const std::string & voice, std::st
                 phonemize_fragment(fragment, out);
                 fragment.clear();
                 if (had_content) {
-                    append_part(out, std::string(ch));
+                    // Glue punctuation to the preceding phoneme (no leading space),
+                    // matching Python kokoro's `həlˈO, wˈɜɹld.` shape. A leading
+                    // space inflates the phoneme codepoint count (which drives
+                    // voice-style row selection) and produces unstable model
+                    // output for some sequences.
+                    while (!out.empty() && out.back() == ' ') {
+                        out.pop_back();
+                    }
+                    out += std::string(ch);
                 }
             } else {
                 fragment.append(ch);

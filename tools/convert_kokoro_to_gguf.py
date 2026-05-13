@@ -78,7 +78,7 @@ _GGML_BLOCK_SIZES: dict[int, int] = {
     GGML_TYPE_F32: 1,
 }
 
-VALID_TIERS = ("kokoro-md", "kokoro-lg")
+VALID_TIERS = ("kokoro-md", "kokoro-lg", "kokoro-f16")
 
 # Patterns indicating a regular Conv1d weight (gets reshape [OC,IC,K] -> [OC,IC*K]).
 # The runtime calls `conv1d()` with these — they MUST all be reshaped to 2D so
@@ -201,6 +201,28 @@ def _tier_type(tier: str, logical: str, ndim: int) -> int:
 
     # ConvTranspose1d (vocoder upsampling) — runtime keeps it F16.
     if ".ups." in logical:
+        return GGML_TYPE_F16
+
+    # Acoustic path (predictor + decoder + vocoder generator + text_encoder +
+    # bert_encoder) must stay at F16. K-quant / Q8_0 weights produce small
+    # per-element errors that compound through the AdaIN + Snake1D stack inside
+    # the generator and the AdaIN-LeakyReLU stack inside the predictor F0/N
+    # branches and decoder encode/decode blocks. For some (voice row, phoneme)
+    # combinations the cumulative error tips the output into near-silence or
+    # full saturation, even though Python at FP32 stays in range. F16 is
+    # empirically the coarsest representation that stays stable.
+    # Only the (large) ALBERT BERT, which only feeds duration encoding via a
+    # linear projection, can be safely quantized.
+    if (
+        logical.startswith("kokopop.predictor.")
+        or logical.startswith("kokopop.decoder.")
+        or logical.startswith("kokopop.text_encoder.")
+        or logical.startswith("kokopop.bert_encoder.")
+    ):
+        return GGML_TYPE_F16
+
+    # Diagnostic tier: everything quantizable goes to F16. No K-quant lossy fits.
+    if tier == "kokoro-f16":
         return GGML_TYPE_F16
 
     # Per-tier mapping of every other 2D+ tensor.
