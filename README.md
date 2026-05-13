@@ -209,7 +209,7 @@ Available endpoints:
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/tts` | `POST` | Synthesize text to audio — PCM float32 stream or complete WAV file |
+| `/tts` | `POST` | Synthesize text to audio — PCM float32 stream, Ogg/Opus stream, or complete WAV file |
 | `/health` | `GET` | Server health check |
 | `/voices` | `GET` | List voices embedded in the GGUF model |
 
@@ -230,6 +230,12 @@ curl -X POST http://localhost:8080/tts \
   -H 'Content-Type: application/json' \
   -d '{"text": "Hello world", "voice": "ff_siwis", "format": "wav"}' \
   -o output.wav
+
+# Stream Ogg/Opus
+curl -X POST http://localhost:8080/tts \
+  -H 'Content-Type: application/json' \
+  -d '{"text": "Hello world", "voice": "af_heart", "format": "ogg"}' \
+  -o output.ogg
 ```
 
 Request body fields:
@@ -241,6 +247,7 @@ Request body fields:
 | `speed` | float | Synthesis speed (default: from CLI `--speed`) |
 | `mode` | string | `interactive` (default) or `long_form` |
 | `format` | string | `pcm` (default) — raw float32 stream; `wav` — complete WAV file; `ogg` — Ogg/Opus stream |
+| `chunking` | object | Optional stable chunking overrides; see the client options below for field names |
 
 #### Python client (`tools/tts_client.py`)
 
@@ -252,13 +259,23 @@ A minimal Python client is provided. It requires no third-party packages.
   --model models/kokoro.gguf \
   --voice af_heart --http --port 8080
 
-# Stream ogg/opus and play in real time (requires ffplay)
+# Stable Ogg/Opus playback for longer text (requires ffplay)
 uv run python tools/tts_client.py \
   --file examples/english.txt \
   --format ogg \
-  --prebuffer-chunks 3 \
-  --chunk-target-min 20 \
-  --chunk-target-max 50 \
+  --mode long_form \
+  --prebuffer-chunks 2 \
+  --voice af_bella | ffplay -i pipe:0
+
+# Lower-latency first audio. Smaller first chunks can start faster, but may be
+# less stable than long_form for continuous playback.
+uv run python tools/tts_client.py \
+  --file examples/english.txt \
+  --format ogg \
+  --chunk-target-min 40 \
+  --chunk-target-max 120 \
+  --chunk-first-max 60 \
+  --prebuffer-chunks 2 \
   --voice af_bella | ffplay -i pipe:0
 
 uv run python tools/tts_client.py \
@@ -298,6 +315,19 @@ All options:
 | `--chunk-sentence-pause` | preset | Pause between sentences in ms |
 | `--chunk-paragraph-pause` | preset | Pause between paragraphs in ms |
 | `--chunk-crossfade` | preset | Crossfade between chunks in ms |
+
+The client sends these overrides as a `chunking` JSON object:
+
+| CLI option | JSON field |
+|---|---|
+| `--chunk-target-min` | `target_min_tokens` |
+| `--chunk-target-max` | `target_max_tokens` |
+| `--chunk-soft-max` | `soft_max_tokens` |
+| `--chunk-hard-max` | `hard_max_tokens` |
+| `--chunk-first-max` | `first_chunk_target_max_tokens` |
+| `--chunk-sentence-pause` | `sentence_pause_ms` |
+| `--chunk-paragraph-pause` | `paragraph_pause_ms` |
+| `--chunk-crossfade` | `crossfade_ms` |
 
 ## Library Integration
 

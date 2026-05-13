@@ -21,7 +21,7 @@ Usage:
     # Save Ogg/Opus to file
     uv run python tools/tts_client.py "Hello world" --format ogg --out hello.ogg
 
-    # Override chunking params (patches the mode preset)
+    # Override stable chunking params (patches the mode preset)
     uv run python tools/tts_client.py "Hello world" \\
         --chunk-target-max 80 --chunk-first-max 40 \\
         --chunk-crossfade 15 --chunk-sentence-pause 100 \\
@@ -209,7 +209,7 @@ def _read_ogg_stream_by_chunk_count(resp: BinaryIO, emit_stdout: bool,
     return b"".join(chunks)
 
 
-def _read_ogg_stream(resp: BinaryIO, emit_stdout: bool, prebuffer_mode: str,
+def _read_ogg_stream(resp: BinaryIO, emit_stdout: bool,
                      prebuffer_ms: int, burst_gap_ms: int,
                      prebuffer_chunks: int) -> bytes:
     if prebuffer_chunks > 0:
@@ -303,7 +303,6 @@ def stream_ogg(
     mode: str,
     url: str,
     emit_stdout: bool,
-    prebuffer_mode: str,
     prebuffer_ms: int,
     burst_gap_ms: int,
     prebuffer_chunks: int,
@@ -311,7 +310,7 @@ def stream_ogg(
 ) -> bytes:
     payload = _build_payload(text, voice, speed, mode, "ogg", chunking)
     def read_fn(resp):
-        return _read_ogg_stream(resp, emit_stdout, prebuffer_mode,
+        return _read_ogg_stream(resp, emit_stdout,
                                 prebuffer_ms, burst_gap_ms, prebuffer_chunks)
     return _send_tts(url, payload, read_fn)
 
@@ -329,10 +328,6 @@ def main() -> None:
                         default="interactive", help="Synthesis mode")
     parser.add_argument("--format", choices=["pcm", "wav", "ogg"], default="pcm",
                         dest="fmt", help="Output format: pcm (float32), wav, or ogg (Opus)")
-    parser.add_argument("--prebuffer-mode", choices=["duration"],
-                        default="duration",
-                        help="Ogg/Opus startup buffering strategy (default: duration). "
-                             "Use --prebuffer-chunks for chunk-count-based buffering.")
     parser.add_argument("--prebuffer-ms", type=int, default=DEFAULT_OGG_PREBUFFER_MS,
                         help="Ogg/Opus audio to buffer before writing to stdout "
                              f"(default: {DEFAULT_OGG_PREBUFFER_MS}; use 0 for immediate)")
@@ -355,28 +350,12 @@ def main() -> None:
                            help="Hard max tokens per chunk (default: preset)")
     chunk_grp.add_argument("--chunk-first-max", type=int, default=None,
                            help="First-chunk target max for low TTFB (default: preset)")
-    chunk_grp.add_argument("--chunk-allow-short-first", dest="allow_short_first",
-                           action="store_true", default=None,
-                           help="Allow a short first chunk (default: preset)")
-    chunk_grp.add_argument("--chunk-no-short-first", dest="allow_short_first",
-                           action="store_false",
-                           help="Disable short first chunk (default: preset)")
-    chunk_grp.add_argument("--chunk-comma-pause", type=int, default=None,
-                           help="Comma pause in ms (default: preset)")
     chunk_grp.add_argument("--chunk-sentence-pause", type=int, default=None,
                            help="Sentence pause in ms (default: preset)")
     chunk_grp.add_argument("--chunk-paragraph-pause", type=int, default=None,
                            help="Paragraph pause in ms (default: preset)")
     chunk_grp.add_argument("--chunk-crossfade", type=int, default=None,
                            help="Crossfade between chunks in ms (default: preset)")
-    chunk_grp.add_argument("--chunk-trim-silence", dest="trim_silence",
-                           action="store_true", default=None,
-                           help="Enable silence trimming (default: preset)")
-    chunk_grp.add_argument("--chunk-no-trim", dest="trim_silence",
-                           action="store_false",
-                           help="Disable silence trimming (default: preset)")
-    chunk_grp.add_argument("--chunk-max-trim", type=int, default=None,
-                           help="Max silence trim in ms (default: preset)")
     parser.add_argument("--out", default=None,
                         help="Output file (.wav). If omitted and format=pcm, "
                              "raw PCM is written to stdout.")
@@ -398,20 +377,14 @@ def main() -> None:
         ("chunk_soft_max", "soft_max_tokens"),
         ("chunk_hard_max", "hard_max_tokens"),
         ("chunk_first_max", "first_chunk_target_max_tokens"),
-        ("chunk_comma_pause", "comma_pause_ms"),
         ("chunk_sentence_pause", "sentence_pause_ms"),
         ("chunk_paragraph_pause", "paragraph_pause_ms"),
         ("chunk_crossfade", "crossfade_ms"),
-        ("chunk_max_trim", "max_silence_trim_ms"),
     ]
     for cli_name, json_name in field_map:
         val = getattr(args, cli_name)
         if val is not None:
             _chunking[json_name] = val
-    if args.allow_short_first is not None:
-        _chunking["allow_short_first_chunk"] = args.allow_short_first
-    if args.trim_silence is not None:
-        _chunking["trim_silence"] = args.trim_silence
     chunking = _chunking if _chunking else None
 
     if args.fmt == "wav":
@@ -424,8 +397,7 @@ def main() -> None:
     elif args.fmt == "ogg":
         emit_stdout = args.out is None and not sys.stdout.buffer.isatty()
         ogg = stream_ogg(text, args.voice, args.speed, args.mode, args.url,
-                         emit_stdout, args.prebuffer_mode,
-                         args.prebuffer_ms, args.prebuffer_gap_ms,
+                         emit_stdout, args.prebuffer_ms, args.prebuffer_gap_ms,
                          args.prebuffer_chunks, chunking)
         if args.out:
             Path(args.out).write_bytes(ogg)
