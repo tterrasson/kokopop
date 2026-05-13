@@ -27,7 +27,7 @@ FetchContent_Declare(
   ggml
   GIT_REPOSITORY https://github.com/ggml-org/ggml.git
   GIT_TAG        a056a26f508b6160438ddd8aabbc859d2a2e7a97
-  GIT_SHALLOW    TRUE
+  GIT_SHALLOW    FALSE
   # Fix 4: dispatch CONV_TRANSPOSE_1D with 32 threads/group and simd_sum
   #         reduction, avoiding GPU watchdog on large generator dims.
   # Apply only when the patch still matches. This keeps re-configure
