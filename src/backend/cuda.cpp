@@ -50,19 +50,13 @@ class CudaBackend final : public Backend {
         // supported by CUDA and for cross-backend fallback/copies.
         ggml_backend_t backends[] = { backend_, cpu_backend_ };
 
-        // Keep an escape hatch for diagnosing scheduler-copy or pipeline issues.
-        const bool parallel = []() {
-            const char * env = std::getenv("KOKOPOP_CUDA_PARALLEL");
-            return env ? std::atoi(env) != 0 : true;
-        }();
-
         sched_ = ggml_backend_sched_new(
             backends,
             nullptr,
             2,
             required,
-            false,
-            parallel);
+            true,
+            true);
 
         if (sched_ != nullptr) {
             sched_capacity_ = required;
