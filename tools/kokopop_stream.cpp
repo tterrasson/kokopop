@@ -32,12 +32,13 @@ namespace {
 void usage(const char * argv0) {
     std::fputs("usage: ", stderr);
     std::fputs(argv0, stderr);
-    std::fputs(" --model kokoro.gguf --voice ff_siwis "
-        "[--speed 1.0] [--mode interactive|long_form] [--threads N] [--backend cpu|metal|cuda]\n"
+    std::fputs(" --model kokoro.gguf "
+        "[--voice NAME] [--speed 1.0] [--mode interactive|long_form] [--threads N] [--backend cpu|metal|cuda]\n"
         "       [--out out.wav]\n"
+        "       [--http] [--port N] [--bind ADDR]\n"
         "\n"
         "stdio mode (default):\n"
-        "  Reads JSON commands from stdin, streams raw audio (float32) to stdout.\n"
+        "  --voice is required. Reads JSON commands from stdin, streams raw audio (float32) to stdout.\n"
         "  JSON protocol (one command per line):\n"
         "    {{\"text\": \"Hello world\"}}              >> accumulate text\n"
         "    {{\"text\": \"Hello\", \"flush\": true}}    >> add text and generate\n"
@@ -45,14 +46,14 @@ void usage(const char * argv0) {
         "    {{\"stop\": true}}                         >> stop streaming\n"
         "\n"
         "HTTP server mode:\n"
-        "  kokopop_stream --model m.gguf --voice ff_siwis --http --port 8080\n"
-        "    POST /tts  - Synthesize text to audio\n"
+        "  kokopop_stream --model m.gguf --http --port 8080\n"
+        "    POST /tts  - Synthesize text to audio (voice is required in JSON payload)\n"
         "    GET  /health - Server health check\n"
         "    GET  /voices - List voices embedded in the GGUF model\n"
         "\n"
         "Options:\n"
         "  --model PATH    Path to Kokoro GGUF model\n"
-        "  --voice NAME    Default voice name (e.g., ff_siwis)\n"
+        "  --voice NAME    Voice name for stdio mode (required without --http)\n"
         "  --speed FLOAT   Synthesis speed (default: 1.0)\n"
         "  --mode MODE     interactive (default) or long_form\n"
         "  --out PATH      Save full audio to WAV file (stdio mode)\n"
@@ -71,10 +72,10 @@ void usage(const char * argv0) {
         "\n"
         "  # HTTP mode\n", stderr);
     std::fputs(argv0, stderr);
-    std::fputs(" --model m.gguf --voice ff_siwis --http --port 8080\n"
+    std::fputs(" --model m.gguf --http --port 8080\n"
         "  curl -X POST http://localhost:8080/tts \\\n"
         "    -H 'Content-Type: application/json' \\\n"
-        "    -d '{{\"text\":\"Hello world\"}}'\n", stderr);
+        "    -d '{{\"text\":\"Hello world\", \"voice\":\"ff_siwis\"}}'\n", stderr);
 }
 
 const char * arg_value(int & i, int argc, char ** argv) {
@@ -272,7 +273,12 @@ int main(int argc, char ** argv) {
         return 2;
     }
 
-    if (model_path.empty() || voice.empty()) {
+    if (model_path.empty()) {
+        usage(argv[0]);
+        return 2;
+    }
+    if (!http_mode && voice.empty()) {
+        std::fprintf(stderr, "error: --voice is required for stdio mode\n");
         usage(argv[0]);
         return 2;
     }

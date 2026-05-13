@@ -568,13 +568,11 @@ void AsyncHttpServer::_dispatch_request(int fd, Connection & conn) {
         if (req.method != "POST") {
             _send_error(fd, conn, 405, "Method Not Allowed",
                         json_error("POST required"));
-            _close_connection(fd);
             return;
         }
         if (!_scheduler) {
             _send_error(fd, conn, 503, "Service Unavailable",
                         json_error("Scheduler not configured"));
-            _close_connection(fd);
             return;
         }
 
@@ -586,7 +584,6 @@ void AsyncHttpServer::_dispatch_request(int fd, Connection & conn) {
         if (!doc) {
             _send_error(fd, conn, 400, "Bad Request",
                         json_error(std::string("JSON parse error: ") + err.msg));
-            _close_connection(fd);
             return;
         }
 
@@ -595,7 +592,6 @@ void AsyncHttpServer::_dispatch_request(int fd, Connection & conn) {
             yyjson_doc_free(doc);
             _send_error(fd, conn, 400, "Bad Request",
                         json_error("JSON is not an object"));
-            _close_connection(fd);
             return;
         }
 
@@ -648,7 +644,14 @@ void AsyncHttpServer::_dispatch_request(int fd, Connection & conn) {
             else if (fs == "ogg") fmt = RequestContext::AudioFormat::OGG_OPUS;
         }
 
-        std::string current_voice = voice ? voice : _default_voice.c_str();
+        if (!voice || std::string(voice).empty()) {
+            yyjson_doc_free(doc);
+            _send_error(fd, conn, 400, "Bad Request",
+                        json_error("Missing or empty 'voice' field"));
+            return;
+        }
+
+        std::string current_voice(voice);
         StreamMode current_mode = _stream_mode;
         if (mode_str) {
             if (std::string(mode_str) == "long_form") {
@@ -657,7 +660,6 @@ void AsyncHttpServer::_dispatch_request(int fd, Connection & conn) {
                 yyjson_doc_free(doc);
                 _send_error(fd, conn, 400, "Bad Request",
                             json_error(std::string("Unknown mode: ") + mode_str));
-                _close_connection(fd);
                 return;
             }
         }
@@ -666,7 +668,6 @@ void AsyncHttpServer::_dispatch_request(int fd, Connection & conn) {
             yyjson_doc_free(doc);
             _send_error(fd, conn, 400, "Bad Request",
                         json_error("Missing or empty 'text' field"));
-            _close_connection(fd);
             return;
         }
 
@@ -675,7 +676,6 @@ void AsyncHttpServer::_dispatch_request(int fd, Connection & conn) {
         if (text_str.size() > 100000) {
             _send_error(fd, conn, 413, "Payload Too Large",
                         json_error("Text too long (max 100,000 chars)"));
-            _close_connection(fd);
             return;
         }
 

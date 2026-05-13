@@ -192,11 +192,7 @@ JSON protocol (one command per line):
 Start an async, event-driven HTTP server for TTS synthesis. Uses `poll()` for non-blocking I/O with a `SynthesisScheduler` for round-robin chunk interleaving across concurrent requests:
 
 ```bash
-./build/kokopop_stream \
-  --model models/kokoro.gguf \
-  --voice af_heart \
-  --http \
-  --port 8080
+./build/kokopop_stream --model models/kokoro.gguf --http --port 8080
 ```
 
 **Options:**
@@ -257,9 +253,7 @@ A minimal Python client is provided. It requires no third-party packages.
 
 ```bash
 # Start the server first
-./build/kokopop_stream \
-  --model models/kokoro.gguf \
-  --voice af_heart --http --port 8080
+./build/kokopop_stream --model models/kokoro.gguf --http --port 8080
 
 # Stable Ogg/Opus playback for longer text (requires ffplay)
 uv run python tools/tts_client.py \
