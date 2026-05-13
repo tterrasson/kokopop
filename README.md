@@ -103,7 +103,7 @@ Synthesize text to a WAV file:
 ./build/kokopop_say \
   --model models/kokoro.gguf \
   --voice af_heart \
-  --text "Hello, world!" \
+  --text "Hello world." \
   --out hello.wav
 ```
 
@@ -113,7 +113,7 @@ Synthesize and play directly (macOS):
 ./build/kokopop_say \
   --model models/kokoro.gguf \
   --voice af_heart \
-  --text "Hello, world!" \
+  --text "Hello world." \
   --play
 ```
 
@@ -133,7 +133,7 @@ Adjust generation speed:
 ./build/kokopop_say \
   --model models/kokoro.gguf \
   --voice af_heart \
-  --text "Hello, world!" \
+  --text "Hello John, how are you today?" \
   --speed 1.5 \
   --out fast.wav
 ```

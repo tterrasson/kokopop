@@ -480,6 +480,19 @@ static bool cpu_istft_data(Model & model, const float * post_data, int64_t n_fra
         return post_data[static_cast<size_t>(c * n_frames + t)];
     };
 
+    double log_mag_sum = 0.0;
+    int64_t log_mag_count = 0;
+    for (int64_t frame = 0; frame < n_frames; ++frame) {
+        for (int k = 0; k <= n_fft / 2; ++k) {
+            log_mag_sum += post_at(k, frame);
+            ++log_mag_count;
+        }
+    }
+    const float log_mag_mean = log_mag_count > 0
+        ? static_cast<float>(log_mag_sum / static_cast<double>(log_mag_count))
+        : -6.0f;
+    const float log_mag_offset = log_mag_mean > -3.0f ? log_mag_mean + 5.0f : 0.0f;
+
     // Precompute window² once per thread — same for every frame.
     static thread_local float win_sq[n_fft];
     static thread_local bool  win_sq_init = false;
@@ -492,7 +505,8 @@ static bool cpu_istft_data(Model & model, const float * post_data, int64_t n_fra
         float real[n_fft / 2 + 1]{};
         float imag[n_fft / 2 + 1]{};
         for (int k = 0; k <= n_fft / 2; ++k) {
-            const float mag = std::exp(std::clamp(post_at(k, frame), -20.0f, 8.0f));
+            const float log_mag = post_at(k, frame) - log_mag_offset;
+            const float mag = std::exp(std::clamp(log_mag, -20.0f, 3.0f));
             const float phase = std::sin(post_at(k + n_fft / 2 + 1, frame));
             const float sin_ph = std::sin(phase);
             const float cos_ph = std::cos(phase);
@@ -515,12 +529,28 @@ static bool cpu_istft_data(Model & model, const float * post_data, int64_t n_fra
         }
     }
     out.resize(static_cast<size_t>(out_len));
+    double out_sum_sq = 0.0;
+    float out_peak = 0.0f;
     for (int64_t i = 0; i < out_len; ++i) {
         const int64_t src = i + center_pad;
         const float d = denom[static_cast<size_t>(src)];
-        out[static_cast<size_t>(i)] = std::clamp(
-            d > 1e-8f ? y[static_cast<size_t>(src)] / d : 0.0f,
-            -1.0f, 1.0f);
+        const float v = d > 1e-8f ? y[static_cast<size_t>(src)] / d : 0.0f;
+        out[static_cast<size_t>(i)] = v;
+        out_sum_sq += static_cast<double>(v) * static_cast<double>(v);
+        out_peak = std::max(out_peak, std::fabs(v));
+    }
+
+    const float out_rms = static_cast<float>(
+        std::sqrt(out_sum_sq / static_cast<double>(std::max<int64_t>(1, out_len))));
+    float gain = 1.0f;
+    if (out_peak > 0.95f) {
+        gain = std::min(gain, 0.8f / out_peak);
+    }
+    if (out_rms > 0.12f) {
+        gain = std::min(gain, 0.08f / out_rms);
+    }
+    for (float & v : out) {
+        v = std::clamp(v * gain, -1.0f, 1.0f);
     }
     return !out.empty();
 }
@@ -659,6 +689,7 @@ bool ggml_generator(
     ggml_tensor * noise_conv_w[2] = {nullptr, nullptr};
     ggml_tensor * noise_conv_b[2] = {nullptr, nullptr};
 
+    ggml_tensor * stage_debug[2] = {nullptr, nullptr};
     for (int stage = 0; stage < 2; ++stage) {
         noise_conv_w[stage] = require_tensor(model, noise_conv_weights[stage][0], error);
         noise_conv_b[stage] = require_tensor(model, noise_conv_weights[stage][1], error);
@@ -712,9 +743,16 @@ bool ggml_generator(
         }
 
         x = ggml_scale(ctx, accum, 1.0f / 3.0f);
+        if (std::getenv("KOKOPOP_POST_STATS") != nullptr) {
+            x = ggml_cont(ctx, x);
+            ggml_set_name(x, stage == 0 ? "kokopop_generator_stage0" : "kokopop_generator_stage1");
+            ggml_set_output(x);
+            stage_debug[stage] = x;
+        }
     }
 
     x = ggml_leaky_relu(ctx, x, 0.01f, false);
+    ggml_tensor * pre_post = ggml_cont(ctx, x);
 
     ggml_tensor * post_w = require_tensor(model, "kokopop.decoder.generator.conv_post.weight", error);
     ggml_tensor * post_b = require_tensor(model, "kokopop.decoder.generator.conv_post.bias", error);
@@ -727,12 +765,24 @@ bool ggml_generator(
     post = ggml_cont(ctx, post);
     ggml_set_name(post, "kokopop_generator_post");
     ggml_set_output(post);
+    if (std::getenv("KOKOPOP_POST_STATS") != nullptr) {
+        ggml_set_name(pre_post, "kokopop_generator_pre_post");
+        ggml_set_output(pre_post);
+    }
 
     const bool gen_profile = std::getenv("KOKOPOP_GEN_PROFILE") != nullptr;
 
     int64_t t0g = gen_profile ? ggml_time_us() : 0;
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, generator_graph_size(decoder.length), false);
     ggml_build_forward_expand(gf, post);
+    if (std::getenv("KOKOPOP_POST_STATS") != nullptr) {
+        for (int stage = 0; stage < 2; ++stage) {
+            if (stage_debug[stage] != nullptr) {
+                ggml_build_forward_expand(gf, stage_debug[stage]);
+            }
+        }
+        ggml_build_forward_expand(gf, pre_post);
+    }
 
     if (gen_profile) {
         std::fprintf(stderr, "[gen-profile] generator n_nodes=%d build=%.1fms\n", ggml_graph_n_nodes(gf), (ggml_time_us() - t0g) / 1000.0);
@@ -783,6 +833,87 @@ bool ggml_generator(
     }
 
     model.backend->tensor_get(post, post_data.data(), 0, post_size * sizeof(float));
+
+    if (std::getenv("KOKOPOP_POST_STATS") != nullptr) {
+        auto print_tensor_stats = [&](const char * label, ggml_tensor * t) {
+            std::vector<float> data(static_cast<size_t>(ggml_nelements(t)));
+            model.backend->tensor_get(t, data.data(), 0, data.size() * sizeof(float));
+            double sum = 0.0;
+            double sum_sq = 0.0;
+            float min_v = std::numeric_limits<float>::infinity();
+            float max_v = -std::numeric_limits<float>::infinity();
+            for (float v : data) {
+                sum += v;
+                sum_sq += static_cast<double>(v) * static_cast<double>(v);
+                min_v = std::min(min_v, v);
+                max_v = std::max(max_v, v);
+            }
+            std::fprintf(stderr,
+                         "[kokopop][%s] frames=%lld channels=%lld mean=%.6f rms=%.6f min=%.6f max=%.6f\n",
+                         label,
+                         static_cast<long long>(t->ne[0]),
+                         static_cast<long long>(t->ne[1]),
+                         sum / static_cast<double>(std::max<size_t>(1, data.size())),
+                         std::sqrt(sum_sq / static_cast<double>(std::max<size_t>(1, data.size()))),
+                         min_v,
+                         max_v);
+        };
+        for (int stage = 0; stage < 2; ++stage) {
+            if (stage_debug[stage] != nullptr) {
+                print_tensor_stats(stage == 0 ? "stage0" : "stage1", stage_debug[stage]);
+            }
+        }
+        std::vector<float> pre_data(static_cast<size_t>(ggml_nelements(pre_post)));
+        model.backend->tensor_get(pre_post, pre_data.data(), 0, pre_data.size() * sizeof(float));
+        double pre_sum = 0.0;
+        double pre_sum_sq = 0.0;
+        float pre_min = std::numeric_limits<float>::infinity();
+        float pre_max = -std::numeric_limits<float>::infinity();
+        for (float v : pre_data) {
+            pre_sum += v;
+            pre_sum_sq += static_cast<double>(v) * static_cast<double>(v);
+            pre_min = std::min(pre_min, v);
+            pre_max = std::max(pre_max, v);
+        }
+        std::fprintf(stderr,
+                     "[kokopop][pre_post] frames=%lld channels=%lld mean=%.6f rms=%.6f min=%.6f max=%.6f\n",
+                     static_cast<long long>(pre_post->ne[0]),
+                     static_cast<long long>(pre_post->ne[1]),
+                     pre_sum / static_cast<double>(std::max<size_t>(1, pre_data.size())),
+                     std::sqrt(pre_sum_sq / static_cast<double>(std::max<size_t>(1, pre_data.size()))),
+                     pre_min,
+                     pre_max);
+
+        auto channel_stats = [&](int64_t c0, int64_t c1, double & mean, double & rms, float & min_v, float & max_v) {
+            double sum = 0.0;
+            double sum_sq = 0.0;
+            size_t count = 0;
+            min_v = std::numeric_limits<float>::infinity();
+            max_v = -std::numeric_limits<float>::infinity();
+            for (int64_t c = c0; c < c1; ++c) {
+                for (int64_t t = 0; t < post->ne[0]; ++t) {
+                    const float v = post_data[static_cast<size_t>(c * post->ne[0] + t)];
+                    sum += v;
+                    sum_sq += static_cast<double>(v) * static_cast<double>(v);
+                    min_v = std::min(min_v, v);
+                    max_v = std::max(max_v, v);
+                    ++count;
+                }
+            }
+            mean = count > 0 ? sum / static_cast<double>(count) : 0.0;
+            rms = count > 0 ? std::sqrt(sum_sq / static_cast<double>(count)) : 0.0;
+        };
+        double mean = 0.0, rms = 0.0, spec_mean = 0.0, spec_rms = 0.0, phase_mean = 0.0, phase_rms = 0.0;
+        float min_v = 0.0f, max_v = 0.0f, spec_min = 0.0f, spec_max = 0.0f, phase_min = 0.0f, phase_max = 0.0f;
+        channel_stats(0, 22, mean, rms, min_v, max_v);
+        channel_stats(0, 11, spec_mean, spec_rms, spec_min, spec_max);
+        channel_stats(11, 22, phase_mean, phase_rms, phase_min, phase_max);
+        std::fprintf(stderr,
+                     "[kokopop][post] frames=%lld values=%zu mean=%.6f rms=%.6f min=%.6f max=%.6f spec_mean=%.6f spec_rms=%.6f spec_min=%.6f spec_max=%.6f phase_mean=%.6f phase_rms=%.6f phase_min=%.6f phase_max=%.6f\n",
+                     static_cast<long long>(post->ne[0]), post_size, mean, rms, min_v, max_v,
+                     spec_mean, spec_rms, spec_min, spec_max,
+                     phase_mean, phase_rms, phase_min, phase_max);
+    }
 
     if (!cpu_istft_data(model, post_data.data(), post->ne[0], audio)) {
         ggml_free(ctx);

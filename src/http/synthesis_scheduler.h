@@ -44,6 +44,7 @@ public:
         float speed,
         StreamMode mode,
         RequestContext::AudioFormat format,
+        int ogg_prebuffer_chunks = 0,
         const ChunkConfig & chunk_config_override = ChunkConfig{},
         bool has_chunk_config_override = false);
 

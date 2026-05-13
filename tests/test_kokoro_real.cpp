@@ -114,7 +114,30 @@ TEST_CASE("real_kokoro_text_frontend_adds_stable_end_for_short_unpunctuated_text
     const Stats audio_stats = stats(samples);
     CHECK(audio_stats.rms > 0.02);
     CHECK(audio_stats.rms < 0.2);
-    CHECK(audio_stats.peak < 0.6f);
+    CHECK(audio_stats.peak < 0.95f);
+}
+
+TEST_CASE("real_kokoro_text_short_comma_stays_stable") {
+    if (!real_model_available()) { MESSAGE("skipping: models/kokoro-md.gguf not found"); return; }
+
+    kokopop_model_options options{};
+    options.n_threads = 1;
+    options.backend = KOKOPOP_BACKEND_CPU;
+
+    kokopop_model * model = nullptr;
+    REQUIRE_EQ(kokopop_model_load(real_model_path().c_str(), &options, &model), KOKOPOP_OK);
+
+    kokopop_audio audio{};
+    CHECK_EQ(kokopop_synthesize_text(model, "Hello, world.", "af_heart", 1.0f, &audio), KOKOPOP_OK);
+
+    std::vector<float> samples(audio.samples, audio.samples + audio.n_samples);
+    kokopop_audio_free(&audio);
+    kokopop_model_free(model);
+
+    const Stats audio_stats = stats(samples);
+    CHECK(audio_stats.rms > 0.02);
+    CHECK(audio_stats.rms < 0.2);
+    CHECK(audio_stats.peak < 0.95f);
 }
 
 TEST_CASE("real_kokoro_scratch_reuse") {

@@ -128,6 +128,9 @@ struct RequestContext {
     // ----------------------------------------------------------------
     // Ogg/Opus encoder (for format=ogg, owned by event loop thread)
     // ----------------------------------------------------------------
+    int ogg_prebuffer_chunks = 0;
+    bool ogg_prebuffer_released = false;
+    std::vector<AudioChunk> ogg_prebuffered_audio;
 #ifdef KOKOPOP_HAS_OPUS
     std::unique_ptr<kokopop::OggOpusEncoder> opus_encoder;
 #endif

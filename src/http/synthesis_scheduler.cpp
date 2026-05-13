@@ -25,6 +25,7 @@ std::shared_ptr<RequestContext> SynthesisScheduler::submit(
     float speed,
     StreamMode mode,
     RequestContext::AudioFormat format,
+    int ogg_prebuffer_chunks,
     const ChunkConfig & chunk_config_override,
     bool has_chunk_config_override)
 {
@@ -35,6 +36,7 @@ std::shared_ptr<RequestContext> SynthesisScheduler::submit(
     ctx->speed = speed;
     ctx->mode = mode;
     ctx->format = format;
+    ctx->ogg_prebuffer_chunks = std::max(0, ogg_prebuffer_chunks);
     ctx->chunk_config = chunk_config_override;
     ctx->has_chunk_config = has_chunk_config_override;
     ctx->sample_rate = _model.sample_rate;

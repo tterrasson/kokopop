@@ -309,7 +309,11 @@ def stream_ogg(
     chunking: dict | None,
 ) -> bytes:
     payload = _build_payload(text, voice, speed, mode, "ogg", chunking)
+    if prebuffer_chunks > 0:
+        payload["prebuffer_chunks"] = prebuffer_chunks
     def read_fn(resp):
+        if prebuffer_chunks > 0:
+            return _read_stream(resp, emit_stdout)
         return _read_ogg_stream(resp, emit_stdout,
                                 prebuffer_ms, burst_gap_ms, prebuffer_chunks)
     return _send_tts(url, payload, read_fn)

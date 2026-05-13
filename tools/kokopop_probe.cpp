@@ -1,6 +1,7 @@
 #include "kokopop.h"
 
 #include "core/error.h"
+#include "core/utf8.h"
 #include "inference/kokoro.h"
 #include "model/model.h"
 #include "synthesis/phonemizer.h"
@@ -12,6 +13,7 @@
 #include <memory>
 #include <numeric>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -114,6 +116,16 @@ void print_int_list(const char * key, const std::vector<int> & values) {
     std::printf("\n");
 }
 
+int64_t utf8_codepoint_count(const std::string & text) {
+    int64_t count = 0;
+    size_t off = 0;
+    std::string_view ch;
+    while (kokopop::utf8_next(text, off, ch)) {
+        ++count;
+    }
+    return off == text.size() ? count : static_cast<int64_t>(text.size());
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -157,13 +169,14 @@ int main(int argc, char ** argv) {
     }
 
     kokopop::KokoroFrontendProbe frontend;
-    if (!kokopop::run_kokoro_frontend_probe(*model, ids, options.voice, frontend, error)) {
+    const int64_t style_len = utf8_codepoint_count(phonemes);
+    if (!kokopop::run_kokoro_frontend_probe(*model, ids, options.voice, frontend, error, style_len)) {
         std::fprintf(stderr, "run_kokoro_frontend_probe failed: %s\n", error.c_str());
         return 1;
     }
 
     kokopop::KokoroGenerationProbe gen;
-    if (!kokopop::run_kokoro_generation_probe(*model, ids, options.voice, 1.0f, frontend, gen, error)) {
+    if (!kokopop::run_kokoro_generation_probe(*model, ids, options.voice, 1.0f, frontend, gen, error, style_len)) {
         std::fprintf(stderr, "run_kokoro_generation_probe failed: %s\n", error.c_str());
         return 1;
     }

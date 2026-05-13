@@ -281,6 +281,9 @@ void AsyncHttpServer::_event_loop() {
 
             auto rs  = conn.req_ctx->state.load();
             auto fmt = conn.req_ctx->format;
+            bool is_terminal = (rs == RequestContext::State::DONE ||
+                                rs == RequestContext::State::ERROR ||
+                                rs == RequestContext::State::CANCELLED);
 
             // Drain all available chunks before pulling Ogg pages.
             // Writing all chunks first then pulling once ensures ffplay
@@ -295,9 +298,30 @@ void AsyncHttpServer::_event_loop() {
                     _send_http_chunk(fd, conn, raw);
                 } else if (fmt == RequestContext::AudioFormat::OGG_OPUS) {
 #ifdef KOKOPOP_HAS_OPUS
-                    conn.req_ctx->opus_encoder->write(chunk.samples.data(),
-                                                      static_cast<int>(chunk.samples.size()));
-                    ogg_has_writes = true;
+                    auto * req_ctx = conn.req_ctx.get();
+                    auto write_ogg_chunk = [req_ctx, &ogg_has_writes] (RequestContext::AudioChunk & audio_chunk) {
+                        req_ctx->opus_encoder->write(audio_chunk.samples.data(),
+                                                     static_cast<int>(audio_chunk.samples.size()));
+                        ogg_has_writes = true;
+                    };
+
+                    const int prebuffer_target = req_ctx->ogg_prebuffer_chunks;
+                    if (prebuffer_target > 1 && !req_ctx->ogg_prebuffer_released) {
+                        req_ctx->ogg_prebuffered_audio.push_back(std::move(chunk));
+                        const bool ready =
+                            static_cast<int>(req_ctx->ogg_prebuffered_audio.size()) >= prebuffer_target ||
+                            is_terminal;
+                        if (!ready) {
+                            continue;
+                        }
+                        for (auto & buffered : req_ctx->ogg_prebuffered_audio) {
+                            write_ogg_chunk(buffered);
+                        }
+                        req_ctx->ogg_prebuffered_audio.clear();
+                        req_ctx->ogg_prebuffer_released = true;
+                    } else {
+                        write_ogg_chunk(chunk);
+                    }
 #endif
                 } else {
                     auto & acc = conn.req_ctx->wav_accumulator;
@@ -320,9 +344,6 @@ void AsyncHttpServer::_event_loop() {
             }
 #endif
 
-            bool is_terminal = (rs == RequestContext::State::DONE ||
-                                rs == RequestContext::State::ERROR ||
-                                rs == RequestContext::State::CANCELLED);
             if (is_terminal && conn.write_buffer.empty()) {
                 if (fmt == RequestContext::AudioFormat::PCM) {
                     _send_final_chunk(fd, conn);
@@ -589,6 +610,12 @@ void AsyncHttpServer::_dispatch_request(int fd, Connection & conn) {
             spd = (float)yyjson_get_num(speed_val);
         }
 
+        int ogg_prebuffer_chunks = 0;
+        yyjson_val * prebuffer_val = yyjson_obj_get(root, "prebuffer_chunks");
+        if (prebuffer_val && !yyjson_is_null(prebuffer_val) && yyjson_is_num(prebuffer_val)) {
+            ogg_prebuffer_chunks = std::max(0, static_cast<int>(yyjson_get_int(prebuffer_val)));
+        }
+
         // Parse optional "chunking" overrides
         ChunkConfig chunk_override = ChunkConfig{};
         bool has_chunk_config = false;
@@ -662,6 +689,7 @@ void AsyncHttpServer::_dispatch_request(int fd, Connection & conn) {
         // Submit to scheduler (round-robin interleaving)
         auto ctx = _scheduler->submit(
             text_str, current_voice, spd, current_mode, fmt,
+            ogg_prebuffer_chunks,
             chunk_override, has_chunk_config);
 
         _send_streaming_response(fd, conn, ctx);

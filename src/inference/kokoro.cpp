@@ -79,11 +79,12 @@ bool load_albert_layer(Model & model, AlbertLayerWeights & w, std::string & erro
     return error.empty();
 }
 
-int64_t voice_style_row(ggml_tensor * voice, int64_t n_tokens) {
+int64_t voice_style_row(ggml_tensor * voice, int64_t n_tokens, int64_t style_len) {
     if (voice == nullptr || voice->ne[1] <= 0) {
         return 0;
     }
-    return std::clamp<int64_t>(n_tokens - 3, 0, voice->ne[1] - 1);
+    const int64_t row_key = style_len > 0 ? style_len - 1 : n_tokens - 3;
+    return std::clamp<int64_t>(row_key, 0, voice->ne[1] - 1);
 }
 
 bool all_finite(const std::vector<float> & values, const char * label, std::string & error) {
@@ -174,7 +175,8 @@ bool run_kokoro_frontend_probe(
     const std::vector<uint32_t> & ids,
     const std::string & requested_voice,
     KokoroFrontendProbe & probe,
-    std::string & error) {
+    std::string & error,
+    int64_t style_len) {
 
     if (ids.empty()) {
         error = "cannot run Kokoro frontend on empty token sequence";
@@ -279,7 +281,7 @@ bool run_kokoro_frontend_probe(
 
     cur = linear(ctx, enc_w, enc_b, cur);
 
-    const int64_t voice_row = voice_style_row(voice, n_tokens);
+    const int64_t voice_row = voice_style_row(voice, n_tokens, style_len);
     ggml_tensor * style = ggml_cast(
         ctx,
         ggml_view_1d(ctx, voice, 128, 128 * voice->nb[0] + voice_row * voice->nb[1]),
@@ -368,7 +370,8 @@ bool run_kokoro_generation_probe(
     float speed,
     const KokoroFrontendProbe & frontend,
     KokoroGenerationProbe & probe,
-    std::string & error) {
+    std::string & error,
+    int64_t style_len) {
 
     if (ids.empty() || frontend.n_tokens != static_cast<int64_t>(ids.size())) {
         error = "invalid Kokoro generation inputs";
@@ -458,7 +461,7 @@ bool run_kokoro_generation_probe(
         return false;
     }
 
-    const int64_t voice_row = voice_style_row(voice, n_tokens);
+    const int64_t voice_row = voice_style_row(voice, n_tokens, style_len);
     ggml_tensor * prosody_style = ggml_cast(
         ctx,
         ggml_view_1d(ctx, voice, 128, 128 * voice->nb[0] + voice_row * voice->nb[1]),

@@ -1,6 +1,7 @@
 #include "synthesis/synth.h"
 
 #include "core/constants.h"
+#include "core/utf8.h"
 #include "inference/kokoro.h"
 
 #include <algorithm>
@@ -35,6 +36,16 @@ bool allocate_audio(size_t n, int32_t sr, kokopop_audio & out) {
     return true;
 }
 
+int64_t utf8_codepoint_count(const std::string & text) {
+    int64_t count = 0;
+    size_t off = 0;
+    std::string_view ch;
+    while (utf8_next(text, off, ch)) {
+        ++count;
+    }
+    return off == text.size() ? count : static_cast<int64_t>(text.size());
+}
+
 bool run_real_synthesis(
     Model & model,
     const std::string & phonemes,
@@ -48,11 +59,12 @@ bool run_real_synthesis(
     }
 
     KokoroFrontendProbe probe;
-    if (!run_kokoro_frontend_probe(model, ids, voice, probe, error)) {
+    const int64_t style_len = utf8_codepoint_count(phonemes);
+    if (!run_kokoro_frontend_probe(model, ids, voice, probe, error, style_len)) {
         return false;
     }
     KokoroGenerationProbe gen;
-    if (!run_kokoro_generation_probe(model, ids, voice, speed, probe, gen, error)) {
+    if (!run_kokoro_generation_probe(model, ids, voice, speed, probe, gen, error, style_len)) {
         return false;
     }
     if (gen.audio.empty()) {

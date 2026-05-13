@@ -182,7 +182,8 @@ bool run_kokoro_frontend_probe(
     const std::vector<uint32_t> & ids,
     const std::string & voice,
     KokoroFrontendProbe & probe,
-    std::string & error);
+    std::string & error,
+    int64_t style_len = -1);
 
 bool run_kokoro_generation_probe(
     Model & model,
@@ -191,6 +192,7 @@ bool run_kokoro_generation_probe(
     float speed,
     const KokoroFrontendProbe & frontend,
     KokoroGenerationProbe & probe,
-    std::string & error);
+    std::string & error,
+    int64_t style_len = -1);
 
 } // namespace kokopop
