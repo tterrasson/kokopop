@@ -59,6 +59,8 @@ class MetalBackend final : public Backend {
     bool env_op_trace_ = false;              // KOKOPOP_METAL_OP_TRACE=1
     bool env_alloc_only_ = false;            // KOKOPOP_METAL_ALLOC_ONLY=1
     bool env_vocoder_convt_ = false;         // KOKOPOP_METAL_VOCODER_CONVT=1
+    bool env_stft_ = false;                  // KOKOPOP_METAL_STFT=1
+    int64_t env_lstm_min_steps_ = 96;         // KOKOPOP_METAL_LSTM_MIN_STEPS=N
 
     bool ensure_scheduler(ggml_cgraph * graph) {
         GGML_ASSERT(graph != nullptr);
@@ -168,6 +170,14 @@ public:
         env_op_trace_ = std::getenv("KOKOPOP_METAL_OP_TRACE") != nullptr;
         env_alloc_only_ = std::getenv("KOKOPOP_METAL_ALLOC_ONLY") != nullptr;
         env_vocoder_convt_ = std::getenv("KOKOPOP_METAL_VOCODER_CONVT") != nullptr;
+        env_stft_ = std::getenv("KOKOPOP_METAL_STFT") != nullptr;
+        if (const char * min_steps = std::getenv("KOKOPOP_METAL_LSTM_MIN_STEPS")) {
+            char * end = nullptr;
+            const long parsed = std::strtol(min_steps, &end, 10);
+            if (end != min_steps && parsed >= 0) {
+                env_lstm_min_steps_ = parsed;
+            }
+        }
 
         cpu_backend_ = ggml_backend_cpu_init();
         if (cpu_backend_ != nullptr) {
@@ -190,7 +200,9 @@ public:
         }
 
         lstm_kernel_ = metal_lstm_create();
-        stft_kernel_ = metal_stft_create(KOKOPOP_STFT_N, KOKOPOP_STFT_HOP);
+        if (env_stft_) {
+            stft_kernel_ = metal_stft_create(KOKOPOP_STFT_N, KOKOPOP_STFT_HOP);
+        }
 
         if (env_vocoder_convt_) {
             vocoder_kernel_ = metal_vocoder_create();
@@ -404,8 +416,7 @@ public:
     }
 
     bool use_metal_lstm(int64_t n_steps) const override {
-        (void) n_steps;
-        return lstm_kernel_ != nullptr;
+        return lstm_kernel_ != nullptr && n_steps >= env_lstm_min_steps_;
     }
 
     void * metal_stft_kernel() const override {

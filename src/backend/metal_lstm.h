@@ -1,15 +1,11 @@
 #pragma once
 
-// C-compatible interface to the Metal LSTM kernel.
 // Only available when KOKOPOP_HAS_METAL is defined.
 // Implemented in metal_lstm.mm (Objective-C++).
 
 #ifdef KOKOPOP_HAS_METAL
 
 struct MetalLstmKernelState;
-
-// Opaque handle returned by metal_lstm_submit().
-typedef void * MetalLstmHandle;
 
 // Create / destroy
 MetalLstmKernelState * metal_lstm_create();
@@ -40,26 +36,5 @@ void metal_lstm_run(
     const float * b_hh,
     float       * output,
     int H, int N, bool reverse);
-
-// Async API — submit without waiting. Forward and backward passes of the same
-// bidirectional layer are independent and can be submitted together so Metal
-// overlaps their execution, cutting syncs from 2 to 1 per layer:
-//
-//   MetalLstmHandle hf = metal_lstm_submit(s, "fwd", ...);
-//   MetalLstmHandle hb = metal_lstm_submit(s, "bwd", ...);
-//   metal_lstm_collect(hf);   // one waitUntilCompleted covers both
-//   metal_lstm_collect(hb);   // returns immediately if GPU already done
-//
-// Each handle owns its own MTLBuffers; concurrent calls are safe.
-// output pointer must remain valid until metal_lstm_collect() returns.
-MetalLstmHandle metal_lstm_submit(
-    MetalLstmKernelState * state,
-    const char * whh_key,
-    const float * pre_gates,
-    const float * b_hh,
-    float       * output,
-    int H, int N, bool reverse);
-
-void metal_lstm_collect(MetalLstmHandle handle);
 
 #endif // KOKOPOP_HAS_METAL

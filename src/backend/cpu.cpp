@@ -40,7 +40,7 @@ class CpuBackend final : public Backend {
             1,
             required,
             false,
-            true);
+            false);
 
         return sched_ != nullptr;
     }

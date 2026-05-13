@@ -1,47 +1,50 @@
-// Fused Metal LSTM kernel for kokopop.
-//
-// One threadgroup per LSTM direction, 4*H = 1024 threads.
-// The kernel loops over N time-steps sequentially inside the shader,
-// eliminating the per-step graph-node overhead (~18 ggml nodes × N steps).
-//
-// Tensor layout (ggml column-major, ne[0] is fast / contiguous):
-//   pre_gates : float[4*H, N]   element (g,t) = pre_gates[g + 4*H*t]
-//   w_hh      : float[H, 4*H]   element (k,j) = w_hh[k + H*j]     (j = gate index)
-//   b_hh      : float[4*H]
-//   output    : float[H, N]     element (h,t) = output[h + H*t]
-
 #include "metal_lstm.h"
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
-#include <unordered_map>
-#include <string>
-#include <cstring>
-#include <cstdio>
 
-// ---------------------------------------------------------------------------
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <cstdlib>
+#include <chrono>
+#include <string>
+#include <unordered_map>
+
+// -----------------------------------------------------------------------------
 // MSL shader source
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 static const char * kLstmShaderSrc = R"MSL(
 #include <metal_stdlib>
 using namespace metal;
 
-kernel void kokopop_lstm_fused(
+#define KOKOPOP_LSTM_H 256u
+#define KOKOPOP_LSTM_4H 1024u
+
+static inline float kokopop_sanitize_gate(float x) {
+    if (!isfinite(x)) return 0.0f;
+    return clamp(x, -80.0f, 80.0f);
+}
+
+static inline float kokopop_sanitize_state(float x) {
+    if (!isfinite(x)) return 0.0f;
+    return clamp(x, -50.0f, 50.0f);
+}
+
+kernel void kokopop_lstm_fused_h256(
     device float       * output    [[ buffer(0) ]],
     device const float * pre_gates [[ buffer(1) ]],
     device const float * w_hh      [[ buffer(2) ]],
     device const float * b_hh      [[ buffer(3) ]],
-    constant uint      & H         [[ buffer(4) ]],
-    constant uint      & N         [[ buffer(5) ]],
-    constant uint      & rev       [[ buffer(6) ]],
+    constant uint      & N         [[ buffer(4) ]],
+    constant uint      & rev       [[ buffer(5) ]],
     uint tid [[ thread_position_in_threadgroup ]]
 ) {
-    // threadgroup memory: h (H floats), c (H floats), all gates (4*H floats)
-    threadgroup float h_shm[256];
-    threadgroup float c_shm[256];
-    threadgroup float g_shm[1024];
+    threadgroup float h_shm[KOKOPOP_LSTM_H];
+    threadgroup float c_shm[KOKOPOP_LSTM_H];
+    threadgroup float g_shm[KOKOPOP_LSTM_4H];
 
-    if (tid < H) {
+    if (tid < KOKOPOP_LSTM_H) {
         h_shm[tid] = 0.0f;
         c_shm[tid] = 0.0f;
     }
@@ -50,37 +53,41 @@ kernel void kokopop_lstm_fused(
     for (uint step = 0; step < N; ++step) {
         const uint t = rev ? (N - 1u - step) : step;
 
-        // Each thread 'tid' computes one element of the gate vector:
-        //   g[tid] = b_hh[tid] + pre_gates[tid + 4*H*t] + dot(w_hh[:,tid], h)
-        // w_hh column 'tid' starts at w_hh + tid*H.
-        const device float * col = w_hh + tid * H;
+        const device float * col = w_hh + tid * KOKOPOP_LSTM_H;
         float dot = 0.0f;
-        for (uint k = 0; k < H; ++k) {
+
+        // Fixed trip count lets the compiler optimize better while preserving
+        // the original sequential accumulation order for each gate output.
+        for (uint k = 0u; k < KOKOPOP_LSTM_H; ++k) {
             dot += col[k] * h_shm[k];
         }
-        g_shm[tid] = b_hh[tid] + pre_gates[tid + 4u * H * t] + dot;
+
+        float gv = b_hh[tid] + pre_gates[tid + KOKOPOP_LSTM_4H * t] + dot;
+        if (!isfinite(gv)) gv = 0.0f;
+        g_shm[tid] = gv;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // First H threads update c and h for their hidden unit.
-        if (tid < H) {
-            float x_i = clamp(g_shm[tid],        -80.0f, 80.0f);
-            float x_f = clamp(g_shm[H + tid],    -80.0f, 80.0f);
-            float x_g = clamp(g_shm[2u*H + tid], -80.0f, 80.0f);
-            float x_o = clamp(g_shm[3u*H + tid], -80.0f, 80.0f);
+        if (tid < KOKOPOP_LSTM_H) {
+            const float x_i = kokopop_sanitize_gate(g_shm[tid]);
+            const float x_f = kokopop_sanitize_gate(g_shm[KOKOPOP_LSTM_H + tid]);
+            const float x_g = kokopop_sanitize_gate(g_shm[2u * KOKOPOP_LSTM_H + tid]);
+            const float x_o = kokopop_sanitize_gate(g_shm[3u * KOKOPOP_LSTM_H + tid]);
 
-            float i_gate = 1.0f / (1.0f + precise::exp(-x_i));
-            float f_gate = 1.0f / (1.0f + precise::exp(-x_f));
-            float g_gate = precise::tanh(x_g);
-            float o_gate = 1.0f / (1.0f + precise::exp(-x_o));
+            // Keep precise math. fast:: variants caused non-finite downstream f0 values.
+            const float i_gate = 1.0f / (1.0f + precise::exp(-x_i));
+            const float f_gate = 1.0f / (1.0f + precise::exp(-x_f));
+            const float g_gate = precise::tanh(x_g);
+            const float o_gate = 1.0f / (1.0f + precise::exp(-x_o));
 
             float c_new = f_gate * c_shm[tid] + i_gate * g_gate;
-            c_new = clamp(c_new, -50.0f, 50.0f);
+            c_new = kokopop_sanitize_state(c_new);
 
             float h_new = o_gate * precise::tanh(c_new);
+            if (!isfinite(h_new)) h_new = 0.0f;
 
             c_shm[tid] = c_new;
             h_shm[tid] = h_new;
-            output[tid + H * t] = h_new;
+            output[tid + KOKOPOP_LSTM_H * t] = h_new;
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -88,270 +95,307 @@ kernel void kokopop_lstm_fused(
 }
 )MSL";
 
-// ---------------------------------------------------------------------------
-// State
-// ---------------------------------------------------------------------------
-struct MetalLstmKernelState {
-    id<MTLDevice>              device      = nil;
-    id<MTLCommandQueue>        queue       = nil;
-    id<MTLComputePipelineState> pipeline   = nil;
+// -----------------------------------------------------------------------------
+struct MetalLstmProfileStats {
+    uint64_t sync_calls = 0;
+    double sync_upload_ms = 0.0;
+    double sync_encode_ms = 0.0;
+    double sync_gpu_wait_ms = 0.0;
+    double sync_download_ms = 0.0;
+};
 
-    // Pre-loaded W_hh buffers keyed by LSTM direction name.
+static inline bool metal_lstm_profile_enabled() {
+    static int enabled = []() -> int {
+        const char * e = std::getenv("KOKOPOP_METAL_PROFILE");
+        return (e != nullptr && e[0] != '\0' && e[0] != '0') ? 1 : 0;
+    }();
+    return enabled != 0;
+}
+
+static inline double metal_lstm_now_ms() {
+    using clock = std::chrono::steady_clock;
+    return std::chrono::duration<double, std::milli>(clock::now().time_since_epoch()).count();
+}
+
+// State
+// -----------------------------------------------------------------------------
+struct MetalLstmKernelState {
+    id<MTLDevice> device = nil;
+    id<MTLCommandQueue> queue = nil;
+    id<MTLComputePipelineState> pipeline = nil;
+
     std::unordered_map<std::string, id<MTLBuffer>> whh_buffers;
 
-    // Scratch buffers for the synchronous metal_lstm_run path.
-    // Re-used across calls if size fits; reallocated otherwise.
     id<MTLBuffer> pre_gates_buf = nil;
-    id<MTLBuffer> b_hh_buf      = nil;
-    id<MTLBuffer> output_buf    = nil;
+    id<MTLBuffer> b_hh_buf = nil;
+    id<MTLBuffer> output_buf = nil;
 
     bool valid = false;
+
+    MetalLstmProfileStats profile;
 };
 
-// Per in-flight async dispatch (returned as MetalLstmHandle).
-struct MetalLstmInflight {
-    id<MTLCommandBuffer> cmd;
-    id<MTLBuffer>        out_staging; // GPU-shared output buffer
-    float*               dst;         // caller's destination pointer
-    size_t               out_bytes;
-};
-
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 // Helpers
-// ---------------------------------------------------------------------------
-static id<MTLBuffer> ensure_buf(id<MTLDevice> device, id<MTLBuffer> buf,
-                                 size_t need_bytes) {
-    if (buf && [buf length] >= need_bytes) return buf;
-    return [device newBufferWithLength:need_bytes
-                               options:MTLResourceStorageModeShared];
+// -----------------------------------------------------------------------------
+static id<MTLBuffer> ensure_buf(id<MTLDevice> device, id<MTLBuffer> buffer, size_t need_bytes) {
+    if (buffer != nil && [buffer length] >= need_bytes) {
+        return buffer;
+    }
+    return [device newBufferWithLength:need_bytes options:MTLResourceStorageModeShared];
 }
 
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-MetalLstmKernelState * metal_lstm_create() {
-    auto * s = new MetalLstmKernelState{};
-
-    s->device = MTLCreateSystemDefaultDevice();
-    if (!s->device) {
-        fprintf(stderr, "[metal_lstm] MTLCreateSystemDefaultDevice failed\n");
-        delete s;
-        return nullptr;
+static bool metal_lstm_validate_shape(MetalLstmKernelState * state, int H, int N) {
+    if (state == nullptr || !state->valid || H <= 0 || N <= 0) {
+        return false;
     }
 
-    s->queue = [s->device newCommandQueue];
-    if (!s->queue) {
-        fprintf(stderr, "[metal_lstm] newCommandQueue failed\n");
-        delete s;
-        return nullptr;
+    if (H != 256) {
+        std::fprintf(stderr,
+                     "[metal_lstm] unsupported H=%d; this shader supports H=256 only\n",
+                     H);
+        return false;
     }
 
-    NSError * err = nil;
-    NSString * src = [NSString stringWithUTF8String:kLstmShaderSrc];
-    id<MTLLibrary> lib = [
-        s->device newLibraryWithSource:src options:nil error:&err
-    ];
-
-    if (!lib) {
-        fprintf(stderr, "[metal_lstm] shader compile error: %s\n",
-                [[err localizedDescription] UTF8String]);
-        delete s;
-        return nullptr;
+    const NSUInteger threads_per_group = static_cast<NSUInteger>(4 * H);
+    const NSUInteger max_threads = [state->pipeline maxTotalThreadsPerThreadgroup];
+    if (threads_per_group > max_threads) {
+        std::fprintf(stderr,
+                     "[metal_lstm] threads-per-group=%lu exceeds pipeline limit=%lu\n",
+                     static_cast<unsigned long>(threads_per_group),
+                     static_cast<unsigned long>(max_threads));
+        return false;
     }
 
-    id<MTLFunction> fn = [lib newFunctionWithName:@"kokopop_lstm_fused"];
-    if (!fn) {
-        fprintf(stderr, "[metal_lstm] function 'kokopop_lstm_fused' not found\n");
-        delete s;
-        return nullptr;
-    }
-
-    s->pipeline = [s->device newComputePipelineStateWithFunction:fn error:&err];
-    if (!s->pipeline) {
-        fprintf(stderr, "[metal_lstm] pipeline error: %s\n",
-                [[err localizedDescription] UTF8String]);
-        delete s;
-        return nullptr;
-    }
-
-    s->valid = true;
-    return s;
+    return true;
 }
 
-void metal_lstm_destroy(MetalLstmKernelState * s) {
-    delete s;
-}
-
-void metal_lstm_preload_whh(
-    MetalLstmKernelState * s,
-    const char * key,
-    const float * w_hh_f32,
-    int H, int four_H)
-{
-    if (!s || !s->valid) return;
-    const size_t bytes = static_cast<size_t>(H) * static_cast<size_t>(four_H) * sizeof(float);
-    id<MTLBuffer> buf = [s->device newBufferWithBytes:w_hh_f32
-                                               length:bytes
-                                              options:MTLResourceStorageModeShared];
-    if (!buf) {
-        fprintf(stderr, "[metal_lstm] failed to allocate W_hh buffer for %s\n", key);
-        return;
-    }
-    s->whh_buffers[key] = buf;
-}
-
-// ---------------------------------------------------------------------------
-// Internal: encode one LSTM dispatch into a command buffer.
-// Does NOT commit. Caller owns cmd lifecycle.
-// ---------------------------------------------------------------------------
 static bool encode_lstm(
-    MetalLstmKernelState   * s,
-    id<MTLCommandBuffer>     cmd,
-    id<MTLBuffer>            pre_gates_buf,
-    id<MTLBuffer>            b_hh_buf,
-    id<MTLBuffer>            out_buf,
-    id<MTLBuffer>            whh_buf,
-    int H, int N, bool reverse)
-{
-    const uint params_H   = static_cast<uint>(H);
-    const uint params_N   = static_cast<uint>(N);
-    const uint params_rev = reverse ? 1u : 0u;
+    MetalLstmKernelState * state,
+    id<MTLCommandBuffer> cmd,
+    id<MTLBuffer> pre_gates_buf,
+    id<MTLBuffer> b_hh_buf,
+    id<MTLBuffer> out_buf,
+    id<MTLBuffer> whh_buf,
+    int H,
+    int N,
+    bool reverse
+) {
+    if (!metal_lstm_validate_shape(state, H, N) ||
+        cmd == nil ||
+        pre_gates_buf == nil ||
+        b_hh_buf == nil ||
+        out_buf == nil ||
+        whh_buf == nil) {
+        return false;
+    }
+
+    (void) H;
+    const uint32_t params_N = static_cast<uint32_t>(N);
+    const uint32_t params_rev = reverse ? 1u : 0u;
 
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-    [enc setComputePipelineState:s->pipeline];
+    if (enc == nil) {
+        return false;
+    }
+
+    [enc setComputePipelineState:state->pipeline];
     [enc setBuffer:out_buf       offset:0 atIndex:0];
     [enc setBuffer:pre_gates_buf offset:0 atIndex:1];
     [enc setBuffer:whh_buf       offset:0 atIndex:2];
     [enc setBuffer:b_hh_buf      offset:0 atIndex:3];
-    // Scalars < 4 KB go inline into the command buffer via setBytes —
-    // no MTLBuffer allocation or memcpy into a persistent buffer needed.
-    [enc setBytes:&params_H   length:sizeof(uint) atIndex:4];
-    [enc setBytes:&params_N   length:sizeof(uint) atIndex:5];
-    [enc setBytes:&params_rev length:sizeof(uint) atIndex:6];
+    [enc setBytes:&params_N      length:sizeof(params_N)   atIndex:4];
+    [enc setBytes:&params_rev    length:sizeof(params_rev) atIndex:5];
 
-    const NSUInteger tpg = static_cast<NSUInteger>(4 * H);
+    const NSUInteger threads_per_group = static_cast<NSUInteger>(4 * H);
     [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
-         threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1, 1)];
     [enc endEncoding];
+
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// Async API: submit without blocking.
-// Returns an opaque handle; caller must pass it to metal_lstm_collect().
-// Allows forward + backward of the same layer to run concurrently:
-//   MetalLstmHandle hf = metal_lstm_submit(s, "fwd", ...);
-//   MetalLstmHandle hb = metal_lstm_submit(s, "bwd", ...);
-//   metal_lstm_collect(hf);  // waits once for both — Metal overlaps them
-//   metal_lstm_collect(hb);
-// ---------------------------------------------------------------------------
-MetalLstmHandle metal_lstm_submit(
-    MetalLstmKernelState * s,
-    const char * whh_key,
-    const float * pre_gates,
-    const float * b_hh,
-    float       * output,
-    int H, int N, bool reverse)
-{
-    if (!s || !s->valid) return nullptr;
+// -----------------------------------------------------------------------------
+// Public API
+// -----------------------------------------------------------------------------
+MetalLstmKernelState * metal_lstm_create() {
+    @autoreleasepool {
+        auto * state = new MetalLstmKernelState{};
 
-    auto it = s->whh_buffers.find(whh_key);
-    if (it == s->whh_buffers.end()) {
-        fprintf(stderr, "[metal_lstm] W_hh not preloaded for key: %s\n", whh_key);
-        return nullptr;
+        state->device = MTLCreateSystemDefaultDevice();
+        if (state->device == nil) {
+            std::fprintf(stderr, "[metal_lstm] MTLCreateSystemDefaultDevice failed\n");
+            delete state;
+            return nullptr;
+        }
+
+        state->queue = [state->device newCommandQueue];
+        if (state->queue == nil) {
+            std::fprintf(stderr, "[metal_lstm] newCommandQueue failed\n");
+            delete state;
+            return nullptr;
+        }
+
+        NSError * err = nil;
+        NSString * src = [NSString stringWithUTF8String:kLstmShaderSrc];
+        id<MTLLibrary> lib = [state->device newLibraryWithSource:src options:nil error:&err];
+        if (lib == nil) {
+            std::fprintf(stderr,
+                         "[metal_lstm] shader compile error: %s\n",
+                         err ? [[err localizedDescription] UTF8String] : "unknown");
+            delete state;
+            return nullptr;
+        }
+
+        id<MTLFunction> fn = [lib newFunctionWithName:@"kokopop_lstm_fused_h256"];
+        if (fn == nil) {
+            std::fprintf(stderr, "[metal_lstm] function 'kokopop_lstm_fused_h256' not found\n");
+            delete state;
+            return nullptr;
+        }
+
+        state->pipeline = [state->device newComputePipelineStateWithFunction:fn error:&err];
+        if (state->pipeline == nil) {
+            std::fprintf(stderr,
+                         "[metal_lstm] pipeline error: %s\n",
+                         err ? [[err localizedDescription] UTF8String] : "unknown");
+            delete state;
+            return nullptr;
+        }
+
+        state->valid = true;
+        return state;
     }
-
-    const size_t pg_bytes  = static_cast<size_t>(4 * H * N) * sizeof(float);
-    const size_t bhh_bytes = static_cast<size_t>(4 * H)     * sizeof(float);
-    const size_t out_bytes = static_cast<size_t>(H * N)      * sizeof(float);
-
-    // Each in-flight call owns its buffers so parallel calls don't alias.
-    id<MTLBuffer> pg_buf  = [s->device newBufferWithLength:pg_bytes
-                                                    options:MTLResourceStorageModeShared];
-    id<MTLBuffer> bhh_buf = [s->device newBufferWithLength:bhh_bytes
-                                                    options:MTLResourceStorageModeShared];
-    id<MTLBuffer> out_buf = [s->device newBufferWithLength:out_bytes
-                                                    options:MTLResourceStorageModeShared];
-    if (!pg_buf || !bhh_buf || !out_buf) {
-        fprintf(stderr, "[metal_lstm] buffer alloc failed in submit\n");
-        return nullptr;
-    }
-
-    memcpy([pg_buf  contents], pre_gates, pg_bytes);
-    memcpy([bhh_buf contents], b_hh,      bhh_bytes);
-
-    // retainedReferences:NO — Metal won't hold the encoder/library beyond endEncoding,
-    // reducing memory pressure when many command buffers are in flight.
-    MTLCommandBufferDescriptor * desc = [MTLCommandBufferDescriptor new];
-    desc.retainedReferences = NO;
-    id<MTLCommandBuffer> cmd = [s->queue commandBufferWithDescriptor:desc];
-
-    encode_lstm(s, cmd, pg_buf, bhh_buf, out_buf, it->second, H, N, reverse);
-
-    auto * inflight     = new MetalLstmInflight{};
-    inflight->cmd        = cmd;
-    inflight->out_staging = out_buf;
-    inflight->dst        = output;
-    inflight->out_bytes  = out_bytes;
-
-    [cmd commit];
-    return inflight;
 }
 
-void metal_lstm_collect(MetalLstmHandle handle)
-{
-    if (!handle) return;
-    auto * inflight = static_cast<MetalLstmInflight *>(handle);
-    [inflight->cmd waitUntilCompleted];
-    memcpy(inflight->dst, [inflight->out_staging contents], inflight->out_bytes);
-    delete inflight;
+void metal_lstm_destroy(MetalLstmKernelState * state) {
+    if (state != nullptr && metal_lstm_profile_enabled()) {
+        const auto & p = state->profile;
+        if (p.sync_calls) {
+            std::fprintf(stderr,
+                         "[metal_lstm_profile] sync_calls=%llu upload=%.3fms encode=%.3fms gpu_wait=%.3fms download=%.3fms total=%.3fms\n",
+                         static_cast<unsigned long long>(p.sync_calls),
+                         p.sync_upload_ms,
+                         p.sync_encode_ms,
+                         p.sync_gpu_wait_ms,
+                         p.sync_download_ms,
+                         p.sync_upload_ms + p.sync_encode_ms + p.sync_gpu_wait_ms + p.sync_download_ms);
+        }
+    }
+    delete state;
 }
 
-// ---------------------------------------------------------------------------
-// Synchronous convenience wrapper (unchanged call-site).
-// Uses persistent scratch buffers to avoid per-call MTLBuffer allocation.
-// ---------------------------------------------------------------------------
+void metal_lstm_preload_whh(
+    MetalLstmKernelState * state,
+    const char * key,
+    const float * w_hh_f32,
+    int H,
+    int four_H
+) {
+    if (state == nullptr || !state->valid || key == nullptr || w_hh_f32 == nullptr) {
+        return;
+    }
+
+    if (H != 256 || four_H != 4 * H) {
+        std::fprintf(stderr,
+                     "[metal_lstm] invalid W_hh shape H=%d four_H=%d; expected H=256 four_H=1024\n",
+                     H,
+                     four_H);
+        return;
+    }
+
+    const size_t bytes = static_cast<size_t>(H) * static_cast<size_t>(four_H) * sizeof(float);
+    id<MTLBuffer> buf = [state->device newBufferWithBytes:w_hh_f32
+                                                    length:bytes
+                                                   options:MTLResourceStorageModeShared];
+    if (buf == nil) {
+        std::fprintf(stderr, "[metal_lstm] failed to allocate W_hh buffer for %s\n", key);
+        return;
+    }
+
+    state->whh_buffers[key] = buf;
+}
+
 void metal_lstm_run(
-    MetalLstmKernelState * s,
+    MetalLstmKernelState * state,
     const char * whh_key,
     const float * pre_gates,
     const float * b_hh,
-    float       * output,
-    int H, int N, bool reverse)
-{
-    if (!s || !s->valid) return;
+    float * output,
+    int H,
+    int N,
+    bool reverse
+) {
+    @autoreleasepool {
+        if (!metal_lstm_validate_shape(state, H, N) ||
+            whh_key == nullptr ||
+            pre_gates == nullptr ||
+            b_hh == nullptr ||
+            output == nullptr) {
+            return;
+        }
 
-    auto it = s->whh_buffers.find(whh_key);
-    if (it == s->whh_buffers.end()) {
-        fprintf(stderr, "[metal_lstm] W_hh not preloaded for key: %s\n", whh_key);
-        return;
+        auto it = state->whh_buffers.find(whh_key);
+        if (it == state->whh_buffers.end()) {
+            std::fprintf(stderr, "[metal_lstm] W_hh not preloaded for key: %s\n", whh_key);
+            return;
+        }
+
+        const size_t pg_bytes = static_cast<size_t>(4 * H) * static_cast<size_t>(N) * sizeof(float);
+        const size_t bhh_bytes = static_cast<size_t>(4 * H) * sizeof(float);
+        const size_t out_bytes = static_cast<size_t>(H) * static_cast<size_t>(N) * sizeof(float);
+
+        state->pre_gates_buf = ensure_buf(state->device, state->pre_gates_buf, pg_bytes);
+        state->b_hh_buf = ensure_buf(state->device, state->b_hh_buf, bhh_bytes);
+        state->output_buf = ensure_buf(state->device, state->output_buf, out_bytes);
+        if (state->pre_gates_buf == nil || state->b_hh_buf == nil || state->output_buf == nil) {
+            std::fprintf(stderr, "[metal_lstm] scratch buffer allocation failed\n");
+            return;
+        }
+
+        double t0 = 0.0, t1 = 0.0, t2 = 0.0, t3 = 0.0, t4 = 0.0;
+        if (metal_lstm_profile_enabled()) t0 = metal_lstm_now_ms();
+        std::memcpy([state->pre_gates_buf contents], pre_gates, pg_bytes);
+        std::memcpy([state->b_hh_buf contents], b_hh, bhh_bytes);
+        if (metal_lstm_profile_enabled()) t1 = metal_lstm_now_ms();
+
+        id<MTLCommandBuffer> cmd = [state->queue commandBuffer];
+        if (cmd == nil) {
+            return;
+        }
+
+        if (!encode_lstm(state,
+                         cmd,
+                         state->pre_gates_buf,
+                         state->b_hh_buf,
+                         state->output_buf,
+                         it->second,
+                         H,
+                         N,
+                         reverse)) {
+            return;
+        }
+        if (metal_lstm_profile_enabled()) t2 = metal_lstm_now_ms();
+
+        [cmd commit];
+        [cmd waitUntilCompleted];
+        if (metal_lstm_profile_enabled()) t3 = metal_lstm_now_ms();
+
+        if ([cmd status] != MTLCommandBufferStatusCompleted) {
+            std::fprintf(stderr,
+                         "[metal_lstm] sync command failed with status=%lu\n",
+                         static_cast<unsigned long>([cmd status]));
+            return;
+        }
+
+        std::memcpy(output, [state->output_buf contents], out_bytes);
+        if (metal_lstm_profile_enabled()) {
+            t4 = metal_lstm_now_ms();
+            state->profile.sync_calls += 1;
+            state->profile.sync_upload_ms += (t1 - t0);
+            state->profile.sync_encode_ms += (t2 - t1);
+            state->profile.sync_gpu_wait_ms += (t3 - t2);
+            state->profile.sync_download_ms += (t4 - t3);
+        }
     }
-
-    const size_t pg_bytes  = static_cast<size_t>(4 * H * N) * sizeof(float);
-    const size_t bhh_bytes = static_cast<size_t>(4 * H)     * sizeof(float);
-    const size_t out_bytes = static_cast<size_t>(H * N)      * sizeof(float);
-
-    s->pre_gates_buf = ensure_buf(s->device, s->pre_gates_buf, pg_bytes);
-    s->b_hh_buf      = ensure_buf(s->device, s->b_hh_buf,      bhh_bytes);
-    s->output_buf    = ensure_buf(s->device, s->output_buf,    out_bytes);
-
-    if (!s->pre_gates_buf || !s->b_hh_buf || !s->output_buf) {
-        fprintf(stderr, "[metal_lstm] scratch buffer allocation failed\n");
-        return;
-    }
-
-    memcpy([s->pre_gates_buf contents], pre_gates, pg_bytes);
-    memcpy([s->b_hh_buf      contents], b_hh,      bhh_bytes);
-
-    MTLCommandBufferDescriptor * desc = [MTLCommandBufferDescriptor new];
-    desc.retainedReferences = NO;
-    id<MTLCommandBuffer> cmd = [s->queue commandBufferWithDescriptor:desc];
-
-    encode_lstm(s, cmd, s->pre_gates_buf, s->b_hh_buf, s->output_buf,
-                it->second, H, N, reverse);
-
-    [cmd commit];
-    [cmd waitUntilCompleted];
-
-    memcpy(output, [s->output_buf contents], out_bytes);
 }
