@@ -325,6 +325,50 @@ The client sends these overrides as a `chunking` JSON object:
 | `--chunk-paragraph-pause` | `paragraph_pause_ms` |
 | `--chunk-crossfade` | `crossfade_ms` |
 
+## Docker
+
+A multi-stage [Dockerfile](Dockerfile) is provided for building and running kokopop without local dependencies.
+
+### Build
+
+```bash
+# Build with default voices (af_heart, ff_siwis, zf_xiaoxiao, im_nicola)
+docker build -t kokopop .
+
+# Build with custom voices and tier
+docker build --build-arg VOICES="af_heart,bf_emma,zf_xiaoxiao" --build-arg TIER="kokoro-lg" -t kokopop .
+```
+
+### Run the HTTP server
+
+```bash
+docker run -p 8080:8080 kokopop
+```
+
+### Override voice, port, or mode at runtime
+
+```bash
+docker run -p 8080:8080 kokopop \
+  --voice bf_emma \
+  --port 9000 \
+  --mode long_form
+```
+
+### Quick synthesis (one-shot)
+
+Override the default HTTP server command to use `kokopop_say`-like synthesis via the stream tool:
+
+```bash
+echo '{"text": "Hello from Docker!", "flush": true}' | \
+  docker run -i --rm kokopop \
+    --model models/kokoro.gguf \
+    --voice af_heart \
+    --mode long_form > output.raw
+
+# Convert to WAV
+ffmpeg -f f32le -ar 24000 -ac 1 -i output.raw output.wav
+```
+
 ## Library Integration
 
 Link against `libkokopop` in your CMake project:
