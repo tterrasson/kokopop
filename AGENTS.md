@@ -1,11 +1,9 @@
-# kokopop — Agent Cheat Sheet
-
 Standalone C++ runtime for Kokoro text-to-speech models in GGUF format.
 
 ## Tech Stack
 
 - **C++17** / **C11** — core library and CLI tools
-- **CMake 3.24+** — build system (fetches `ggml` and `doctest` as submodules)
+- **CMake 3.24+** — build system (fetches `ggml` and `doctest`)
 
 ## Project Structure
 
@@ -37,10 +35,6 @@ build/            CMake output directory
 # Default (CPU-only)
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-
-# With Metal GPU (macOS)
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DKOKOPOP_ENABLE_METAL=ON
-cmake --build build
 ```
 
 ### CMake Options
@@ -50,6 +44,7 @@ cmake --build build
 | `KOKOPOP_BUILD_TESTS` | `ON` | Build unit tests |
 | `KOKOPOP_BUILD_TOOLS` | `ON` | Build CLI tools |
 | `KOKOPOP_ENABLE_METAL` | `OFF` | Metal GPU backend (macOS) |
+| `KOKOPOP_ENABLE_CUDA` | `OFF` | CUDA backend (NVIDIA GPUs) |
 | `KOKOPOP_BUILD_BENCH` | `OFF` | Build benchmarks |
 
 ## Run
@@ -91,7 +86,7 @@ ctest --test-dir build --output-on-failure
 
 ## Python / uv
 
-All Python work uses **uv**. Never run bare `python` commands.
+All Python work uses **uv**
 
 ```bash
 # Convert a Kokoro model to GGUF format
