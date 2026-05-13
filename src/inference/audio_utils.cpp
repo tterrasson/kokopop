@@ -7,6 +7,7 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -31,15 +32,14 @@ namespace kokopop {
 
 const float * hann_window_20() {
     constexpr int N = KOKOPOP_STFT_N;
-    static float win[N];
-    static bool  init = false;
-    if (!init) {
-        for (int n = 0; n < N; ++n) {
-            win[n] = 0.5f - 0.5f * std::cos(2.0f * M_PI * n / static_cast<float>(N));
-        }
-        init = true;
-    }
-    return win;
+    // Lambda-based magic static: C++11 guarantees thread-safe one-time init.
+    static const auto win = []() {
+        std::array<float, N> w;
+        for (int n = 0; n < N; ++n)
+            w[n] = 0.5f - 0.5f * std::cos(2.0f * M_PI * n / static_cast<float>(N));
+        return w;
+    }();
+    return win.data();
 }
 
 struct StftTwiddles {
@@ -480,9 +480,9 @@ static bool cpu_istft_data(Model & model, const float * post_data, int64_t n_fra
         return post_data[static_cast<size_t>(c * n_frames + t)];
     };
 
-    // Precompute window² once — same for every frame.
-    static float win_sq[n_fft];
-    static bool win_sq_init = false;
+    // Precompute window² once per thread — same for every frame.
+    static thread_local float win_sq[n_fft];
+    static thread_local bool  win_sq_init = false;
     if (!win_sq_init) {
         for (int n = 0; n < n_fft; ++n) win_sq[n] = window[n] * window[n];
         win_sq_init = true;

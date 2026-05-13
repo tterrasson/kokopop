@@ -197,9 +197,13 @@ static void cpu_lstm_contiguous(
     const int64_t N  = p.n_steps;
     const int64_t H4 = 4 * H;
 
-    std::vector<float> h(static_cast<size_t>(H), 0.0f);
-    std::vector<float> c(static_cast<size_t>(H), 0.0f);
-    std::vector<float> gates(static_cast<size_t>(H4));
+    // Reuse per-thread scratch buffers to avoid 3 heap allocations per LSTM direction.
+    static thread_local std::vector<float> h;
+    static thread_local std::vector<float> c;
+    static thread_local std::vector<float> gates;
+    h.assign(static_cast<size_t>(H), 0.0f);
+    c.assign(static_cast<size_t>(H), 0.0f);
+    gates.resize(static_cast<size_t>(H4));
 
     const float * w_base = p.w_hh_rowwise ? p.w_hh_rowwise : p.w_hh_f32;
 
@@ -240,9 +244,14 @@ static void cpu_lstm_strided(
     const int64_t N  = p.n_steps;
     const int64_t H4 = 4 * H;
 
-    std::vector<float> h(static_cast<size_t>(H), 0.0f);
-    std::vector<float> c(static_cast<size_t>(H), 0.0f);
-    std::vector<float> gates(static_cast<size_t>(H4));
+    // Same thread_local scratch buffers as cpu_lstm_contiguous — safe because
+    // only one of the two paths runs per lstm_fused_callback invocation.
+    static thread_local std::vector<float> h;
+    static thread_local std::vector<float> c;
+    static thread_local std::vector<float> gates;
+    h.assign(static_cast<size_t>(H), 0.0f);
+    c.assign(static_cast<size_t>(H), 0.0f);
+    gates.resize(static_cast<size_t>(H4));
 
     const float * w_base = p.w_hh_rowwise ? p.w_hh_rowwise : p.w_hh_f32;
 

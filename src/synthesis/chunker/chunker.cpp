@@ -115,7 +115,7 @@ bool make_unit_cached(const std::string & text,
     static thread_local std::unordered_map<std::string,
                                             std::pair<std::string, std::vector<uint32_t>>>
         phoneme_cache;
-    constexpr size_t cache_max_size = 128;
+    constexpr size_t cache_max_size = 256;
 
     // Key includes voice so that the same text phonemized for different
     // languages (e.g. ff_siwis → French, af_heart → English) is cached separately.
@@ -473,18 +473,9 @@ std::vector<Chunk> chunk_text(
 // ---------------------------------------------------------------------------
 
 void clear_chunk_data(Chunk & chunk) {
-    // Free phonemes and tokens (largest memory consumers)
-    // Use shrink_to_fit to actually release memory back to the system
-    chunk.phonemes.clear();
-    {
-        std::string empty;
-        empty.swap(chunk.phonemes);
-    }
-    chunk.tokens.clear();
-    {
-        std::vector<uint32_t> empty;
-        empty.swap(chunk.tokens);
-    }
+    // Free phonemes and tokens — swap with empty releases the heap allocation.
+    { std::string       empty; empty.swap(chunk.phonemes); }
+    { std::vector<uint32_t> empty; empty.swap(chunk.tokens); }
     // Keep n_tokens and boundary_after for diagnostics
 }
 

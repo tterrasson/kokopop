@@ -51,22 +51,30 @@ struct AlbertLayerWeights {
 bool load_albert_layer(Model & model, AlbertLayerWeights & w, std::string & error) {
     constexpr const char * base = KOKOPOP_PREFIX_ALBERT_LAYER;
 
-    w.q_w          = require_tensor(model, (std::string(base) + "attention.query.weight").c_str(), error);
-    w.q_b          = require_tensor(model, (std::string(base) + "attention.query.bias").c_str(), error);
-    w.k_w          = require_tensor(model, (std::string(base) + "attention.key.weight").c_str(), error);
-    w.k_b          = require_tensor(model, (std::string(base) + "attention.key.bias").c_str(), error);
-    w.v_w          = require_tensor(model, (std::string(base) + "attention.value.weight").c_str(), error);
-    w.v_b          = require_tensor(model, (std::string(base) + "attention.value.bias").c_str(), error);
-    w.o_w          = require_tensor(model, (std::string(base) + "attention.dense.weight").c_str(), error);
-    w.o_b          = require_tensor(model, (std::string(base) + "attention.dense.bias").c_str(), error);
-    w.attn_norm_w  = require_tensor(model, (std::string(base) + "attention.LayerNorm.weight").c_str(), error);
-    w.attn_norm_b  = require_tensor(model, (std::string(base) + "attention.LayerNorm.bias").c_str(), error);
-    w.ffn_w        = require_tensor(model, (std::string(base) + "ffn.weight").c_str(), error);
-    w.ffn_b        = require_tensor(model, (std::string(base) + "ffn.bias").c_str(), error);
-    w.ffn_out_w    = require_tensor(model, (std::string(base) + "ffn_output.weight").c_str(), error);
-    w.ffn_out_b    = require_tensor(model, (std::string(base) + "ffn_output.bias").c_str(), error);
-    w.out_norm_w   = require_tensor(model, (std::string(base) + "full_layer_layer_norm.weight").c_str(), error);
-    w.out_norm_b   = require_tensor(model, (std::string(base) + "full_layer_layer_norm.bias").c_str(), error);
+    // Single reusable key string — avoids 16 temporary std::string allocations.
+    std::string key;
+    key.reserve(96);
+    const auto t = [&](const char * suffix) -> ggml_tensor * {
+        key = base; key += suffix;
+        return require_tensor(model, key.c_str(), error);
+    };
+
+    w.q_w         = t("attention.query.weight");
+    w.q_b         = t("attention.query.bias");
+    w.k_w         = t("attention.key.weight");
+    w.k_b         = t("attention.key.bias");
+    w.v_w         = t("attention.value.weight");
+    w.v_b         = t("attention.value.bias");
+    w.o_w         = t("attention.dense.weight");
+    w.o_b         = t("attention.dense.bias");
+    w.attn_norm_w = t("attention.LayerNorm.weight");
+    w.attn_norm_b = t("attention.LayerNorm.bias");
+    w.ffn_w       = t("ffn.weight");
+    w.ffn_b       = t("ffn.bias");
+    w.ffn_out_w   = t("ffn_output.weight");
+    w.ffn_out_b   = t("ffn_output.bias");
+    w.out_norm_w  = t("full_layer_layer_norm.weight");
+    w.out_norm_b  = t("full_layer_layer_norm.bias");
 
     return error.empty();
 }

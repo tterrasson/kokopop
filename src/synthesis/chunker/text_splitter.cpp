@@ -347,12 +347,14 @@ std::vector<std::string> split_keep_delimiter(
                 text.compare(i, delim.size(), delim) == 0) {
                 parts.push_back(text.substr(start, i - start + delim.size()));
                 start = i + delim.size();
-                i += delim.size();
+                // Advance to the last byte of the delimiter so that the
+                // outer ++i lands on the first character after it.
+                i += delim.size() - 1;
                 matched = true;
                 break;
             }
         }
-        if (matched) continue; // i was advanced; outer ++i skips past delimiter
+        if (matched) continue;
     }
     if (start < text.size()) {
         parts.push_back(text.substr(start));

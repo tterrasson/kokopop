@@ -227,8 +227,9 @@ Model::~Model() {
 
 bool Model::tokenize_phonemes(const std::string & phonemes, std::vector<uint32_t> & ids, std::string & error) const {
     ids.clear();
-    // Two sentinel tokens (0) + one slot per UTF-8 code point is the upper bound.
-    ids.reserve(phonemes.size() + 2);
+    // Two sentinels + one slot per UTF-8 code point (upper bound).
+    // Divide by 2 to avoid massive over-allocation for multi-byte scripts.
+    ids.reserve(phonemes.size() / 2 + 2);
     ids.push_back(0);
     size_t off = 0;
     std::string_view ch;
