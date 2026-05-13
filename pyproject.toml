@@ -18,3 +18,13 @@ dev = [
     "opencc>=1.3.0",
     "whisper>=1.1.10",
 ]
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cpu" }
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

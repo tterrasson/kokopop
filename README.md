@@ -20,6 +20,7 @@ A standalone C++ library and toolkit for running [Kokoro](https://github.com/hex
 ### Prerequisites
 
 - CMake 3.24+
+- pkg-config
 - C++17 / C11 compiler (GCC 11+, Clang 14+, MSVC 2019+)
 - [libespeak-ng](https://github.com/espeak-ng/espeak-ng) (phonemization)
 

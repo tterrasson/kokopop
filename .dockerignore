@@ -1,0 +1,6 @@
+build/
+models/
+*.wav
+*.ogg
+*.raw
+.venv
