@@ -263,17 +263,22 @@ void AsyncHttpServer::_event_loop() {
         // Connection events
         for (int i = 1; i < nfds; i++) {
             int fd = _poll_fds[i].fd;
+
+            // --- Read events ---
+            if (_poll_fds[i].revents & (POLLIN | POLLHUP | POLLERR)) {
+                auto it = _connections.find(fd);
+                if (it != _connections.end()) {
+                    _handle_connection_read(fd, it->second);
+                }
+            }
+
+            // Re-fetch: _handle_connection_read may have closed the connection
             auto it = _connections.find(fd);
             if (it == _connections.end()) continue;
-            Connection & conn = it->second;
 
-            if (_poll_fds[i].revents & (POLLIN | POLLHUP | POLLERR)) {
-                _handle_connection_read(fd, conn);
-            }
-            // Re-check: read handler may have closed the connection
-            if (_connections.find(fd) == _connections.end()) continue;
+            // --- Write events ---
             if (_poll_fds[i].revents & (POLLOUT | POLLHUP | POLLERR)) {
-                _handle_connection_write(fd, conn);
+                _handle_connection_write(fd, it->second);
             }
         }
 
