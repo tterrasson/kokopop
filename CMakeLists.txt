@@ -334,6 +334,27 @@ if(KOKOPOP_BUILD_TOOLS)
   )
   target_link_libraries(kokopop_play PRIVATE kokopop)
 
+  # Adaptive mode benchmark (TTFB + inter-chunk timing)
+  add_executable(kokopop_bench_adaptative
+    tools/kokopop_bench_adaptative.cpp
+    src/http/synthesis_scheduler.cpp
+  )
+  target_include_directories(kokopop_bench_adaptative PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/model
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/inference
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/synthesis
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/synthesis/chunker
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/audio
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/backend
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/streaming
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/http
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    $<BUILD_INTERFACE:${ggml_SOURCE_DIR}/include>
+  )
+  target_link_libraries(kokopop_bench_adaptative PRIVATE kokopop yyjson)
+
   # RT benchmark tool (synthesis speed measurement)
   add_executable(kokopop_rt tools/kokopop_rt.cpp)
   target_include_directories(kokopop_rt PRIVATE
