@@ -47,6 +47,23 @@ ChunkConfig make_long_form_config() {
     return cfg;
 }
 
+ChunkConfig make_ultra_fast_config() {
+    ChunkConfig cfg;
+    cfg.target_min_tokens = 10;
+    cfg.target_max_tokens = 60;
+    cfg.soft_max_tokens = 150;
+    cfg.hard_max_tokens = 400;
+    cfg.first_chunk_target_max_tokens = 15;
+    cfg.allow_short_first_chunk = true;
+    cfg.comma_pause_ms = 50;
+    cfg.sentence_pause_ms = 120;
+    cfg.paragraph_pause_ms = 250;
+    cfg.crossfade_ms = 15;
+    cfg.trim_silence = true;
+    cfg.max_silence_trim_ms = 80;
+    return cfg;
+}
+
 ChunkConfig merge_chunk_config(ChunkConfig base, ChunkConfig overrides) {
     ChunkConfig def; // all defaults
     if (overrides.target_min_tokens != def.target_min_tokens)

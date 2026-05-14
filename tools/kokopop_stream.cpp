@@ -33,7 +33,7 @@ void usage(const char * argv0) {
     std::fputs("usage: ", stderr);
     std::fputs(argv0, stderr);
     std::fputs(" --model kokoro.gguf "
-        "[--voice NAME] [--speed 1.0] [--mode interactive|long_form] [--threads N] [--backend cpu|metal|cuda]\n"
+        "[--voice NAME] [--speed 1.0] [--mode interactive|ultra_fast|long_form] [--threads N] [--backend cpu|metal|cuda]\n"
         "       [--out out.wav]\n"
         "       [--http] [--port N] [--bind ADDR]\n"
         "\n"
@@ -55,7 +55,7 @@ void usage(const char * argv0) {
         "  --model PATH    Path to Kokoro GGUF model\n"
         "  --voice NAME    Voice name for stdio mode (required without --http)\n"
         "  --speed FLOAT   Synthesis speed (default: 1.0)\n"
-        "  --mode MODE     interactive (default) or long_form\n"
+        "  --mode MODE     interactive (default), ultra_fast, or long_form\n"
         "  --out PATH      Save full audio to WAV file (stdio mode)\n"
         "  --threads N     Number of threads (default: min(4, hw_concurrency))\n"
         "  --backend       Use CPU, Metal, or CUDA backend (default: auto)\n"
@@ -286,8 +286,10 @@ int main(int argc, char ** argv) {
     kokopop::StreamMode stream_mode = kokopop::StreamMode::Interactive;
     if (mode_str == "long_form") {
         stream_mode = kokopop::StreamMode::LongForm;
+    } else if (mode_str == "ultra_fast") {
+        stream_mode = kokopop::StreamMode::UltraFast;
     } else if (mode_str != "interactive") {
-        std::fprintf(stderr, "Unknown mode: %s (use 'interactive' or 'long_form')\n", mode_str.c_str());
+        std::fprintf(stderr, "Unknown mode: %s (use 'interactive', 'ultra_fast', or 'long_form')\n", mode_str.c_str());
         return 2;
     }
 

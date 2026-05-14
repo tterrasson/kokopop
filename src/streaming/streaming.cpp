@@ -43,9 +43,13 @@ SynthesisPlan prepare_synthesis(
     SynthesisPlan plan;
 
     // Select config
-    plan.config = (mode == StreamMode::Interactive)
-        ? make_interactive_config()
-        : make_long_form_config();
+    if (mode == StreamMode::Interactive) {
+        plan.config = make_interactive_config();
+    } else if (mode == StreamMode::UltraFast) {
+        plan.config = make_ultra_fast_config();
+    } else {
+        plan.config = make_long_form_config();
+    }
 
     if (chunk_config_override) {
         plan.config = merge_chunk_config(plan.config, *chunk_config_override);
@@ -68,9 +72,13 @@ SynthesisPlan prepare_synthesis(
     plan.speed = speed;
     plan.mode = mode;
 
+    std::string mode_name = "unknown";
+    if (mode == StreamMode::Interactive) mode_name = "interactive";
+    else if (mode == StreamMode::UltraFast) mode_name = "ultra_fast";
+    else if (mode == StreamMode::LongForm) mode_name = "long_form";
+
     std::fprintf(stderr, "[kokopop] prepared: %zu chunks, %s mode\n",
-                plan.chunks.size(),
-                (mode == StreamMode::Interactive) ? "interactive" : "long_form");
+                plan.chunks.size(), mode_name.c_str());
 
     return plan;
 }

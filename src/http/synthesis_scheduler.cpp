@@ -122,6 +122,45 @@ void SynthesisScheduler::_worker_loop() {
             ctx->state.store(RequestContext::State::INFERRING);
             std::fprintf(stderr, "[scheduler] request #%u prepared: %d chunks\n",
                         ctx->request_id, ctx->chunks_total);
+
+            // ---- Hot-path: infer chunk[0] immediately for TTFB ----
+            // After preparation, infer the first chunk right away before
+            // yielding to the round-robin queue. This guarantees the first
+            // audio byte is produced without waiting for the next queue turn.
+            if (!ctx->cancelled.load() && ctx->output_has_room()) {
+                std::vector<float> out_tail;
+                std::string error;
+                auto audio = infer_chunk(
+                    _model, *ctx->plan, 0, ctx->prev_tail, out_tail, error);
+
+                if (!audio.empty()) {
+                    ctx->prev_tail = std::move(out_tail);
+                    ctx->push_audio(std::move(audio), 0);
+                    ctx->chunks_completed.fetch_add(1);
+
+                    std::fprintf(stderr, "[scheduler] request #%u chunk 0/%d: %d tokens (hot-path)\n",
+                                ctx->request_id, ctx->chunks_total,
+                                ctx->plan->chunks[0].n_tokens);
+
+                    if (ctx->chunks_completed.load() >= ctx->chunks_total) {
+                        ctx->state.store(RequestContext::State::DONE);
+                        std::fprintf(stderr, "[scheduler] request #%u DONE\n", ctx->request_id);
+                        continue;
+                    }
+                } else {
+                    ctx->error = error.empty() ? "inference failed" : error;
+                    ctx->state.store(RequestContext::State::ERROR);
+                    std::fprintf(stderr, "[scheduler] request #%u chunk 0 failed: %s\n",
+                                ctx->request_id, ctx->error.c_str());
+                    continue;
+                }
+            }
+            // Re-enqueue for remaining chunks
+            {
+                std::lock_guard<std::mutex> lock(_queue_mutex);
+                _pending.push_back(ctx);
+            }
+            continue;
         }
 
         // ---- Phase 2: INFERRING (one chunk at a time) ----

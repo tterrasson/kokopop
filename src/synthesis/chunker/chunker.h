@@ -52,6 +52,9 @@ ChunkConfig make_interactive_config();
 /// Default "long-form" config — larger chunks, better prosody
 ChunkConfig make_long_form_config();
 
+/// "Ultra-fast" config — minimal TTFB, very small first chunk
+ChunkConfig make_ultra_fast_config();
+
 /// Merge `overrides` into `base`: only non-default fields in overrides
 /// replace the corresponding fields in base.  This lets a client send a
 /// partial ChunkConfig that patches the preset.
