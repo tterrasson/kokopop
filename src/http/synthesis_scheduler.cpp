@@ -110,8 +110,16 @@ void SynthesisScheduler::_worker_loop() {
 
             ctx->plan = std::make_shared<SynthesisPlan>(std::move(plan));
             ctx->chunks_total = static_cast<int>(ctx->plan->chunks.size());
-            ctx->state.store(RequestContext::State::INFERRING);
 
+            // Client may have disconnected during preparation
+            if (ctx->cancelled.load()) {
+                ctx->state.store(RequestContext::State::CANCELLED);
+                std::fprintf(stderr, "[scheduler] request #%u cancelled after prepare\n",
+                            ctx->request_id);
+                continue;
+            }
+
+            ctx->state.store(RequestContext::State::INFERRING);
             std::fprintf(stderr, "[scheduler] request #%u prepared: %d chunks\n",
                         ctx->request_id, ctx->chunks_total);
         }

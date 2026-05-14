@@ -146,9 +146,6 @@ private:
     float _default_speed = 1.0f;
     StreamMode _stream_mode = StreamMode::Interactive;
 
-    // Connection timeout in milliseconds
-    static constexpr int TIMEOUT_MS = 30000;
-
     // Maximum connections
     static constexpr int MAX_CONNECTIONS = 64;
 

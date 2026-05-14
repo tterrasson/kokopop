@@ -229,8 +229,12 @@ void AsyncHttpServer::_event_loop() {
             _poll_fds[nfds].events = 0;
             _poll_fds[nfds].revents = 0;
 
+            // Always watch for read events: needed for reading request data
+            // and for detecting client disconnects (POLLHUP/POLLERR) on streaming
+            // connections that have no outstanding writes.
             if (conn.state == Connection::STATE_READING_HEADERS ||
-                conn.state == Connection::STATE_READING_BODY) {
+                conn.state == Connection::STATE_READING_BODY ||
+                conn.state == Connection::STATE_STREAMING) {
                 _poll_fds[nfds].events |= POLLIN;
             }
             if (!conn.write_buffer.empty() ||
@@ -278,6 +282,12 @@ void AsyncHttpServer::_event_loop() {
         std::vector<int> fds_to_close;
         for (auto & [fd, conn] : _connections) {
             if (conn.state != Connection::STATE_STREAMING || !conn.req_ctx) continue;
+
+            // Client disconnected — stop draining, close the connection.
+            if (conn.req_ctx->cancelled.load()) {
+                fds_to_close.push_back(fd);
+                continue;
+            }
 
             auto rs  = conn.req_ctx->state.load();
             auto fmt = conn.req_ctx->format;
@@ -423,6 +433,7 @@ void AsyncHttpServer::_handle_connection_read(int fd, Connection & conn) {
 #endif
         }
         if (conn.req_ctx) conn.req_ctx->cancelled.store(true);
+        conn.write_buffer.clear();  // free orphaned chunks
         _close_connection(fd);
         return;
     }
