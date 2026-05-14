@@ -352,6 +352,7 @@ if(KOKOPOP_BUILD_TESTS)
   enable_testing()
   add_executable(kokopop_tests
     tests/test_main.cpp
+    src/http/synthesis_scheduler.cpp
   )
   target_include_directories(kokopop_tests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src

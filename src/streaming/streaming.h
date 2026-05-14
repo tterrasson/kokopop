@@ -16,9 +16,8 @@ namespace kokopop {
 
 /// Mode selection for chunking presets
 enum class StreamMode {
-    Interactive,  // Fast TTFB, smaller chunks
-    UltraFast,    // Minimal TTFB, very small first chunk
-    LongForm      // Larger chunks, better prosody
+    Adaptative,  // Fast TTFB, dynamic chunk sizing
+    LongForm     // Larger chunks, better prosody
 };
 
 /// Callback invoked when a chunk of audio is ready

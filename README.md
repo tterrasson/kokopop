@@ -243,9 +243,8 @@ Request body fields:
 | `text` | string | **Required** — text to synthesize |
 | `voice` | string | Override default voice (e.g., `ff_siwis`) |
 | `speed` | float | Synthesis speed (default: from CLI `--speed`) |
-| `mode` | string | `interactive` (default) or `long_form` |
+| `mode` | string | `adaptative` (default) or `long_form` |
 | `format` | string | `pcm` (default) — raw float32 stream; `wav` — complete WAV file; `ogg` — Ogg/Opus stream |
-| `chunking` | object | Optional stable chunking overrides; see the client options below for field names |
 
 #### Python client (`tools/tts_client.py`)
 
@@ -263,21 +262,16 @@ uv run python tools/tts_client.py \
   --prebuffer-chunks 2 \
   --voice af_bella | ffplay -i pipe:0
 
-# Lower-latency first audio. Smaller first chunks can start faster, but may be
-# less stable than long_form for continuous playback.
+# Lower-latency adaptive playback. The server sizes chunks from live timings.
 uv run python tools/tts_client.py \
   --file examples/english.txt \
   --format ogg \
-  --chunk-target-min 40 \
-  --chunk-target-max 120 \
-  --chunk-first-max 60 \
   --prebuffer-chunks 2 \
   --voice af_bella | ffplay -i pipe:0
 
 uv run python tools/tts_client.py \
   --file examples/mandarin.txt \
   --format ogg \
-  --prebuffer-ms 2000 \
   --voice zm_yunjian | ffplay -i pipe:0
 
 # Stream PCM and save as WAV (client-side conversion)
@@ -297,33 +291,10 @@ All options:
 | `--url` | `http://127.0.0.1:8080/tts` | Server URL |
 | `--voice` | server default | Voice name |
 | `--speed` | `1.0` | Speed multiplier |
-| `--mode` | `interactive` | `interactive` or `long_form` |
+| `--mode` | `adaptative` | `adaptative` or `long_form` |
 | `--format` | `pcm` | `pcm` (float32 stream), `wav` (complete file), or `ogg` (Ogg/Opus stream) |
 | `--out` | — | Output file; if omitted, raw bytes go to stdout |
-| `--prebuffer-ms` | `3000` | Milliseconds of audio to buffer before playback starts (Ogg mode) |
-| `--prebuffer-chunks` | `0` | Number of TTS synthesis chunks to buffer before playback (Ogg mode; overrides `--prebuffer-ms` when > 0) |
-| `--prebuffer-gap-ms` | `250` | Idle gap in ms used to detect boundaries between TTS chunks |
-| `--chunk-target-min` | preset | Minimum tokens per synthesis chunk |
-| `--chunk-target-max` | preset | Target maximum tokens per synthesis chunk |
-| `--chunk-soft-max` | preset | Soft token limit before forced split |
-| `--chunk-hard-max` | preset | Hard token limit per chunk |
-| `--chunk-first-max` | preset | Token limit for the first chunk (lower = faster TTFB) |
-| `--chunk-sentence-pause` | preset | Pause between sentences in ms |
-| `--chunk-paragraph-pause` | preset | Pause between paragraphs in ms |
-| `--chunk-crossfade` | preset | Crossfade between chunks in ms |
-
-The client sends these overrides as a `chunking` JSON object:
-
-| CLI option | JSON field |
-|---|---|
-| `--chunk-target-min` | `target_min_tokens` |
-| `--chunk-target-max` | `target_max_tokens` |
-| `--chunk-soft-max` | `soft_max_tokens` |
-| `--chunk-hard-max` | `hard_max_tokens` |
-| `--chunk-first-max` | `first_chunk_target_max_tokens` |
-| `--chunk-sentence-pause` | `sentence_pause_ms` |
-| `--chunk-paragraph-pause` | `paragraph_pause_ms` |
-| `--chunk-crossfade` | `crossfade_ms` |
+| `--prebuffer-chunks` | `0` | Server-side Ogg synthesis chunks to buffer before playback |
 
 ## Docker
 

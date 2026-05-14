@@ -29,7 +29,7 @@ struct ChunkConfig {
     int soft_max_tokens = 260;
     int hard_max_tokens = 510;
 
-    // First chunk policy (reduce TTFB for interactive mode)
+    // First chunk policy (reduce TTFB for adaptative mode)
     int first_chunk_target_max_tokens = 100;
     bool allow_short_first_chunk = true;
 
@@ -46,14 +46,11 @@ struct ChunkConfig {
     int max_silence_trim_ms = 120;
 };
 
-/// Default "interactive" config — fast first audio, smaller chunks
-ChunkConfig make_interactive_config();
+/// Default "adaptative" config — fast first audio, dynamic chunk sizing
+ChunkConfig make_adaptative_config();
 
 /// Default "long-form" config — larger chunks, better prosody
 ChunkConfig make_long_form_config();
-
-/// "Ultra-fast" config — minimal TTFB, very small first chunk
-ChunkConfig make_ultra_fast_config();
 
 /// Merge `overrides` into `base`: only non-default fields in overrides
 /// replace the corresponding fields in base.  This lets a client send a
@@ -108,6 +105,35 @@ std::vector<Chunk> chunk_text(
     const ChunkConfig & config,
     TokenizeFn tokenize_fn,
     std::string & error);
+
+/// Prepare natural text units for adaptative chunking. The returned units are
+/// already phonemized/tokenized and split on natural pauses where possible.
+std::vector<Unit> prepare_chunk_units(
+    const std::string & text,
+    const std::string & voice,
+    const ChunkConfig & config,
+    TokenizeFn tokenize_fn,
+    std::string & error);
+
+/// Build the next adaptative chunk from prepared units. `next_unit` is advanced
+/// past consumed units. The caller decides `target_tokens` from live timings.
+Chunk build_adaptative_chunk(
+    const std::vector<Unit> & units,
+    size_t & next_unit,
+    const ChunkConfig & config,
+    int target_tokens,
+    bool is_first);
+
+/// Per-request live controller for adaptative chunk sizing.
+struct AdaptativeChunkController {
+    double target_generation_ms = 700.0;
+    double ms_per_token_ewma = 0.0;
+    int min_tokens = 32;
+    int max_tokens = 220;
+
+    int target_tokens(size_t queued_requests = 0) const;
+    void observe(int n_tokens, double generation_ms);
+};
 
 // ---------------------------------------------------------------------------
 // Memory management helpers

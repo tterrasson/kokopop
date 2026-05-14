@@ -53,7 +53,7 @@ struct RequestContext {
     std::string text;
     std::string voice;
     float speed = 1.0f;
-    StreamMode mode = StreamMode::Interactive;
+    StreamMode mode = StreamMode::Adaptative;
     AudioFormat format = AudioFormat::PCM;
     ChunkConfig chunk_config;      // override fields (defaults = no-op)
     bool has_chunk_config = false;
@@ -66,6 +66,9 @@ struct RequestContext {
     // Synthesis plan (filled during PREPARING phase)
     // ----------------------------------------------------------------
     std::shared_ptr<SynthesisPlan> plan;
+    std::vector<Unit> adaptative_units;
+    size_t adaptative_next_unit = 0;
+    AdaptativeChunkController adaptative_controller;
 
     // ----------------------------------------------------------------
     // Progress

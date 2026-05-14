@@ -13,13 +13,13 @@
 
 namespace kokopop {
 
-ChunkConfig make_interactive_config() {
+ChunkConfig make_adaptative_config() {
     ChunkConfig cfg;
-    cfg.target_min_tokens = 20;
-    cfg.target_max_tokens = 120;
-    cfg.soft_max_tokens = 240;
+    cfg.target_min_tokens = 28;
+    cfg.target_max_tokens = 80;
+    cfg.soft_max_tokens = 200;
     cfg.hard_max_tokens = 510;
-    cfg.first_chunk_target_max_tokens = 40;
+    cfg.first_chunk_target_max_tokens = 64;
     cfg.allow_short_first_chunk = true;
     cfg.comma_pause_ms = 70;
     cfg.sentence_pause_ms = 170;
@@ -44,23 +44,6 @@ ChunkConfig make_long_form_config() {
     cfg.crossfade_ms = 35;
     cfg.trim_silence = true;
     cfg.max_silence_trim_ms = 160;
-    return cfg;
-}
-
-ChunkConfig make_ultra_fast_config() {
-    ChunkConfig cfg;
-    cfg.target_min_tokens = 10;
-    cfg.target_max_tokens = 60;
-    cfg.soft_max_tokens = 150;
-    cfg.hard_max_tokens = 400;
-    cfg.first_chunk_target_max_tokens = 15;
-    cfg.allow_short_first_chunk = true;
-    cfg.comma_pause_ms = 50;
-    cfg.sentence_pause_ms = 120;
-    cfg.paragraph_pause_ms = 250;
-    cfg.crossfade_ms = 15;
-    cfg.trim_silence = true;
-    cfg.max_silence_trim_ms = 80;
     return cfg;
 }
 
@@ -198,10 +181,12 @@ std::vector<Unit> force_split_unit(
         for (const auto & part : parts) {
             Unit u;
             if (make_unit_cached(part, voice, tokenize_fn, u, error)) {
-                if (u.n_tokens <= config.hard_max_tokens) {
+                if (u.n_tokens <= config.target_max_tokens) {
                     result.push_back(std::move(u));
                 } else {
-                    // Recursively split
+                    // Recursively split punctuation parts until they fit the
+                    // active chunk target. This matters for adaptative, where
+                    // waiting on a long comma-clause can dominate TTFB.
                     auto sub = force_split_unit(part, voice, config, tokenize_fn, error);
                     result.insert(result.end(),
                                   std::make_move_iterator(sub.begin()),
@@ -227,7 +212,9 @@ std::vector<Unit> force_split_unit(
                 if (!current.empty()) {
                     result.push_back(std::move(current_unit));
                     current = word;
-                    current_unit = Unit{};
+                    if (!make_unit_cached(current, voice, tokenize_fn, current_unit, error)) {
+                        current_unit = Unit{};
+                    }
                 } else {
                     // Single word too big — split by characters
                     result.push_back(std::move(trial_unit));
@@ -266,7 +253,7 @@ std::vector<Chunk> rebalance_tiny_chunks(
     std::vector<Chunk> result;
     result.reserve(chunks.size());
     for (size_t i = 0; i < chunks.size(); ++i) {
-        // First chunk can be small in interactive mode
+        // First chunk can be small in adaptative mode
         bool is_first = (i == 0);
         if (is_first && config.allow_short_first_chunk) {
             result.push_back(std::move(chunks[i]));
@@ -330,7 +317,7 @@ std::vector<Chunk> rebalance_tiny_chunks(
 // Main pipeline
 // ---------------------------------------------------------------------------
 
-std::vector<Chunk> chunk_text(
+std::vector<Unit> prepare_chunk_units(
     const std::string & text,
     const std::string & voice,
     const ChunkConfig & config,
@@ -352,6 +339,30 @@ std::vector<Chunk> chunk_text(
             // Tokenization failed (likely exceeds context length) — try force-split
             // before giving up, so long sentences without punctuation still work.
             auto split = force_split_unit(raw, voice, config, tokenize_fn, error);
+            if (units.empty() &&
+                config.allow_short_first_chunk &&
+                config.first_chunk_target_max_tokens > 0 &&
+                !split.empty() &&
+                split.front().n_tokens > config.first_chunk_target_max_tokens) {
+                ChunkConfig first_cfg = config;
+                first_cfg.target_min_tokens = 1;
+                first_cfg.target_max_tokens = config.first_chunk_target_max_tokens;
+                first_cfg.soft_max_tokens = config.first_chunk_target_max_tokens;
+                first_cfg.hard_max_tokens = config.first_chunk_target_max_tokens;
+                auto first_split = force_split_unit(
+                    split.front().text, voice, first_cfg, tokenize_fn, error);
+                if (!first_split.empty()) {
+                    std::vector<Unit> refined;
+                    refined.reserve(first_split.size() + split.size() - 1);
+                    refined.insert(refined.end(),
+                                   std::make_move_iterator(first_split.begin()),
+                                   std::make_move_iterator(first_split.end()));
+                    refined.insert(refined.end(),
+                                   std::make_move_iterator(split.begin() + 1),
+                                   std::make_move_iterator(split.end()));
+                    split = std::move(refined);
+                }
+            }
             if (split.empty()) {
                 std::fprintf(stderr, "[chunker] skipping unit (cannot split): %s\n",
                              unit_error.c_str());
@@ -363,10 +374,12 @@ std::vector<Chunk> chunk_text(
             continue;
         }
 
-        // Step 4: Force-split oversized units
-        // Split at soft_max_tokens to prevent single long sentences from
-        // creating memory-hungry chunks that exceed backend buffer limits.
-        if (u.n_tokens > config.soft_max_tokens) {
+        // Step 4: Force-split oversized units.
+        // In adaptative mode, target_max_tokens is small (≈80) so the
+        // controller has fine-grained unit granularity. In long-form mode,
+        // target_max is larger but still below soft_max, acting as a
+        // reasonable memory and latency guard.
+        if (u.n_tokens > config.target_max_tokens) {
             auto split = force_split_unit(raw, voice, config, tokenize_fn, error);
             units.insert(units.end(),
                         std::make_move_iterator(split.begin()),
@@ -375,6 +388,18 @@ std::vector<Chunk> chunk_text(
             units.push_back(std::move(u));
         }
     }
+
+    return units;
+}
+
+std::vector<Chunk> chunk_text(
+    const std::string & text,
+    const std::string & voice,
+    const ChunkConfig & config,
+    TokenizeFn tokenize_fn,
+    std::string & error) {
+
+    std::vector<Unit> units = prepare_chunk_units(text, voice, config, tokenize_fn, error);
 
     // Step 5: Assemble units into chunks
     // Pre-compute upper bounds for reserve() — avoids repeated reallocations
@@ -491,6 +516,87 @@ std::vector<Chunk> chunk_text(
     }
 
     return chunks;
+}
+
+int AdaptativeChunkController::target_tokens(size_t queued_requests) const {
+    const double baseline = ms_per_token_ewma > 0.01 ? ms_per_token_ewma : 12.0;
+    double adjusted_target_ms = target_generation_ms;
+    if (queued_requests > 0) {
+        adjusted_target_ms /= 1.0 + std::min<double>(2.0, queued_requests * 0.35);
+    }
+    const int estimate = static_cast<int>(adjusted_target_ms / baseline);
+    return std::max(min_tokens, std::min(max_tokens, estimate));
+}
+
+void AdaptativeChunkController::observe(int n_tokens, double generation_ms) {
+    if (n_tokens <= 0 || generation_ms <= 0.0) return;
+    const double sample = generation_ms / static_cast<double>(n_tokens);
+    constexpr double alpha = 0.30;
+    // Seed the EWMA at the default baseline rather than cold-starting at the
+    // first observation. A single fast first chunk (JIT/Metal warmup) would
+    // otherwise overshoot the estimate and make the next chunk too large,
+    // causing a gap when subsequent synthesis is slower (O(n^2) attention).
+    if (ms_per_token_ewma <= 0.0) ms_per_token_ewma = 12.0;
+    ms_per_token_ewma = alpha * sample + (1.0 - alpha) * ms_per_token_ewma;
+}
+
+Chunk build_adaptative_chunk(
+    const std::vector<Unit> & units,
+    size_t & next_unit,
+    const ChunkConfig & config,
+    int target_tokens,
+    bool is_first) {
+    Chunk chunk;
+    if (next_unit >= units.size()) return chunk;
+
+    const int target = std::max(config.target_min_tokens,
+                                std::min(config.hard_max_tokens, target_tokens));
+    auto append_unit = [&](const Unit & unit) {
+        if (!chunk.phonemes.empty() && !unit.phonemes.empty()) {
+            chunk.phonemes.push_back(' ');
+        }
+        chunk.phonemes.append(unit.phonemes);
+        chunk.tokens.insert(chunk.tokens.end(), unit.tokens.begin(), unit.tokens.end());
+        chunk.n_tokens += unit.n_tokens;
+        chunk.text.append(unit.text);
+        chunk.boundary_after = unit.boundary_after;
+    };
+
+    while (next_unit < units.size()) {
+        const Unit & unit = units[next_unit];
+        const int trial = chunk.n_tokens + unit.n_tokens;
+        if (!chunk.tokens.empty() && trial > config.hard_max_tokens) {
+            break;
+        }
+
+        append_unit(unit);
+        ++next_unit;
+
+        if (is_first) {
+            // For adaptative TTFB, the first natural pause is enough. This
+            // keeps "Bonjour," quick while preserving a long pre-comma clause.
+            if (chunk.boundary_after != Boundary::None) break;
+            if (chunk.n_tokens >= config.hard_max_tokens) break;
+            continue;
+        }
+
+        if (chunk.n_tokens >= target && chunk.boundary_after != Boundary::None) {
+            break;
+        }
+        // Hard cap at target_max even without a boundary: prevents a long
+        // unpunctuated sentence from creating a chunk that takes longer to
+        // synthesise than the previous chunk takes to play, causing a gap.
+        if (chunk.n_tokens >= config.target_max_tokens) break;
+        if (chunk.n_tokens >= config.soft_max_tokens &&
+            chunk.boundary_after != Boundary::None) {
+            break;
+        }
+        if (chunk.n_tokens >= config.hard_max_tokens) break;
+    }
+
+    chunk.is_first = is_first;
+    chunk.is_last = next_unit >= units.size();
+    return chunk;
 }
 
 // ---------------------------------------------------------------------------

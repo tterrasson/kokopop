@@ -301,9 +301,9 @@ void AsyncHttpServer::_event_loop() {
                                 rs == RequestContext::State::CANCELLED);
 
             // Drain all available chunks before pulling Ogg pages.
-            // Writing all chunks first then pulling once ensures ffplay
-            // receives a single batch of pages covering all available audio
-            // rather than one tiny page per synthesis chunk.
+            // Writing all chunks first then pulling once lets ffplay receive
+            // a coherent batch of pages covering the available audio instead
+            // of one tiny page per synthesis chunk.
             bool ogg_has_writes = false;
             RequestContext::AudioChunk chunk;
             while (conn.req_ctx->try_pop(chunk)) {
@@ -321,7 +321,7 @@ void AsyncHttpServer::_event_loop() {
                     };
 
                     const int prebuffer_target = req_ctx->ogg_prebuffer_chunks;
-                    if (prebuffer_target > 1 && !req_ctx->ogg_prebuffer_released) {
+                    if (prebuffer_target > 0 && !req_ctx->ogg_prebuffer_released) {
                         req_ctx->ogg_prebuffered_audio.push_back(std::move(chunk));
                         const bool ready =
                             static_cast<int>(req_ctx->ogg_prebuffered_audio.size()) >= prebuffer_target ||
@@ -345,9 +345,11 @@ void AsyncHttpServer::_event_loop() {
             }
 #ifdef KOKOPOP_HAS_OPUS
             // Pull pages once, after all available chunks have been written.
-            // Do not force page flushes mid-stream: libopusenc's muxing delay
-            // controls page cadence, which keeps ffplay from seeing a train of
-            // tiny partial pages at synthesis chunk boundaries.
+            // Do not force flush: ope_encoder_get_page(flush=1) is a muxer-level
+            // flush that only emits complete Opus frames. Samples that don't fill
+            // a full 20 ms frame stay in the Opus encoder buffer and would be
+            // silently dropped, causing audible truncation of the first chunk.
+            // With MUXING_DELAY=40 ms the natural page cadence is fast enough.
             if (ogg_has_writes) {
                 auto & enc = *conn.req_ctx->opus_encoder;
                 enc.pull_pages(0);
@@ -628,28 +630,6 @@ void AsyncHttpServer::_dispatch_request(int fd, Connection & conn) {
             ogg_prebuffer_chunks = std::max(0, static_cast<int>(yyjson_get_int(prebuffer_val)));
         }
 
-        // Parse optional "chunking" overrides
-        ChunkConfig chunk_override = ChunkConfig{};
-        bool has_chunk_config = false;
-        yyjson_val * chunking_obj = yyjson_obj_get(root, "chunking");
-        if (chunking_obj && yyjson_is_obj(chunking_obj)) {
-            has_chunk_config = true;
-            auto read_int = [&](const char *key, int &field) {
-                yyjson_val *v = yyjson_obj_get(chunking_obj, key);
-                if (v && !yyjson_is_null(v) && yyjson_is_num(v)) {
-                    field = static_cast<int>(yyjson_get_int(v));
-                }
-            };
-            read_int("target_min_tokens", chunk_override.target_min_tokens);
-            read_int("target_max_tokens", chunk_override.target_max_tokens);
-            read_int("soft_max_tokens", chunk_override.soft_max_tokens);
-            read_int("hard_max_tokens", chunk_override.hard_max_tokens);
-            read_int("first_chunk_target_max_tokens", chunk_override.first_chunk_target_max_tokens);
-            read_int("sentence_pause_ms", chunk_override.sentence_pause_ms);
-            read_int("paragraph_pause_ms", chunk_override.paragraph_pause_ms);
-            read_int("crossfade_ms", chunk_override.crossfade_ms);
-        }
-
         // "format": "pcm"     → stream raw float32 PCM (default)
         // "format": "wav"     → accumulate and return a complete WAV file
         // "format": "ogg"     → stream Ogg/Opus with Transfer-Encoding: chunked
@@ -670,12 +650,15 @@ void AsyncHttpServer::_dispatch_request(int fd, Connection & conn) {
         std::string current_voice(voice);
         StreamMode current_mode = _stream_mode;
         if (mode_str) {
-            if (std::string(mode_str) == "long_form") {
+            std::string ms(mode_str);
+            if (ms == "long_form") {
                 current_mode = StreamMode::LongForm;
-            } else if (std::string(mode_str) != "interactive") {
+            } else if (ms == "adaptative") {
+                current_mode = StreamMode::Adaptative;
+            } else {
                 yyjson_doc_free(doc);
                 _send_error(fd, conn, 400, "Bad Request",
-                            json_error(std::string("Unknown mode: ") + mode_str));
+                            json_error(std::string("Unknown mode: ") + ms));
                 return;
             }
         }
@@ -706,7 +689,7 @@ void AsyncHttpServer::_dispatch_request(int fd, Connection & conn) {
         auto ctx = _scheduler->submit(
             text_str, current_voice, spd, current_mode, fmt,
             ogg_prebuffer_chunks,
-            chunk_override, has_chunk_config);
+            ChunkConfig{}, false);
 
         _send_streaming_response(fd, conn, ctx);
         return;

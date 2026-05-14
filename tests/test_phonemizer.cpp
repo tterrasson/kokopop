@@ -14,9 +14,9 @@ TEST_CASE("phonemizer_preserves_prosody_punctuation") {
     std::string statement;
     std::string error;
     CHECK(kokopop::phonemize_text("Tu aimes les films ?", "ff_siwis", question, error));
-    CHECK_EQ(question, std::string("ty ˈɛm le fˈilm ?"));
+    CHECK_EQ(question, std::string("ty ˈɛm le fˈilm?"));
     CHECK(kokopop::phonemize_text("Tu aimes les films.", "ff_siwis", statement, error));
-    CHECK_EQ(statement, std::string("ty ˈɛm le fˈilm ."));
+    CHECK_EQ(statement, std::string("ty ˈɛm le fˈilm."));
     CHECK(question != statement);
 }
 

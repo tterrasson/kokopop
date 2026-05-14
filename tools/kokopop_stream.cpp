@@ -33,7 +33,7 @@ void usage(const char * argv0) {
     std::fputs("usage: ", stderr);
     std::fputs(argv0, stderr);
     std::fputs(" --model kokoro.gguf "
-        "[--voice NAME] [--speed 1.0] [--mode interactive|ultra_fast|long_form] [--threads N] [--backend cpu|metal|cuda]\n"
+        "[--voice NAME] [--speed 1.0] [--mode adaptative|long_form] [--threads N] [--backend cpu|metal|cuda]\n"
         "       [--out out.wav]\n"
         "       [--http] [--port N] [--bind ADDR]\n"
         "\n"
@@ -55,7 +55,7 @@ void usage(const char * argv0) {
         "  --model PATH    Path to Kokoro GGUF model\n"
         "  --voice NAME    Voice name for stdio mode (required without --http)\n"
         "  --speed FLOAT   Synthesis speed (default: 1.0)\n"
-        "  --mode MODE     interactive (default), ultra_fast, or long_form\n"
+        "  --mode MODE     adaptative (default) or long_form\n"
         "  --out PATH      Save full audio to WAV file (stdio mode)\n"
         "  --threads N     Number of threads (default: min(4, hw_concurrency))\n"
         "  --backend       Use CPU, Metal, or CUDA backend (default: auto)\n"
@@ -201,7 +201,7 @@ int main(int argc, char ** argv) {
     std::string model_path;
     std::string voice;
     float speed = 1.0f;
-    std::string mode_str = "interactive";
+    std::string mode_str = "adaptative";
     std::string out_path;
     int threads = std::min(4, static_cast<int>(std::thread::hardware_concurrency()));
     int backend = KOKOPOP_BACKEND_AUTO;
@@ -283,13 +283,11 @@ int main(int argc, char ** argv) {
         return 2;
     }
 
-    kokopop::StreamMode stream_mode = kokopop::StreamMode::Interactive;
+    kokopop::StreamMode stream_mode = kokopop::StreamMode::Adaptative;
     if (mode_str == "long_form") {
         stream_mode = kokopop::StreamMode::LongForm;
-    } else if (mode_str == "ultra_fast") {
-        stream_mode = kokopop::StreamMode::UltraFast;
-    } else if (mode_str != "interactive") {
-        std::fprintf(stderr, "Unknown mode: %s (use 'interactive', 'ultra_fast', or 'long_form')\n", mode_str.c_str());
+    } else if (mode_str != "adaptative") {
+        std::fprintf(stderr, "Unknown mode: %s (use 'adaptative' or 'long_form')\n", mode_str.c_str());
         return 2;
     }
 

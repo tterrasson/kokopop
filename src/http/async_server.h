@@ -144,7 +144,7 @@ private:
     Model * _model = nullptr;
     std::string _default_voice;
     float _default_speed = 1.0f;
-    StreamMode _stream_mode = StreamMode::Interactive;
+    StreamMode _stream_mode = StreamMode::Adaptative;
 
     // Maximum connections
     static constexpr int MAX_CONNECTIONS = 64;

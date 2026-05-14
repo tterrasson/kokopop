@@ -26,11 +26,11 @@ OggOpusEncoder::OggOpusEncoder(int sample_rate, int channels) {
             + ope_strerror(err));
     }
 
-    // Emit a new Ogg page about every 200 ms. libopusenc expects this value
-    // in milliseconds, not samples.
-    // Small enough for responsive streaming, large enough for ffplay to
-    // buffer without skipping between pages.
-    ope_encoder_ctl(_enc, OPE_SET_MUXING_DELAY(200));
+    // Keep encoder-side latency low for live TTS. The defaults are tuned for
+    // file output and can withhold most of the first synthesis chunk even after
+    // the server has written several seconds of PCM into libopusenc.
+    ope_encoder_ctl(_enc, OPE_SET_DECISION_DELAY(0));
+    ope_encoder_ctl(_enc, OPE_SET_MUXING_DELAY(40));
 
     // A typical Opus page is well under 4 KB; reserving 16 KB covers the first
     // few pages emitted in a streaming session and avoids tiny incremental

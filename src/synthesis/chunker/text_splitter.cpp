@@ -379,7 +379,8 @@ std::vector<std::string> split_into_candidate_units(const std::string & text) {
     for (const auto & para : paragraphs) {
         auto sentences = split_sentences(para);
         for (const auto & sent : sentences) {
-            auto clauses = split_keep_delimiter(sent, { "；", "：", "，", "、" });
+            auto clauses = split_keep_delimiter(
+                sent, { "; ", ": ", ", ", ";", ":", ",", "；", "：", "，", "、" });
             for (const auto & clause : clauses) {
                 std::string s = trim_ascii(clause);
                 if (!s.empty()) {

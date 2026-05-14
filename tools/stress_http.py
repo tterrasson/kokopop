@@ -1,6 +1,6 @@
 #!/usr/bin/env uv run python
 """
-Stress test for kokopop HTTP server (interactive mode).
+Stress test for kokopop HTTP server (adaptative mode).
 
 Usage:
     uv run tests/stress_http.py [--port 8080] [--host 127.0.0.1] \
@@ -38,7 +38,7 @@ def send_request(url: str, text: str, voice: str, idx: int):
     payload = json.dumps({
         "text": text,
         "voice": voice,
-        "mode": "interactive",
+        "mode": "adaptative",
     }).encode("utf-8")
 
     req = urllib.request.Request(

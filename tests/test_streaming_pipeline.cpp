@@ -1,5 +1,6 @@
 #include "test_helpers.h"
 #include "streaming/streaming.h"
+#include "http/synthesis_scheduler.h"
 
 #include <atomic>
 #include <chrono>
@@ -62,13 +63,13 @@ std::unique_ptr<kokopop::Model> load_mock_model() {
 TEST_CASE("streaming_pipeline_delivers_all_chunks_in_order") {
     auto model = load_mock_model();
     // A multi-sentence text guarantees several chunks under the default
-    // interactive chunker config — exercising the pipeline lookahead.
+    // adaptative chunker config — exercising the pipeline lookahead.
     const std::string text =
         "Premier chunk. Deuxième chunk. Troisième chunk. Quatrième chunk. Cinquième chunk.";
 
     Capture cap;
     auto handle = kokopop::stream_synthesize(
-        *model, text, "af_heart", 1.0f, kokopop::StreamMode::Interactive,
+        *model, text, "af_heart", 1.0f, kokopop::StreamMode::Adaptative,
         record_callback, &cap);
     handle.join();
 
@@ -92,7 +93,7 @@ TEST_CASE("streaming_pipeline_stops_promptly_when_callback_returns_false") {
     cap.stop_after_index = 1;  // stop after the second chunk's callback fires
 
     auto handle = kokopop::stream_synthesize(
-        *model, text, "af_heart", 1.0f, kokopop::StreamMode::Interactive,
+        *model, text, "af_heart", 1.0f, kokopop::StreamMode::Adaptative,
         record_callback, &cap);
     handle.join();
 
@@ -113,7 +114,7 @@ TEST_CASE("streaming_pipeline_handles_single_chunk_text") {
     auto model = load_mock_model();
     Capture cap;
     auto handle = kokopop::stream_synthesize(
-        *model, "abc", "af_heart", 1.0f, kokopop::StreamMode::Interactive,
+        *model, "abc", "af_heart", 1.0f, kokopop::StreamMode::Adaptative,
         record_callback, &cap);
     handle.join();
 
@@ -132,7 +133,7 @@ TEST_CASE("streaming_pipeline_external_stop_is_honoured") {
 
     Capture cap;
     auto handle = kokopop::stream_synthesize(
-        *model, text, "af_heart", 1.0f, kokopop::StreamMode::Interactive,
+        *model, text, "af_heart", 1.0f, kokopop::StreamMode::Adaptative,
         record_callback, &cap);
     handle.stop();
     handle.join();
@@ -140,5 +141,40 @@ TEST_CASE("streaming_pipeline_external_stop_is_honoured") {
     // Indices, if any, must still be in order.
     for (size_t i = 1; i < cap.indices.size(); ++i) {
         CHECK_LT(cap.indices[i - 1], cap.indices[i]);
+    }
+}
+
+TEST_CASE("synthesis_scheduler_adaptative_delivers_chunks_in_order") {
+    auto model = load_mock_model();
+    kokopop::SynthesisScheduler scheduler(*model);
+    auto ctx = scheduler.submit(
+        "Bonjour, comment allez-vous ? Deuxième phrase pour vérifier la suite.",
+        "af_heart", 1.0f, kokopop::StreamMode::Adaptative,
+        kokopop::RequestContext::AudioFormat::PCM);
+
+    std::vector<int> indices;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < deadline) {
+        kokopop::RequestContext::AudioChunk chunk;
+        while (ctx->try_pop(chunk)) {
+            indices.push_back(chunk.chunk_index);
+            CHECK_GT(chunk.samples.size(), 0u);
+        }
+        auto state = ctx->state.load();
+        if (state == kokopop::RequestContext::State::DONE ||
+            state == kokopop::RequestContext::State::ERROR ||
+            state == kokopop::RequestContext::State::CANCELLED) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+
+    scheduler.stop();
+    scheduler.join();
+
+    CHECK_EQ(ctx->state.load(), kokopop::RequestContext::State::DONE);
+    REQUIRE_FALSE(indices.empty());
+    for (size_t i = 1; i < indices.size(); ++i) {
+        CHECK_LT(indices[i - 1], indices[i]);
     }
 }

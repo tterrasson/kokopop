@@ -116,7 +116,7 @@ void StdioStreamer::_synthesize(const std::string & text) {
 
     std::fprintf(stderr, "[kokopop] Synthesizing: %zu chars, voice=%s, speed=%.1f, mode=%s\n",
                 text.size(), _voice.c_str(), _speed,
-                _mode == StreamMode::LongForm ? "long_form" : "interactive");
+                _mode == StreamMode::LongForm ? "long_form" : "adaptative");
 
     auto handle = stream_synthesize(
         _model,

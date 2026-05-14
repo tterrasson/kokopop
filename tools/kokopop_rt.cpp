@@ -350,7 +350,7 @@ int main(int argc, char ** argv) {
     const auto t_prepare_start = now_us();
     auto plan = kokopop::prepare_synthesis(
         *model, text, voice, opts.speed,
-        kokopop::StreamMode::Interactive, error);
+        kokopop::StreamMode::Adaptative, error);
     const double t_prepare_ms = ms(now_us() - t_prepare_start);
 
     if (plan.chunks.empty()) {
