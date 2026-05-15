@@ -329,8 +329,9 @@ docker build --format docker \
 ### Run the HTTP server
 
 ```bash
-# CPU
-docker run -p 8080:8080 kokopop-cpu
+# CPU, capped at 4 CPUs. kokopop_stream auto-selects
+# min(4, hardware_concurrency()) threads unless --threads is passed.
+docker run --cpus 4 -p 8080:8080 kokopop-cpu
 
 # CUDA with Docker
 docker run --gpus all -p 8080:8080 kokopop-cuda
@@ -339,13 +340,20 @@ docker run --gpus all -p 8080:8080 kokopop-cuda
 podman run --device nvidia.com/gpu=all -p 8080:8080 kokopop-cuda
 ```
 
-### Override voice, port, or mode at runtime
+To override kokopop's inference thread count explicitly, pass `--threads N`
+after the image name together with the full command arguments.
+
+### Override voice, port, mode, or threads at runtime
 
 ```bash
-docker run -p 9000:9000 kokopop-cpu \
+docker run --cpus 4 -p 9000:9000 kokopop-cpu \
+  --model models/kokoro.gguf \
+  --http \
   --voice bf_emma \
+  --bind 0.0.0.0 \
   --port 9000 \
-  --mode long_form
+  --mode long_form \
+  --threads 4
 ```
 
 ### Quick synthesis (one-shot)

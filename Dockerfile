@@ -136,6 +136,7 @@ ENTRYPOINT ["/app/kokopop_stream"]
 CMD [ \
     "--model", "models/kokoro.gguf", \
     "--http", \
+    "--bind", "0.0.0.0", \
     "--port", "8080", \
     "--mode", "adaptative", \
     "--voice", "af_heart" \
@@ -179,6 +180,7 @@ ENTRYPOINT ["/app/kokopop_stream"]
 CMD [ \
     "--model", "models/kokoro.gguf", \
     "--http", \
+    "--bind", "0.0.0.0", \
     "--port", "8080", \
     "--mode", "adaptative", \
     "--voice", "af_heart" \
