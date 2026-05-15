@@ -299,27 +299,50 @@ All options:
 ## Docker
 
 A multi-stage [Dockerfile](Dockerfile) is provided for building and running kokopop without local dependencies.
+The default image is CPU-only. A separate CUDA target builds against NVIDIA CUDA and uses
+`nvidia/cuda:13.2.1-runtime-ubuntu24.04` for the runtime image.
 
 ### Build
 
 ```bash
-# Build with default voices (af_heart, ff_siwis, zf_xiaoxiao, im_nicola)
-docker build -t kokopop .
+# Build the default CPU image with default voices
+# (af_heart, ff_siwis, zf_xiaoxiao, im_nicola)
+docker build --format docker -t kokopop-cpu .
 
-# Build with custom voices and tier
-docker build --build-arg VOICES="af_heart,bf_emma,zf_xiaoxiao" --build-arg TIER="kokoro-lg" -t kokopop .
+# Build the CPU image with custom voices and tier
+docker build --format docker \
+  --build-arg VOICES="af_heart,bf_emma,zf_xiaoxiao" \
+  --build-arg TIER="kokoro-lg" \
+  -t kokopop-cpu .
+
+# Build the CUDA image
+docker build --format docker --target runtime-cuda -t kokopop-cuda .
+
+# Build the CUDA image with custom voices and tier
+docker build --format docker \
+  --target runtime-cuda \
+  --build-arg VOICES="af_heart,bf_emma,zf_xiaoxiao" \
+  --build-arg TIER="kokoro-lg" \
+  -t kokopop-cuda .
 ```
 
 ### Run the HTTP server
 
 ```bash
-docker run -p 8080:8080 kokopop
+# CPU
+docker run -p 8080:8080 kokopop-cpu
+
+# CUDA with Docker
+docker run --gpus all -p 8080:8080 kokopop-cuda
+
+# CUDA with Podman using NVIDIA CDI
+podman run --device nvidia.com/gpu=all -p 8080:8080 kokopop-cuda
 ```
 
 ### Override voice, port, or mode at runtime
 
 ```bash
-docker run -p 8080:8080 kokopop \
+docker run -p 9000:9000 kokopop-cpu \
   --voice bf_emma \
   --port 9000 \
   --mode long_form
@@ -331,7 +354,7 @@ Override the default HTTP server command to use `kokopop_say`-like synthesis via
 
 ```bash
 echo '{"text": "Hello from Docker!", "flush": true}' | \
-  docker run -i --rm kokopop \
+  docker run -i --rm kokopop-cpu \
     --model models/kokoro.gguf \
     --voice af_heart \
     --mode long_form > output.raw
