@@ -137,7 +137,7 @@ CMD [ \
     "--model", "models/kokoro.gguf", \
     "--http", \
     "--port", "8080", \
-    "--mode", "interactive", \
+    "--mode", "adaptative", \
     "--voice", "af_heart" \
 ]
 
