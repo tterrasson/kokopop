@@ -112,6 +112,38 @@ bool metal_vocoder_run_stage(
     const MetalResblockIterWeights noise_iters[3],
     const MetalResblockIterWeights main_iters[3][3]);
 
+// Fused post_conv + iSTFT path. Runs everything in a single Metal
+// command buffer on the vocoder's queue:
+//   1. leaky_relu(x_in, 0.01)                            x_in : [T_in, IC_in]
+//   2. post = conv1d(post_w, x_in) + post_b              post : [T_in, 22]
+//   3. iSTFT 3-pass (idft → overlap-add → normalize)     audio: [out_len]
+//
+// Cross-stage cache (set by metal_vocoder_run_stage) is honoured: if
+// x_in_data matches the previous stage's downloaded output pointer, the
+// CPU upload is skipped and the data is blitted in from GPU memory.
+//
+// Returns false if iSTFT pipelines are unavailable (caller must fall back
+// to the CPU/separate-Metal-iSTFT path).
+// Returns true if the fused post_conv+iSTFT kernels are loaded. Used by
+// audio_utils.cpp to decide whether to emit the graph's CPU post_conv ops.
+bool metal_vocoder_post_istft_available(const MetalVocoderState * state);
+
+bool metal_vocoder_run_post_istft(
+    MetalVocoderState * state,
+
+    // x_in : post-stage-1 generator output (CPU pointer).
+    const float * x_in_data, int64_t T_in, int64_t IC_in,
+
+    // Post-conv weights (K=7, stride=1, padding=3, IC_in -> 22).
+    const ggml_tensor * post_w,
+    const ggml_tensor * post_b,
+
+    // iSTFT shape.
+    int n_frames, int out_len,
+
+    // Output (CPU buffer of out_len floats).
+    float * audio_out);
+
 } // namespace kokopop
 
 #endif // KOKOPOP_HAS_METAL

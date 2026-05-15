@@ -170,6 +170,10 @@ struct Model {
     // See graph_ops.cpp::lstm_direction for usage.
     std::vector<struct LstmCustomParams> lstm_custom_params;
 
+    // Scratch storage for Metal LSTM pre-gates matmul params. Reserved
+    // alongside lstm_custom_params; same lifetime semantics.
+    std::vector<struct LstmPregatesParams> lstm_pregates_params;
+
     // Scratch storage for experimental Metal vocoder custom-op parameters.
     // Reserved before building the generator graph so userdata pointers remain
     // stable until graph execution completes.

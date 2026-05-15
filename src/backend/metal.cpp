@@ -401,6 +401,12 @@ public:
         }
     }
 
+    void preload_lstm_wih(const std::string & key, const float * w_ih_f32, int I, int four_H) override {
+        if (lstm_kernel_ != nullptr) {
+            metal_lstm_preload_wih(lstm_kernel_, key.c_str(), w_ih_f32, I, four_H);
+        }
+    }
+
     void * metal_lstm_kernel() const override {
         return lstm_kernel_;
     }

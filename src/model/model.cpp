@@ -480,6 +480,11 @@ void Model::preload_tensor_cache() {
         if (kv.second == nullptr) continue;
         std::vector<float> data;
         if (tensor_to_f32(*backend, kv.second, data)) {
+            // Push to Metal pre-gates cache (no-op on non-Metal).
+            // ggml mul_mat conventions: w_ih has shape [I, 4H] (ne[0]=I fast).
+            const int I      = static_cast<int>(kv.second->ne[0]);
+            const int four_H = static_cast<int>(kv.second->ne[1]);
+            backend->preload_lstm_wih(kv.first, data.data(), I, four_H);
             lstm_w_ih_f32.emplace(kv.first, std::move(data));
         }
     }

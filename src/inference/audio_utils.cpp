@@ -4,6 +4,7 @@
 
 #ifdef KOKOPOP_HAS_METAL
 #include "backend/metal_stft.h"
+#include "backend/metal_vocoder.h"
 #endif
 
 #include <algorithm>
@@ -135,7 +136,7 @@ static bool fill_harmonic_stft(
 
     const int64_t n_samples = static_cast<int64_t>(f0.size()) * upsample;
 
-    // 7.1 — Reuse pre-allocated source buffer instead of allocating every call.
+    // Reuse pre-allocated source buffer instead of allocating every call.
     // The buffer lives in Model and grows to accommodate the largest chunk.
     std::vector<float> & source = model.tmp_stft_source_f32;
     if (source.size() < static_cast<size_t>(n_samples)) {
@@ -328,7 +329,7 @@ static bool fill_harmonic_stft(
                 source[static_cast<size_t>(seg_start + j)] = std::tanh(merged);
             }
 #endif
-            // 7.2 — Phase normalisation every K segments instead of every segment.
+            // Phase normalisation every K segments instead of every segment.
             // Full normalisation (sqrt) after every upsample-step is expensive.
             // Every 16 segments (~4800 samples at 300 upsamp.) keeps float drift
             // well below 1e-6 — inaudible for audio synthesis.
@@ -351,7 +352,7 @@ static bool fill_harmonic_stft(
         }
     }
 
-    // 7.1 — Reuse pre-allocated harmonic STFT buffer.
+    // Reuse pre-allocated harmonic STFT buffer.
     // The buffer lives in Model; the CPU path overwrites all useful elements; no zero-fill needed.
     const size_t har_size = static_cast<size_t>(22 * target_frames);
     if (har_data.size() < har_size) {
@@ -432,9 +433,9 @@ CpuTensor cpu_harmonic_stft(Model & model, const std::vector<float> & f0, int64_
     };
 }
 
-// 7.3 — cpu_istft now accepts a Model& and a std::vector<float>& for the output buffer.
-// The intermediate y[] and denom[] arrays are cached inside Model and reused across calls,
-// eliminating two large allocations per chunk.
+// cpu_istft takes a Model& and a std::vector<float>& for the output buffer.
+// The intermediate y[] and denom[] arrays are cached inside Model and reused
+// across calls, eliminating two large allocations per chunk.
 static bool cpu_istft_data(Model & model, const float * post_data, int64_t n_frames, std::vector<float> & out) {
     constexpr int n_fft = KOKOPOP_STFT_N;
     constexpr int hop = KOKOPOP_STFT_HOP;
@@ -462,7 +463,7 @@ static bool cpu_istft_data(Model & model, const float * post_data, int64_t n_fra
     }
 #endif
 
-    // 7.3 — Reuse pre-allocated accumulator and denominator buffers.
+    // Reuse pre-allocated accumulator and denominator buffers.
     std::vector<float> & y = model.tmp_istft_y_f32;
     std::vector<float> & denom = model.tmp_istft_denom_f32;
     const size_t pad_size = static_cast<size_t>(padded_len);
@@ -766,23 +767,61 @@ bool ggml_generator(
         }
     }
 
-    x = ggml_leaky_relu(ctx, x, 0.01f, false);
-    ggml_tensor * pre_post = ggml_cont(ctx, x);
+    // When the fused post_conv + iSTFT chain is available, stop the graph at
+    // the stage 1 output: leaky_relu(0.01), conv_post and the iSTFT all run
+    // on the GPU in a single command buffer after compute. POST_STATS forces
+    // the full ggml path so the pre_post/post taps remain available for
+    // stats/dumps.
+#ifdef KOKOPOP_HAS_METAL
+    auto * metal_vocoder = (model.backend != nullptr)
+        ? static_cast<MetalVocoderState *>(model.backend->metal_vocoder_kernel())
+        : nullptr;
+    const bool use_fused_post_istft =
+        metal_vocoder != nullptr &&
+        metal_vocoder_post_istft_available(metal_vocoder) &&
+        !post_stats;
+#else
+    const bool use_fused_post_istft = false;
+#endif
 
-    ggml_tensor * post_w = require_tensor(model, "kokopop.decoder.generator.conv_post.weight", error);
-    ggml_tensor * post_b = require_tensor(model, "kokopop.decoder.generator.conv_post.bias", error);
-    if (!error.empty()) {
-        ggml_free(ctx);
-        return false;
-    }
+    ggml_tensor * post_w_tensor = nullptr;
+    ggml_tensor * post_b_tensor = nullptr;
+    ggml_tensor * post = nullptr;
+    ggml_tensor * pre_post = nullptr;
+    ggml_tensor * stage1_out_tap = nullptr;
 
-    ggml_tensor * post = add_channel_bias(ctx, conv1d(ctx, post_w, x, 1, 3, 1, 7), post_b);
-    post = ggml_cont(ctx, post);
-    ggml_set_name(post, "kokopop_generator_post");
-    ggml_set_output(post);
-    if (std::getenv("KOKOPOP_POST_STATS") != nullptr) {
-        ggml_set_name(pre_post, "kokopop_generator_pre_post");
-        ggml_set_output(pre_post);
+    if (use_fused_post_istft) {
+        // Resolve post_conv weights (used after compute by the fused GPU call).
+        post_w_tensor = require_tensor(model, "kokopop.decoder.generator.conv_post.weight", error);
+        post_b_tensor = require_tensor(model, "kokopop.decoder.generator.conv_post.bias",   error);
+        if (!error.empty()) {
+            ggml_free(ctx);
+            return false;
+        }
+        // Anchor the stage 1 output as the graph's terminal tensor — the GPU
+        // path reads it directly via the cross-stage cache.
+        stage1_out_tap = ggml_cont(ctx, x);
+        ggml_set_name(stage1_out_tap, "kokopop_generator_stage1_out");
+        ggml_set_output(stage1_out_tap);
+    } else {
+        x = ggml_leaky_relu(ctx, x, 0.01f, false);
+        pre_post = ggml_cont(ctx, x);
+
+        post_w_tensor = require_tensor(model, "kokopop.decoder.generator.conv_post.weight", error);
+        post_b_tensor = require_tensor(model, "kokopop.decoder.generator.conv_post.bias",   error);
+        if (!error.empty()) {
+            ggml_free(ctx);
+            return false;
+        }
+
+        post = add_channel_bias(ctx, conv1d(ctx, post_w_tensor, x, 1, 3, 1, 7), post_b_tensor);
+        post = ggml_cont(ctx, post);
+        ggml_set_name(post, "kokopop_generator_post");
+        ggml_set_output(post);
+        if (std::getenv("KOKOPOP_POST_STATS") != nullptr) {
+            ggml_set_name(pre_post, "kokopop_generator_pre_post");
+            ggml_set_output(pre_post);
+        }
     }
 
     const bool gen_profile = std::getenv("KOKOPOP_GEN_PROFILE") != nullptr;
@@ -795,7 +834,11 @@ bool ggml_generator(
     // only via params (callback userdata), so without this explicit expand
     // the scheduler would prune it and tensor_set(har_t) would crash.
     ggml_build_forward_expand(gf, har_t);
-    ggml_build_forward_expand(gf, post);
+    if (use_fused_post_istft) {
+        ggml_build_forward_expand(gf, stage1_out_tap);
+    } else {
+        ggml_build_forward_expand(gf, post);
+    }
     if (post_stats) {
         for (int stage = 0; stage < 2; ++stage) {
             if (stage_debug[stage] != nullptr) ggml_build_forward_expand(gf, stage_debug[stage]);
@@ -848,6 +891,41 @@ bool ggml_generator(
         error = "ggml generator graph compute failed";
         return false;
     }
+
+#ifdef KOKOPOP_HAS_METAL
+    if (use_fused_post_istft) {
+        // Download stage 1 output (the cross-stage cache leaves a GPU-resident
+        // copy for the fused post-istft call) and run the fused post_conv +
+        // iSTFT chain on GPU. On failure, fall back to the CPU post_conv +
+        // iSTFT path by emulating it here.
+        const int64_t T_in  = stage1_out_tap->ne[0];
+        const int64_t IC_in = stage1_out_tap->ne[1];
+        std::vector<float> & x_data = model.tmp_post_f32;
+        const size_t x_n = static_cast<size_t>(T_in * IC_in);
+        if (x_data.size() < x_n) x_data.resize(x_n);
+        model.backend->tensor_get(stage1_out_tap, x_data.data(), 0, x_n * sizeof(float));
+
+        constexpr int n_fft = KOKOPOP_STFT_N;
+        constexpr int hop   = KOKOPOP_STFT_HOP;
+        const int64_t padded_len = n_fft + hop * (T_in - 1);
+        const int64_t out_len    = std::max<int64_t>(0, padded_len - 2 * (n_fft / 2));
+        audio.resize(static_cast<size_t>(out_len));
+
+        if (metal_vocoder_run_post_istft(metal_vocoder,
+                                         x_data.data(), T_in, IC_in,
+                                         post_w_tensor, post_b_tensor,
+                                         static_cast<int>(T_in),
+                                         static_cast<int>(out_len),
+                                         audio.data())) {
+            ggml_free(ctx);
+            return !audio.empty();
+        }
+        std::fprintf(stderr, "[metal_vocoder] fused post_istft failed — no CPU fallback in fused mode\n");
+        ggml_free(ctx);
+        error = "fused post_istft failed";
+        return false;
+    }
+#endif
 
     const size_t post_size = static_cast<size_t>(ggml_nelements(post));
     std::vector<float> & post_data = model.tmp_post_f32;

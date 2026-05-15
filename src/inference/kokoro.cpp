@@ -289,6 +289,8 @@ bool run_kokoro_frontend_probe(
 
     model.lstm_custom_params.clear();
     model.lstm_custom_params.reserve(24);
+    model.lstm_pregates_params.clear();
+    model.lstm_pregates_params.reserve(24);
 
     ggml_tensor * d = duration_encoder(ctx, model, cur, style, n_tokens, error);
     if (d == nullptr) {
@@ -447,6 +449,8 @@ bool run_kokoro_generation_probe(
 
     model.lstm_custom_params.clear();
     model.lstm_custom_params.reserve(24);
+    model.lstm_pregates_params.clear();
+    model.lstm_pregates_params.reserve(24);
 
     ggml_tensor * token_ids     = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
     ggml_tensor * duration_pred = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, frontend.hidden_dim, n_tokens);

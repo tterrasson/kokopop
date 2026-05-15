@@ -93,6 +93,42 @@ kernel void kokopop_lstm_fused_h256(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
+
+// Pre-gates matmul. Computes pre_gates = w_ih @ input  (no bias).
+//   w_ih   : [I, 4H]  fast dim = I  (ggml column-major)  → w_ih[i + I*g]
+//   input  : [I, N]   fast dim = I                       → input[i + I*t]
+//   output : [4H, N]  fast dim = 4H                      → output[g + 4H*t]
+//
+// One simdgroup (32 lanes) cooperates on each (g, t) output; the I-axis
+// reduction is split across lanes and merged via simd_sum. Launch shape:
+//   dispatchThreads(32, 4H, N), threadsPerThreadgroup(32, 1, 1).
+struct PregatesArgs {
+    uint I;
+    uint four_H;
+    uint N;
+};
+
+kernel void kokopop_lstm_pregates_matmul(
+    constant PregatesArgs & args [[ buffer(0) ]],
+    device const float * w_ih    [[ buffer(1) ]],
+    device const float * input   [[ buffer(2) ]],
+    device float       * output  [[ buffer(3) ]],
+    uint3 gid  [[ thread_position_in_grid ]],
+    uint  lane [[ thread_index_in_simdgroup ]]
+) {
+    const uint g = gid.y;
+    const uint t = gid.z;
+    if (g >= args.four_H || t >= args.N) return;
+
+    float acc = 0.0f;
+    for (uint i = lane; i < args.I; i += 32u) {
+        acc += w_ih[i + args.I * g] * input[i + args.I * t];
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) {
+        output[g + args.four_H * t] = acc;
+    }
+}
 )MSL";
 
 // -----------------------------------------------------------------------------
@@ -129,6 +165,12 @@ struct MetalLstmKernelState {
     id<MTLBuffer> pre_gates_buf = nil;
     id<MTLBuffer> b_hh_buf = nil;
     id<MTLBuffer> output_buf = nil;
+
+    // Pre-gates matmul pipeline + buffers.
+    id<MTLComputePipelineState> pregates_pipeline = nil;
+    std::unordered_map<std::string, id<MTLBuffer>> wih_buffers;
+    id<MTLBuffer> pregates_input_buf  = nil;  // Shared, [I, N]
+    id<MTLBuffer> pregates_output_buf = nil;  // Shared, [4H, N]
 
     bool valid = false;
 
@@ -263,6 +305,17 @@ MetalLstmKernelState * metal_lstm_create() {
             return nullptr;
         }
 
+        // Pre-gates matmul pipeline (best-effort).
+        id<MTLFunction> pregates_fn = [lib newFunctionWithName:@"kokopop_lstm_pregates_matmul"];
+        if (pregates_fn != nil) {
+            NSError * pgerr = nil;
+            state->pregates_pipeline = [state->device newComputePipelineStateWithFunction:pregates_fn error:&pgerr];
+            if (state->pregates_pipeline == nil) {
+                std::fprintf(stderr, "[metal_lstm] pregates pipeline error: %s\n",
+                             pgerr ? [[pgerr localizedDescription] UTF8String] : "unknown");
+            }
+        }
+
         state->valid = true;
         return state;
     }
@@ -314,6 +367,92 @@ void metal_lstm_preload_whh(
     }
 
     state->whh_buffers[key] = buf;
+}
+
+// Uploads I*4H f32 of w_ih once per (key, shape), caches the MTLBuffer,
+// and reuses it across calls.
+void metal_lstm_preload_wih(
+    MetalLstmKernelState * state,
+    const char * key,
+    const float * w_ih_f32,
+    int I,
+    int four_H
+) {
+    if (state == nullptr || !state->valid || key == nullptr || w_ih_f32 == nullptr ||
+        state->pregates_pipeline == nil || I <= 0 || four_H <= 0) {
+        return;
+    }
+    const size_t bytes = static_cast<size_t>(I) * static_cast<size_t>(four_H) * sizeof(float);
+    id<MTLBuffer> buf = [state->device newBufferWithBytes:w_ih_f32
+                                                    length:bytes
+                                                   options:MTLResourceStorageModeShared];
+    if (buf == nil) {
+        std::fprintf(stderr, "[metal_lstm] failed to allocate w_ih buffer for %s\n", key);
+        return;
+    }
+    state->wih_buffers[key] = buf;
+}
+
+bool metal_lstm_pregates_matmul(
+    MetalLstmKernelState * state,
+    const char * key,
+    const float * input,
+    float       * pre_gates,
+    int I, int four_H, int N
+) {
+    @autoreleasepool {
+        if (state == nullptr || !state->valid || state->pregates_pipeline == nil ||
+            key == nullptr || input == nullptr || pre_gates == nullptr ||
+            I <= 0 || four_H <= 0 || N <= 0) {
+            return false;
+        }
+        auto it = state->wih_buffers.find(key);
+        if (it == state->wih_buffers.end()) return false;
+        id<MTLBuffer> wih_buf = it->second;
+
+        const size_t input_bytes  = static_cast<size_t>(I) * static_cast<size_t>(N) * sizeof(float);
+        const size_t output_bytes = static_cast<size_t>(four_H) * static_cast<size_t>(N) * sizeof(float);
+        state->pregates_input_buf  = ensure_buf(state->device, state->pregates_input_buf,  input_bytes);
+        state->pregates_output_buf = ensure_buf(state->device, state->pregates_output_buf, output_bytes);
+        if (state->pregates_input_buf == nil || state->pregates_output_buf == nil) return false;
+
+        std::memcpy([state->pregates_input_buf contents], input, input_bytes);
+
+        id<MTLCommandBuffer> cmd = [state->queue commandBuffer];
+        if (cmd == nil) return false;
+
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        if (enc == nil) return false;
+
+        const uint32_t args[3] = {
+            static_cast<uint32_t>(I),
+            static_cast<uint32_t>(four_H),
+            static_cast<uint32_t>(N),
+        };
+        [enc setComputePipelineState:state->pregates_pipeline];
+        [enc setBytes:args  length:sizeof(args) atIndex:0];
+        [enc setBuffer:wih_buf                    offset:0 atIndex:1];
+        [enc setBuffer:state->pregates_input_buf  offset:0 atIndex:2];
+        [enc setBuffer:state->pregates_output_buf offset:0 atIndex:3];
+
+        [enc dispatchThreads:MTLSizeMake(32,
+                                          static_cast<NSUInteger>(four_H),
+                                          static_cast<NSUInteger>(N))
+       threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        [enc endEncoding];
+
+        [cmd commit];
+        [cmd waitUntilCompleted];
+
+        if ([cmd status] != MTLCommandBufferStatusCompleted) {
+            std::fprintf(stderr, "[metal_lstm] pregates command failed status=%lu\n",
+                         static_cast<unsigned long>([cmd status]));
+            return false;
+        }
+
+        std::memcpy(pre_gates, [state->pregates_output_buf contents], output_bytes);
+        return true;
+    }
 }
 
 void metal_lstm_run(

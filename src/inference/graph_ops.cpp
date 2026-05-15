@@ -3,6 +3,7 @@
 
 #ifdef KOKOPOP_HAS_METAL
 #include "backend/metal_vocoder.h"
+#include "backend/metal_lstm.h"
 #endif
 
 #include "core/constants.h"
@@ -1329,8 +1330,23 @@ ggml_tensor * lstm_direction(
 
     const int64_t hidden = w.hidden;
 
+    // Metal pre-gates matmul. Runs `pre_gates = w_ih @ input` in a Metal
+    // command buffer using a preloaded w_ih buffer; the CPU LSTM recurrence
+    // consumes the downloaded pre_gates afterward.
+    ggml_tensor * mul_result = nullptr;
+#ifdef KOKOPOP_HAS_METAL
+    const bool use_pregates_metal =
+        model.backend != nullptr &&
+        model.backend->metal_lstm_kernel() != nullptr;
+#else
+    const bool use_pregates_metal = false;
+#endif
+
+    // When the pregates Metal path is active we don't add w_ih to the graph
+    // (the weight lives in a preloaded Metal buffer instead). Otherwise build
+    // a host-visible F32 copy as before for the ggml mul_mat path.
     ggml_tensor * w_ih = w.w_ih_packed;
-    if (model.backend_type != KOKOPOP_BACKEND_CUDA) {
+    if (!use_pregates_metal && model.backend_type != KOKOPOP_BACKEND_CUDA) {
         const std::string wih_key = prefix + ".weight_ih_l0" + (reverse ? "_reverse" : "");
         const auto wih_it = model.lstm_w_ih_f32.find(wih_key);
         if (wih_it == model.lstm_w_ih_f32.end()) {
@@ -1349,10 +1365,38 @@ ggml_tensor * lstm_direction(
             wih_it->second.size() * sizeof(float));
     }
 
-    ggml_tensor * pre_input_gates_packed = ggml_add(
-        ctx,
-        ggml_mul_mat(ctx, w_ih, input),
-        w.b_ih_packed);
+#ifdef KOKOPOP_HAS_METAL
+    if (use_pregates_metal) {
+        const std::string wih_key = prefix + ".weight_ih_l0" + (reverse ? "_reverse" : "");
+        const auto wih_it = model.lstm_w_ih_f32.find(wih_key);
+        if (wih_it == model.lstm_w_ih_f32.end()) {
+            error = "fused LSTM: w_ih not preloaded for " + wih_key;
+            return nullptr;
+        }
+        const int64_t I      = w.w_ih_packed->ne[0];
+        const int64_t four_H = w.w_ih_packed->ne[1];
+
+        model.lstm_pregates_params.push_back(LstmPregatesParams{
+            model.backend->metal_lstm_kernel(),
+            wih_it->first.c_str(),
+            static_cast<int>(I),
+            static_cast<int>(four_H),
+            static_cast<int>(n_steps),
+        });
+        const LstmPregatesParams * pg = &model.lstm_pregates_params.back();
+
+        ggml_tensor * dst = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, four_H, n_steps);
+        model.backend->queue_zero_tensor(dst);
+        mul_result = ggml_map_custom2_inplace(
+            ctx, dst, input,
+            lstm_pregates_callback, 1,
+            const_cast<LstmPregatesParams *>(pg));
+    }
+#endif
+    if (mul_result == nullptr) {
+        mul_result = ggml_mul_mat(ctx, w_ih, input);
+    }
+    ggml_tensor * pre_input_gates_packed = ggml_add(ctx, mul_result, w.b_ih_packed);
 
     const std::string whh_key = prefix + ".weight_hh_l0" + (reverse ? "_reverse" : "");
     const auto it = model.lstm_w_hh_f32.find(whh_key);

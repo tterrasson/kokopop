@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 
@@ -354,6 +355,44 @@ void lstm_fused_callback(
 #endif
 
     cpu_lstm(*p, pre_gates, dst);
+}
+
+// Pre-gates matmul callback. Computes dst = w_ih @ input using the Metal
+// LSTM kernel state. On Metal failure the function emits zeros and logs
+// (loud failure rather than silent degradation).
+void lstm_pregates_callback(
+    ggml_tensor       * dst,
+    const ggml_tensor * /*dst_unused*/,
+    const ggml_tensor * input,
+    int ith,
+    int /*nth*/,
+    void * userdata) {
+
+    if (ith != 0) return;
+
+    const LstmPregatesParams * p = static_cast<const LstmPregatesParams *>(userdata);
+    GGML_ASSERT(p != nullptr);
+    GGML_ASSERT(dst != nullptr);
+    GGML_ASSERT(input != nullptr);
+
+#ifdef KOKOPOP_HAS_METAL
+    if (p->metal_kernel != nullptr &&
+        tensor_is_f32_2d_contiguous(input, p->I, p->n_steps) &&
+        tensor_is_f32_2d_contiguous(dst, p->four_H, p->n_steps)) {
+        if (metal_lstm_pregates_matmul(
+                static_cast<MetalLstmKernelState *>(p->metal_kernel),
+                p->wih_key,
+                static_cast<const float *>(input->data),
+                static_cast<float *>(dst->data),
+                p->I, p->four_H, p->n_steps)) {
+            return;
+        }
+    }
+#endif
+
+    std::fprintf(stderr, "[lstm_pregates] Metal call failed for %s\n",
+                 p->wih_key ? p->wih_key : "(unknown)");
+    std::memset(dst->data, 0, ggml_nbytes(dst));
 }
 
 } // namespace kokopop
