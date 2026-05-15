@@ -88,7 +88,22 @@ FROM builder-cpu AS model-export
 
 # Voices to embed — override at build time:
 #   docker build --build-arg VOICES="af_heart,bf_emma,zf_xiaoxiao" .
-ARG VOICES="af_heart,ff_siwis,zf_xiaoxiao,im_nicola"
+#
+# Default set — all languages except Japanese and Hindi:
+#   American English – Female: af_heart af_alloy af_aoede af_bella af_jessica af_kore af_nicole af_nova af_river af_sarah af_sky
+#   American English – Male:   am_adam am_echo am_eric am_fenrir am_liam am_michael am_onyx am_puck am_santa
+#   British English – Female:  bf_alice bf_emma bf_isabella bf_lily
+#   British English – Male:    bm_daniel bm_fable bm_george bm_lewis
+#   Mandarin Chinese – Female: zf_xiaobei zf_xiaoni zf_xiaoxiao zf_xiaoyi
+#   Mandarin Chinese – Male:   zm_yunjian zm_yunxi zm_yunxia zm_yunyang
+#   Spanish – Female:          ef_dora
+#   Spanish – Male:            em_alex em_santa
+#   French – Female:           ff_siwis
+#   Italian – Female:          if_sara
+#   Italian – Male:            im_nicola
+#   Brazilian Portuguese – F:  pf_dora
+#   Brazilian Portuguese – M:  pm_alex pm_santa
+ARG VOICES="af_heart,af_alloy,af_aoede,af_bella,af_jessica,af_kore,af_nicole,af_nova,af_river,af_sarah,af_sky,am_adam,am_echo,am_eric,am_fenrir,am_liam,am_michael,am_onyx,am_puck,am_santa,bf_alice,bf_emma,bf_isabella,bf_lily,bm_daniel,bm_fable,bm_george,bm_lewis,zf_xiaobei,zf_xiaoni,zf_xiaoxiao,zf_xiaoyi,zm_yunjian,zm_yunxi,zm_yunxia,zm_yunyang,ef_dora,em_alex,em_santa,ff_siwis,if_sara,im_nicola,pf_dora,pm_alex,pm_santa"
 ARG TIER="kokoro-md"
 
 RUN uv sync --no-dev && \

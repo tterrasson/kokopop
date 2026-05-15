@@ -302,6 +302,36 @@ A multi-stage [Dockerfile](Dockerfile) is provided for building and running koko
 The default image is CPU-only. A separate CUDA target builds against NVIDIA CUDA and uses
 `nvidia/cuda:13.2.1-runtime-ubuntu24.04` for the runtime image.
 
+### Pre-built image (CPU)
+
+A ready-to-use CPU image is published on Docker Hub as [`tterrasson/kokopop-cpu`](https://hub.docker.com/r/tterrasson/kokopop-cpu):
+
+```bash
+# Pull the image
+docker pull tterrasson/kokopop-cpu
+
+# Run the HTTP server (default voices: af_heart, ff_siwis, zf_xiaoxiao, im_nicola)
+docker run --cpus 4 -p 8080:8080 tterrasson/kokopop-cpu
+
+# Override voice, port, or threads at runtime
+docker run --cpus 4 -p 9000:9000 tterrasson/kokopop-cpu \
+  --model models/kokoro.gguf \
+  --http \
+  --voice bf_emma \
+  --bind 0.0.0.0 \
+  --port 9000
+
+# Quick one-shot synthesis
+echo '{"text": "Hello from Docker!", "flush": true}' | \
+  docker run -i --rm tterrasson/kokopop-cpu \
+    --model models/kokoro.gguf \
+    --voice af_heart \
+    --mode long_form > output.raw
+
+# Convert to WAV
+ffmpeg -f f32le -ar 24000 -ac 1 -i output.raw output.wav
+```
+
 ### Build
 
 ```bash
