@@ -17,7 +17,7 @@ ChunkConfig make_adaptative_config() {
     ChunkConfig cfg;
     cfg.target_min_tokens = 28;
     cfg.target_max_tokens = 80;
-    cfg.soft_max_tokens = 200;
+    cfg.soft_max_tokens = 320;
     cfg.hard_max_tokens = 510;
     cfg.first_chunk_target_max_tokens = 64;
     cfg.allow_short_first_chunk = true;
@@ -525,10 +525,11 @@ int AdaptativeChunkController::target_tokens(size_t queued_requests) const {
         adjusted_target_ms /= 1.0 + std::min<double>(2.0, queued_requests * 0.35);
     }
     const int estimate = static_cast<int>(adjusted_target_ms / baseline);
-    return std::max(min_tokens, std::min(max_tokens, estimate));
+    const int cap = std::max(min_tokens, std::min(max_tokens, growth_max_tokens));
+    return std::max(min_tokens, std::min(cap, estimate));
 }
 
-void AdaptativeChunkController::observe(int n_tokens, double generation_ms) {
+void AdaptativeChunkController::observe(int n_tokens, double generation_ms, double audio_ms) {
     if (n_tokens <= 0 || generation_ms <= 0.0) return;
     const double sample = generation_ms / static_cast<double>(n_tokens);
     constexpr double alpha = 0.30;
@@ -538,6 +539,34 @@ void AdaptativeChunkController::observe(int n_tokens, double generation_ms) {
     // causing a gap when subsequent synthesis is slower (O(n^2) attention).
     if (ms_per_token_ewma <= 0.0) ms_per_token_ewma = 12.0;
     ms_per_token_ewma = alpha * sample + (1.0 - alpha) * ms_per_token_ewma;
+
+    // Closed-loop: update lead_ms and adjust the dynamic cap AIMD-style.
+    cumulative_audio_ms += audio_ms;
+    if (first_observed) {
+        cumulative_gen_ms_after_first += generation_ms;
+    } else {
+        first_observed = true;
+    }
+
+    const double lead = lead_ms();
+    const double rtf = audio_ms > 0.0 ? generation_ms / audio_ms : 1.0;
+
+    // Shrink when the buffer is critically low, OR when synthesis is losing
+    // ground (rtf > 1) and the buffer isn't already comfortable. Looking at
+    // rtf in addition to absolute lead lets us react one chunk earlier when
+    // generation slows down — otherwise we keep growing the cap until the
+    // buffer has already drained.
+    const bool buffer_critical = lead < safety_floor_ms;
+    const bool losing_ground = rtf > 1.0 && lead < comfort_lead_ms;
+    if (buffer_critical || losing_ground) {
+        const int shrunk = static_cast<int>(growth_max_tokens * shrink_factor);
+        growth_max_tokens = std::max(min_tokens, shrunk);
+    } else if (lead >= comfort_lead_ms && rtf < 0.9) {
+        growth_max_tokens = std::min(max_tokens, growth_max_tokens + grow_step_tokens);
+    } else if (lead >= comfort_lead_ms) {
+        growth_max_tokens = std::min(max_tokens, growth_max_tokens + grow_step_tokens / 2);
+    }
+    // Otherwise (between floor and comfort, rtf ≤ 1): hold steady.
 }
 
 Chunk build_adaptative_chunk(

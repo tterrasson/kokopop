@@ -125,14 +125,38 @@ Chunk build_adaptative_chunk(
     bool is_first);
 
 /// Per-request live controller for adaptative chunk sizing.
+///
+/// Closed-loop control on the audio buffer ahead of playback (`lead_ms`):
+///   lead_ms = Σ audio_ms_i  −  Σ generation_ms_i (chunks 2..N)
+/// The first chunk's generation does not count: the client only starts
+/// playing once it has been delivered.
+///
+/// A dynamic cap `growth_max_tokens` is adjusted AIMD-style after every chunk:
+///   - lead_ms <  safety_floor_ms  → multiplicative shrink (×shrink_factor)
+///   - lead_ms ≥  comfort_lead_ms  → additive grow (+grow_step_tokens)
+///   - in between                  → half-speed grow (+grow_step_tokens/2)
 struct AdaptativeChunkController {
+    // Cost model
     double target_generation_ms = 700.0;
     double ms_per_token_ewma = 0.0;
     int min_tokens = 32;
-    int max_tokens = 220;
+    int max_tokens = 220;            // hard absolute ceiling (soft_max_tokens)
+
+    // Closed-loop state
+    double cumulative_audio_ms = 0.0;
+    double cumulative_gen_ms_after_first = 0.0;
+    bool first_observed = false;
+    int growth_max_tokens = 80;      // dynamic cap, starts at target_max_tokens
+
+    // Tunables for the AIMD loop
+    double safety_floor_ms = 250.0;
+    double comfort_lead_ms = 1500.0;
+    int grow_step_tokens = 16;
+    double shrink_factor = 0.5;
 
     int target_tokens(size_t queued_requests = 0) const;
-    void observe(int n_tokens, double generation_ms);
+    void observe(int n_tokens, double generation_ms, double audio_ms);
+    double lead_ms() const { return cumulative_audio_ms - cumulative_gen_ms_after_first; }
 };
 
 // ---------------------------------------------------------------------------

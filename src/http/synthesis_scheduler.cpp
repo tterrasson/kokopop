@@ -121,7 +121,11 @@ void SynthesisScheduler::_worker_loop() {
                 }
                 ctx->chunk_config = cfg;
                 ctx->adaptative_controller.min_tokens = cfg.target_min_tokens;
-                ctx->adaptative_controller.max_tokens = cfg.target_max_tokens;
+                // Hard absolute ceiling = soft_max_tokens (chunks may grow up
+                // to this when lead_ms stays comfortable). The starting cap
+                // matches the historical static behaviour (target_max_tokens).
+                ctx->adaptative_controller.max_tokens = cfg.soft_max_tokens;
+                ctx->adaptative_controller.growth_max_tokens = cfg.target_max_tokens;
 
                 TokenizeFn tokenize_fn = [this](const std::string & phonemes,
                                                 std::vector<uint32_t> & ids,
@@ -218,18 +222,20 @@ void SynthesisScheduler::_worker_loop() {
                 const auto end = std::chrono::steady_clock::now();
                 const double generation_ms =
                     std::chrono::duration<double, std::milli>(end - start).count();
-                ctx->adaptative_controller.observe(n_tokens, generation_ms);
-                ctx->chunks_total = is_last_chunk ? idx + 1 : 0;
                 const double audio_ms = static_cast<double>(audio.size()) /
                     static_cast<double>(_model.sample_rate) * 1000.0;
+                ctx->adaptative_controller.observe(n_tokens, generation_ms, audio_ms);
+                ctx->chunks_total = is_last_chunk ? idx + 1 : 0;
                 const int next_target = ctx->adaptative_controller.target_tokens(
                     queued_after_pop);
                 std::fprintf(stderr,
                     "[scheduler] request #%u chunk %d: gen=%.0fms audio=%.0fms"
-                    " rtf=%.2f → next_target=%d tokens\n",
+                    " rtf=%.2f lead=%.0fms cap=%d → next_target=%d tokens\n",
                     ctx->request_id, idx + 1,
                     generation_ms, audio_ms,
                     generation_ms / (audio_ms > 0 ? audio_ms : 1.0),
+                    ctx->adaptative_controller.lead_ms(),
+                    ctx->adaptative_controller.growth_max_tokens,
                     next_target);
             }
 

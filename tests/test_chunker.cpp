@@ -196,12 +196,12 @@ TEST_CASE("adaptative_controller_adjusts_budget_from_generation_speed") {
     controller.max_tokens = 200;
     CHECK_EQ(controller.target_tokens(), 58);
 
-    controller.observe(100, 300.0);
+    controller.observe(100, 300.0, 3000.0);
     // Fast synthesis: target rises above the conservative baseline (58).
     // Cold-start seeds the EWMA at 12 ms/token so the jump is dampened.
     CHECK_GT(controller.target_tokens(), 58);
 
-    controller.observe(20, 1000.0);
+    controller.observe(20, 1000.0, 600.0);
     // Slow synthesis: target falls back below the initial baseline.
     CHECK_LT(controller.target_tokens(), 58);
 }
