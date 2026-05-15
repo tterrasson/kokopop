@@ -128,10 +128,11 @@ void metal_vocoder_convt_callback(
     const ggml_tensor * output_storage,
     const ggml_tensor * input,
     const ggml_tensor * weight,
-    int /*ith*/,
+    int ith,
     int /*nth*/,
     void * userdata) {
 
+    if (ith != 0) return;
     (void) output_storage;
 
     const auto * params = static_cast<const MetalVocoderConvTransposeParams *>(userdata);
@@ -152,6 +153,211 @@ void metal_vocoder_convt_callback(
     }
 }
 
+#endif // KOKOPOP_HAS_METAL
+
+#ifdef KOKOPOP_HAS_METAL
+// ---------------------------------------------------------------------------
+// Generator ResBlock Metal callback
+// ---------------------------------------------------------------------------
+// CPU-side linear projection: out[oc] = sum_d(w[d + ne[0]*oc] * style[d]) + b[oc]
+// w layout follows ggml_mul_mat: ne[0]=style_dim, ne[1]=IC → row-major per output channel.
+static void metal_resblock_project_style(
+    const ggml_tensor * w,
+    const ggml_tensor * b,
+    const float       * style,
+    float             * out
+) {
+    const int64_t OC  = w->ne[1];
+    const int64_t dim = w->ne[0];
+    const float * bias = static_cast<const float *>(b->data);
+    for (int64_t oc = 0; oc < OC; ++oc) {
+        float sum = bias[oc];
+        if (w->type == GGML_TYPE_F16) {
+            const ggml_fp16_t * row = static_cast<const ggml_fp16_t *>(w->data) + oc * dim;
+            for (int64_t d = 0; d < dim; ++d) sum += ggml_fp16_to_fp32(row[d]) * style[d];
+        } else {
+            const float * row = static_cast<const float *>(w->data) + oc * dim;
+            for (int64_t d = 0; d < dim; ++d) sum += row[d] * style[d];
+        }
+        out[oc] = sum;
+    }
+}
+
+// ggml_map_custom3_inplace callback: dst = resblock(x=b, style=c)
+// Mirrors the convt pattern: a = dst (fresh tensor, first arg = inplace target).
+// b = x (input, read-only), c = style (read-only).
+static void metal_generator_resblock_callback(
+    ggml_tensor       * dst,
+    const ggml_tensor * /*out_ignored*/,  // a == dst, not used
+    const ggml_tensor * x_in,             // b = x
+    const ggml_tensor * style,            // c = style
+    int ith, int /*nth*/,
+    void * userdata
+) {
+    if (ith != 0) return;
+
+    const auto * p = static_cast<const MetalGeneratorResblockParams *>(userdata);
+    if (p == nullptr || p->kernel == nullptr || p->weights == nullptr) {
+        return;
+    }
+
+    const auto * w      = static_cast<const GeneratorResblockWeights *>(p->weights);
+    auto       * kernel = static_cast<MetalVocoderState *>(p->kernel);
+
+    const int64_t T  = dst->ne[0];
+    const int64_t IC = dst->ne[1];
+
+    // Project all 6 adain gamma/beta pairs on CPU (12 * IC floats total).
+    // Thread-local scratch — avoids a heap allocation per ResBlock call on the
+    // hot generator path. Safe because the callback is serialized (ith != 0
+    // returns early) and the projection is fully consumed before the GPU
+    // call below releases it.
+    static thread_local std::vector<float> projs;
+    projs.assign(static_cast<size_t>(12 * IC), 0.0f);
+    const float * style_f32 = static_cast<const float *>(style->data);
+
+    for (int iter = 0; iter < 3; ++iter) {
+        float * base = projs.data() + static_cast<size_t>(iter * 4 * IC);
+        metal_resblock_project_style(w->adain1[iter].gamma_w, w->adain1[iter].gamma_b, style_f32, base + 0 * IC);
+        metal_resblock_project_style(w->adain1[iter].beta_w,  w->adain1[iter].beta_b,  style_f32, base + 1 * IC);
+        metal_resblock_project_style(w->adain2[iter].gamma_w, w->adain2[iter].gamma_b, style_f32, base + 2 * IC);
+        metal_resblock_project_style(w->adain2[iter].beta_w,  w->adain2[iter].beta_b,  style_f32, base + 3 * IC);
+    }
+
+    // Build per-iteration weight descriptors.
+    MetalResblockIterWeights iters[3];
+    for (int i = 0; i < 3; ++i) {
+        const int d    = KOKOPOP_RESBLOCK_DILATIONS[i];
+        const int pad2 = p->kernel_size / 2;
+
+        iters[i] = {
+            w->adain1[i].norm_w, w->adain1[i].norm_b, w->alpha1[i],
+            w->convs1_w[i], w->convs1_b[i], p->kernel_size, d, w->paddings[i],
+            w->adain2[i].norm_w, w->adain2[i].norm_b, w->alpha2[i],
+            w->convs2_w[i], w->convs2_b[i], p->kernel_size, 1, pad2,
+        };
+    }
+
+    const float * x_data  = static_cast<const float *>(x_in->data);
+    float       * out_data = static_cast<float *>(dst->data);
+
+    if (!metal_vocoder_run_generator_resblocks(kernel, x_data, out_data, T, IC, projs.data(), iters)) {
+        std::fprintf(stderr, "[metal_vocoder] generator_resblock GPU call failed — output undefined\n");
+    }
+}
+
+// Helper: build MetalResblockIterWeights[3] and pack 12*IC style projections
+// for a given GeneratorResblockWeights + kernel_size + style.
+static void build_resblock_iters_and_projs(
+    const GeneratorResblockWeights & w,
+    int kernel_size,
+    const float * style, int64_t style_dim, int64_t IC,
+    MetalResblockIterWeights iters[3],
+    float * projs_out  // [12 * IC]
+) {
+    (void)style_dim;
+    for (int it = 0; it < 3; ++it) {
+        float * base = projs_out + static_cast<size_t>(it * 4 * IC);
+        metal_resblock_project_style(w.adain1[it].gamma_w, w.adain1[it].gamma_b, style, base + 0 * IC);
+        metal_resblock_project_style(w.adain1[it].beta_w,  w.adain1[it].beta_b,  style, base + 1 * IC);
+        metal_resblock_project_style(w.adain2[it].gamma_w, w.adain2[it].gamma_b, style, base + 2 * IC);
+        metal_resblock_project_style(w.adain2[it].beta_w,  w.adain2[it].beta_b,  style, base + 3 * IC);
+
+        const int d    = KOKOPOP_RESBLOCK_DILATIONS[it];
+        const int pad2 = kernel_size / 2;
+        iters[it] = {
+            w.adain1[it].norm_w, w.adain1[it].norm_b, w.alpha1[it],
+            w.convs1_w[it], w.convs1_b[it], kernel_size, d, w.paddings[it],
+            w.adain2[it].norm_w, w.adain2[it].norm_b, w.alpha2[it],
+            w.convs2_w[it], w.convs2_b[it], kernel_size, 1, pad2,
+        };
+    }
+}
+
+// ggml_map_custom3_inplace callback for the fused per-stage generator op.
+//   a = dst   (in-place target, holds post-stage x — shape [T_post_pad, IC_x_out])
+//   b = x_in  (read-only, post-decoder or post-previous-stage)
+//   c = style (read-only)
+// har_t is accessed via params->har_t->data.
+static void metal_generator_stage_callback(
+    ggml_tensor       * dst,
+    const ggml_tensor * /*out_ignored*/,
+    const ggml_tensor * x_in,
+    const ggml_tensor * style,
+    int ith, int /*nth*/,
+    void * userdata
+) {
+    if (ith != 0) return;
+
+    const auto * p = static_cast<const MetalGeneratorStageParams *>(userdata);
+    if (p == nullptr || p->kernel == nullptr || p->har_t == nullptr ||
+        p->noise_resblock == nullptr) {
+        std::fprintf(stderr, "[metal_vocoder] stage callback: missing params\n");
+        return;
+    }
+
+    auto * kernel = static_cast<MetalVocoderState *>(p->kernel);
+
+    const auto * w_noise = static_cast<const GeneratorResblockWeights *>(p->noise_resblock);
+    const GeneratorResblockWeights * w_main[3] = {
+        static_cast<const GeneratorResblockWeights *>(p->main_resblocks[0]),
+        static_cast<const GeneratorResblockWeights *>(p->main_resblocks[1]),
+        static_cast<const GeneratorResblockWeights *>(p->main_resblocks[2]),
+    };
+    if (w_main[0] == nullptr || w_main[1] == nullptr || w_main[2] == nullptr) {
+        std::fprintf(stderr, "[metal_vocoder] stage callback: missing main resblock weights\n");
+        return;
+    }
+
+    const int64_t T_x_in     = x_in->ne[0];
+    const int64_t T_post_pad = dst->ne[0];
+    const int64_t har_len    = p->har_t->ne[0];
+    const int64_t har_C      = p->har_t->ne[1];
+
+    const int64_t IC_noise = w_noise->adain1[0].gamma_w->ne[1];
+    const int64_t IC_main  = w_main[0]->adain1[0].gamma_w->ne[1];
+    const int64_t style_dim = w_noise->adain1[0].gamma_w->ne[0];
+
+    // Pack style projections for noise + 3 main resblocks.
+    const size_t proj_n = static_cast<size_t>(12 * IC_noise + 3 * 12 * IC_main);
+    static thread_local std::vector<float> projs;
+    projs.assign(proj_n, 0.0f);
+
+    const float * style_f32 = static_cast<const float *>(style->data);
+
+    MetalResblockIterWeights noise_iters[3];
+    build_resblock_iters_and_projs(*w_noise, p->noise_kernel_size,
+                                    style_f32, style_dim, IC_noise,
+                                    noise_iters, projs.data());
+
+    MetalResblockIterWeights main_iters[3][3];
+    for (int br = 0; br < 3; ++br) {
+        float * base = projs.data() + static_cast<size_t>(12 * IC_noise + br * 12 * IC_main);
+        build_resblock_iters_and_projs(*w_main[br], p->main_kernel_sizes[br],
+                                        style_f32, style_dim, IC_main,
+                                        main_iters[br], base);
+    }
+
+    const float * x_in_data = static_cast<const float *>(x_in->data);
+    const float * har_data  = static_cast<const float *>(p->har_t->data);
+    float       * out_data  = static_cast<float *>(dst->data);
+
+    if (!metal_vocoder_run_stage(
+            kernel,
+            x_in_data, T_x_in,
+            har_data,  har_len, har_C,
+            projs.data(),
+            IC_noise, IC_main,
+            out_data, T_post_pad,
+            p->up_stride, p->up_padding,
+            p->pad_reflect_left1,
+            p->noise_kernel, p->noise_stride, p->noise_padding,
+            p->noise_conv_w, p->noise_conv_b,
+            p->up_w, p->up_b,
+            noise_iters, main_iters)) {
+        std::fprintf(stderr, "[metal_vocoder] stage GPU call failed — output undefined\n");
+    }
+}
 #endif // KOKOPOP_HAS_METAL
 
 // ---------------------------------------------------------------------------
@@ -514,7 +720,7 @@ ggml_tensor * conv_transpose1d_crop_bias(
 
 #ifdef KOKOPOP_HAS_METAL
     if (model.backend != nullptr &&
-        model.backend->use_metal_vocoder_convt() &&
+        model.backend->metal_vocoder_kernel() != nullptr &&
         input->type == GGML_TYPE_F32 &&
         (weight->type == GGML_TYPE_F32 || weight->type == GGML_TYPE_F16) &&
         bias->type == GGML_TYPE_F32 &&
@@ -794,6 +1000,24 @@ ggml_tensor * graph_generator_resblock(
 
     const auto cached = model.generator_resblock_weights.find(prefix);
     if (cached != model.generator_resblock_weights.end()) {
+#ifdef KOKOPOP_HAS_METAL
+        if (model.backend != nullptr && model.backend->metal_vocoder_kernel() != nullptr &&
+            cached->second.valid()) {
+            model.metal_vocoder_resblock_params.push_back({
+                model.backend->metal_vocoder_kernel(),
+                &cached->second,
+                kernel_size,
+                cached->second.adain1[0].gamma_w->ne[0],
+            });
+            const MetalGeneratorResblockParams * params = &model.metal_vocoder_resblock_params.back();
+
+            ggml_tensor * out = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, x->ne[0], x->ne[1]);
+            return ggml_map_custom3_inplace(
+                ctx, out, x, style,
+                metal_generator_resblock_callback, 1,
+                const_cast<MetalGeneratorResblockParams *>(params));
+        }
+#endif
         return graph_generator_resblock(
             ctx,
             x,
@@ -943,6 +1167,152 @@ static LstmWeights load_lstm_weights(
     return w;
 }
 
+// ---------------------------------------------------------------------------
+// 3-branch main resblock + sum/3
+// ---------------------------------------------------------------------------
+// Explicit per-branch construction. On Metal, this path is only reached as
+// the fallback when graph_generator_stage_fused() returns nullptr (e.g.
+// some resblock weight missing from the cache); the normal Metal path
+// fuses everything in graph_generator_stage_fused().
+ggml_tensor * graph_3branch_main_sum(
+    ggml_context * ctx,
+    Model & model,
+    ggml_tensor * x,
+    ggml_tensor * style,
+    int stage,
+    std::string & error) {
+
+    ggml_tensor * accum = nullptr;
+    for (int k = 0; k < 3; ++k) {
+        const std::string prefix = "kokopop.decoder.generator.resblocks." +
+                                    std::to_string(stage * 3 + k);
+        ggml_tensor * branch = graph_generator_resblock(
+            ctx, model, x, style, prefix, KOKOPOP_RESBLOCK_KERNELS[k], error);
+        if (branch == nullptr) {
+            return nullptr;
+        }
+        accum = (accum == nullptr) ? branch : ggml_add(ctx, accum, branch);
+    }
+    return ggml_scale(ctx, accum, 1.0f / 3.0f);
+}
+
+// ---------------------------------------------------------------------------
+// Fused per-stage generator graph helper
+// ---------------------------------------------------------------------------
+ggml_tensor * graph_generator_stage_fused(
+    ggml_context * ctx,
+    Model & model,
+    ggml_tensor * x,
+    ggml_tensor * style,
+    ggml_tensor * har_t,
+    int stage,
+    std::string & error) {
+
+    (void)error;
+
+#ifndef KOKOPOP_HAS_METAL
+    (void)ctx; (void)model; (void)x; (void)style; (void)har_t; (void)stage;
+    return nullptr;
+#else
+    if (model.backend == nullptr || model.backend->metal_vocoder_kernel() == nullptr) {
+        return nullptr;
+    }
+    if (stage < 0 || stage > 1) return nullptr;
+
+    // Per-stage constants (mirror the table in audio_utils.cpp).
+    struct StageConst {
+        int kernel_size_noise;
+        int up_stride;
+        int up_padding;
+        int noise_stride;
+        int noise_padding;
+        int noise_kernel;
+        bool pad_left1;
+        const char * noise_prefix;
+        const char * up_weight;
+        const char * up_bias;
+        const char * noise_conv_w;
+        const char * noise_conv_b;
+    };
+    static const StageConst kStages[2] = {
+        {7, 10, 5, 6, 3, 12, false,
+         "kokopop.decoder.generator.noise_res.0",
+         "kokopop.decoder.generator.ups.0.weight",
+         "kokopop.decoder.generator.ups.0.bias",
+         "kokopop.decoder.generator.noise_convs.0.weight",
+         "kokopop.decoder.generator.noise_convs.0.bias"},
+        {11, 6, 3, 1, 0, 1, true,
+         "kokopop.decoder.generator.noise_res.1",
+         "kokopop.decoder.generator.ups.1.weight",
+         "kokopop.decoder.generator.ups.1.bias",
+         "kokopop.decoder.generator.noise_convs.1.weight",
+         "kokopop.decoder.generator.noise_convs.1.bias"},
+    };
+    const StageConst & sc = kStages[stage];
+
+    // Look up cached resblock weights (noise + 3 main).
+    const auto it_noise = model.generator_resblock_weights.find(sc.noise_prefix);
+    if (it_noise == model.generator_resblock_weights.end() || !it_noise->second.valid()) {
+        return nullptr;
+    }
+    const GeneratorResblockWeights * w_main[3] = {nullptr, nullptr, nullptr};
+    for (int br = 0; br < 3; ++br) {
+        const std::string pfx = "kokopop.decoder.generator.resblocks." +
+                                 std::to_string(stage * 3 + br);
+        const auto it = model.generator_resblock_weights.find(pfx);
+        if (it == model.generator_resblock_weights.end() || !it->second.valid()) {
+            return nullptr;
+        }
+        w_main[br] = &it->second;
+    }
+
+    // Look up weight tensors.
+    std::string local_err;
+    ggml_tensor * noise_conv_w = require_tensor(model, sc.noise_conv_w, local_err);
+    ggml_tensor * noise_conv_b = require_tensor(model, sc.noise_conv_b, local_err);
+    ggml_tensor * up_w = require_tensor(model, sc.up_weight, local_err);
+    ggml_tensor * up_b = require_tensor(model, sc.up_bias,   local_err);
+    if (!local_err.empty()) return nullptr;
+
+    // Derive output shape (matches audio_utils.cpp formula).
+    const int64_t T_x_in    = x->ne[0];
+    const int64_t IC_x_out  = up_w->ne[1];
+    const int64_t T_convt   = (T_x_in - 1) * sc.up_stride - 2 * sc.up_padding + up_w->ne[0];
+    const int64_t T_post_pad = sc.pad_left1 ? T_convt + 1 : T_convt;
+
+    // Build params (pushed into stable storage in the model).
+    MetalGeneratorStageParams params{};
+    params.kernel          = model.backend->metal_vocoder_kernel();
+    params.har_t           = har_t;
+    params.noise_conv_w    = noise_conv_w;
+    params.noise_conv_b    = noise_conv_b;
+    params.noise_kernel    = sc.noise_kernel;
+    params.noise_stride    = sc.noise_stride;
+    params.noise_padding   = sc.noise_padding;
+    params.up_w            = up_w;
+    params.up_b            = up_b;
+    params.up_stride       = sc.up_stride;
+    params.up_padding      = sc.up_padding;
+    params.pad_reflect_left1 = sc.pad_left1;
+    params.noise_resblock    = &it_noise->second;
+    params.noise_kernel_size = sc.kernel_size_noise;
+    for (int br = 0; br < 3; ++br) {
+        params.main_resblocks[br]     = w_main[br];
+        params.main_kernel_sizes[br]  = KOKOPOP_RESBLOCK_KERNELS[br];
+    }
+    params.style_dim = w_main[0]->adain1[0].gamma_w->ne[0];
+
+    model.metal_vocoder_stage_params.push_back(params);
+    const MetalGeneratorStageParams * stable = &model.metal_vocoder_stage_params.back();
+
+    ggml_tensor * out = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, T_post_pad, IC_x_out);
+    return ggml_map_custom3_inplace(
+        ctx, out, x, style,
+        metal_generator_stage_callback, 1,
+        const_cast<MetalGeneratorStageParams *>(stable));
+#endif
+}
+
 ggml_tensor * lstm_direction(
     ggml_context * ctx,
     Model & model,
@@ -1007,7 +1377,7 @@ ggml_tensor * lstm_direction(
         it->second.data(),
         b_it->second.data(),
         rowwise,
-        model.backend->use_metal_lstm(n_steps) ? model.backend->metal_lstm_kernel() : nullptr,
+        model.backend->metal_lstm_kernel(),
         it->first.c_str(),
         hidden,
         n_steps,

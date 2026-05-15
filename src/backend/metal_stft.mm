@@ -406,10 +406,15 @@ void metal_stft_compute(
         [enc setBytes:&v_n_samples length:sizeof(v_n_samples) atIndex:8];
         [enc setBytes:&v_n_frames  length:sizeof(v_n_frames)  atIndex:9];
 
+        // Threadgroup sized within Metal's 1024-threads/group ceiling.
+        // 32×16=512 leaves headroom for the simdgroup scheduler. Kernel does
+        // explicit bounds checks so any threadgroup size is safe.
+        const NSUInteger tg_x = state->n_bins < 32 ? static_cast<NSUInteger>(state->n_bins) : 32;
+        const NSUInteger tg_y = target_frames < 16 ? static_cast<NSUInteger>(target_frames) : 16;
         [enc dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(state->n_bins),
                                          static_cast<NSUInteger>(target_frames),
                                          1)
-       threadsPerThreadgroup:MTLSizeMake(static_cast<NSUInteger>(state->n_bins), 32, 1)];
+       threadsPerThreadgroup:MTLSizeMake(tg_x, tg_y, 1)];
         [enc endEncoding];
 
         [cmd commit];

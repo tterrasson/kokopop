@@ -121,6 +121,41 @@ ggml_tensor * graph_generator_resblock(
     const std::string & prefix,
     int kernel_size,
     std::string & error);
+
+// 3-branch main resblock + sum/3. `stage` selects resblocks.<stage*3+k>
+// for k in 0..3. Returns a tensor with the same shape as x, equal to
+// (resblock_0(x) + resblock_1(x) + resblock_2(x)) / 3.
+//
+// On Metal this is only reached as a fallback when graph_generator_stage_fused
+// is unavailable (missing cached resblock). The normal Metal path fuses the
+// entire stage including this sum.
+ggml_tensor * graph_3branch_main_sum(
+    ggml_context * ctx,
+    Model & model,
+    ggml_tensor * x,
+    ggml_tensor * style,
+    int stage,
+    std::string & error);
+
+// Fused per-stage generator op (replaces the entire body of one stage in
+// audio_utils.cpp::ggml_generator). Performs leaky_relu | noise_conv |
+// noise_resblock | conv_transpose1d | [pad_reflect_left1] | add |
+// 3 main resblocks | sum/3 in a single Metal command buffer.
+//
+// Returns the post-stage x tensor (shape [T_post_pad, IC_x_out=64]).
+// Returns nullptr when the fused path is not applicable (non-Metal backend,
+// vocoder kernel unavailable, or any of the 4 stage resblocks not cached);
+// caller falls back to the explicit per-op graph in that case.
+//
+// `stage` is 0 or 1. `har_t` is the harmonic STFT tensor (graph input).
+ggml_tensor * graph_generator_stage_fused(
+    ggml_context * ctx,
+    Model & model,
+    ggml_tensor * x,
+    ggml_tensor * style,
+    ggml_tensor * har_t,
+    int stage,
+    std::string & error);
 ggml_tensor * duration_encoder(
     ggml_context * ctx,
     Model & model,

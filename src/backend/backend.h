@@ -93,26 +93,14 @@ struct Backend {
     // Used by graph_ops::lstm_direction to fill LstmCustomParams::metal_kernel.
     virtual void * metal_lstm_kernel() const { return nullptr; }
 
-    // Optional: decide whether a fused LSTM should run through Metal for this
-    // sequence length. Small recurrences are often faster in the CPU callback
-    // because Metal has to upload the precomputed gates and wait for a command
-    // buffer for every direction.
-    virtual bool use_metal_lstm(int64_t n_steps) const {
-        (void)n_steps;
-        return metal_lstm_kernel() != nullptr;
-    }
-
-    // Return the Metal STFT kernel handle cast to void* (null for CPU backend).
+// Return the Metal STFT kernel handle cast to void* (null for CPU backend).
     // Used by cpu_harmonic_stft to dispatch the DFT on the GPU.
     virtual void * metal_stft_kernel() const { return nullptr; }
 
-    // Return the experimental Metal vocoder kernel handle cast to void*
+    // Return the Metal vocoder kernel handle cast to void*
     // (null for CPU backend). Used by selected custom ggml nodes.
     virtual void * metal_vocoder_kernel() const { return nullptr; }
 
-    // Optional: enable experimental Metal vocoder kernels. Default is false so
-    // the CPU backend and the stable Metal placement remain unchanged.
-    virtual bool use_metal_vocoder_convt() const { return false; }
 
     // ---- Context sizing ----
 
@@ -175,6 +163,54 @@ struct MetalVocoderConvTransposeParams {
     const ggml_tensor * bias = nullptr;
     int stride = 1;
     int crop_left = 0;
+};
+
+// Params for the Metal generator-resblock custom-op node.
+// weights is a type-erased const GeneratorResblockWeights * (cast in graph_ops.cpp).
+struct MetalGeneratorResblockParams {
+    void       * kernel     = nullptr;  // MetalVocoderState *
+    const void * weights    = nullptr;  // const GeneratorResblockWeights *
+    int          kernel_size = 3;
+    int64_t      style_dim   = 0;
+};
+
+// Params for the fused per-stage generator custom-op. One callback runs:
+//   leaky_relu(x, 0.1) | conv1d_strided(har, noise_conv) | resblock(noise)
+//   | conv_transpose1d(x, up) | [pad_reflect_left1] | add x += x_source
+//   | for k in 0..3: branch_k = resblock_k(x); sum(b0,b1,b2)/3
+// in a single Metal command buffer per stage.
+struct MetalGeneratorStageParams {
+    void       * kernel = nullptr;        // MetalVocoderState *
+
+    // har_t graph-input tensor (data pointer valid at callback time).
+    const ggml_tensor * har_t = nullptr;
+
+    // Noise conv1d (har → x_source)
+    const ggml_tensor * noise_conv_w = nullptr;
+    const ggml_tensor * noise_conv_b = nullptr;
+    int                 noise_kernel  = 0;
+    int                 noise_stride  = 0;
+    int                 noise_padding = 0;
+
+    // Upsampling conv_transpose1d
+    const ggml_tensor * up_w = nullptr;
+    const ggml_tensor * up_b = nullptr;
+    int                 up_stride  = 0;
+    int                 up_padding = 0;
+
+    // True for stage 1 (left-reflect pad by 1 after convt).
+    bool                pad_reflect_left1 = false;
+
+    // Noise resblock (kernel_size = noise_kernel_size).
+    const void *        noise_resblock = nullptr;   // GeneratorResblockWeights *
+    int                 noise_kernel_size = 0;
+
+    // 3 main resblocks (kernel_size matches KOKOPOP_RESBLOCK_KERNELS).
+    const void *        main_resblocks[3] = {nullptr, nullptr, nullptr};  // GeneratorResblockWeights *
+    int                 main_kernel_sizes[3] = {3, 7, 11};
+
+    // Style dim (read from any cached gamma weight).
+    int64_t             style_dim = 0;
 };
 
 // Factory: creates a CPU backend (always available).

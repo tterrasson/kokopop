@@ -57,10 +57,6 @@ class MetalBackend final : public Backend {
 
     bool env_log_sched_ = false;             // KOKOPOP_METAL_LOG_SCHED=1
     bool env_op_trace_ = false;              // KOKOPOP_METAL_OP_TRACE=1
-    bool env_alloc_only_ = false;            // KOKOPOP_METAL_ALLOC_ONLY=1
-    bool env_vocoder_convt_ = false;         // KOKOPOP_METAL_VOCODER_CONVT=1
-    bool env_stft_ = false;                  // KOKOPOP_METAL_STFT=1
-    int64_t env_lstm_min_steps_ = 96;         // KOKOPOP_METAL_LSTM_MIN_STEPS=N
 
     bool ensure_scheduler(ggml_cgraph * graph) {
         GGML_ASSERT(graph != nullptr);
@@ -86,8 +82,10 @@ class MetalBackend final : public Backend {
         // CPU backend must be last. It handles unsupported ops and fallback copies.
         ggml_backend_t backends[] = { metal_backend_, cpu_backend_ };
 
-        // Keep op_offload=false. Kokoro has many hybrid graphs; the scheduler
-        // can still split unsupported ops to the CPU backend as needed.
+        // op_offload=false: ops run on the backend where their inputs live.
+        // With weights in Metal shared memory, matmuls and attention naturally
+        // stay on Metal. Custom ops (LSTM, vocoder) stay on CPU without forcing
+        // extra cross-backend copies.
         sched_ = ggml_backend_sched_new(
             backends,
             nullptr,
@@ -168,27 +166,14 @@ public:
 
         env_log_sched_ = std::getenv("KOKOPOP_METAL_LOG_SCHED") != nullptr;
         env_op_trace_ = std::getenv("KOKOPOP_METAL_OP_TRACE") != nullptr;
-        env_alloc_only_ = std::getenv("KOKOPOP_METAL_ALLOC_ONLY") != nullptr;
-        env_vocoder_convt_ = std::getenv("KOKOPOP_METAL_VOCODER_CONVT") != nullptr;
-        env_stft_ = std::getenv("KOKOPOP_METAL_STFT") != nullptr;
-        if (const char * min_steps = std::getenv("KOKOPOP_METAL_LSTM_MIN_STEPS")) {
-            char * end = nullptr;
-            const long parsed = std::strtol(min_steps, &end, 10);
-            if (end != min_steps && parsed >= 0) {
-                env_lstm_min_steps_ = parsed;
-            }
-        }
-
         cpu_backend_ = ggml_backend_cpu_init();
         if (cpu_backend_ != nullptr) {
             ggml_backend_cpu_set_n_threads(cpu_backend_, std::max<int32_t>(1, n_threads));
         }
 
-        // Keep fusion disabled by default unless explicitly enabled by the user.
-        // This is a conservative default for hybrid graphs and custom kernels.
-        if (std::getenv("KOKOPOP_METAL_ENABLE_FUSION") == nullptr) {
-            setenv("GGML_METAL_FUSION_DISABLE", "1", 0);
-        }
+        // Hybrid graphs and custom kernels (LSTM, vocoder, STFT) rely on the
+        // scheduler splitting ops across backends; ggml Metal fusion can interfere.
+        setenv("GGML_METAL_FUSION_DISABLE", "1", 0);
 
         metal_backend_ = ggml_backend_metal_init();
         if (metal_backend_ == nullptr) {
@@ -199,14 +184,25 @@ public:
             return;
         }
 
-        lstm_kernel_ = metal_lstm_create();
-        if (env_stft_) {
-            stft_kernel_ = metal_stft_create(KOKOPOP_STFT_N, KOKOPOP_STFT_HOP);
+        // Metal LSTM kernel enabled by default. Despite the recurrence running
+        // on a single SM, it benchmarks ~4% faster end-to-end than the CPU
+        // NEON path for this model (H=256, ~6-12 directions/chunk). Disable
+        // with KOKOPOP_METAL_LSTM=0 to fall back to CPU LSTM.
+        const char * env_lstm = std::getenv("KOKOPOP_METAL_LSTM");
+        const bool enable_metal_lstm = (env_lstm == nullptr) ||
+                                       (env_lstm[0] != '0' || env_lstm[1] != '\0');
+        if (enable_metal_lstm) {
+            std::fprintf(stderr, "[metal] creating lstm kernel\n");
+            lstm_kernel_ = metal_lstm_create();
         }
-
-        if (env_vocoder_convt_) {
-            vocoder_kernel_ = metal_vocoder_create();
-        }
+        std::fprintf(stderr, "[metal] creating stft kernel\n");
+        stft_kernel_    = metal_stft_create(KOKOPOP_STFT_N, KOKOPOP_STFT_HOP);
+        std::fprintf(stderr, "[metal] creating vocoder kernel\n");
+        vocoder_kernel_ = metal_vocoder_create();
+        std::fprintf(stderr, "[metal] backend ready (lstm=%s stft=%s vocoder=%s)\n",
+                     lstm_kernel_ ? "ok" : "null",
+                     stft_kernel_ ? "ok" : "null",
+                     vocoder_kernel_ ? "ok" : "null");
     }
 
     ~MetalBackend() override {
@@ -350,12 +346,6 @@ public:
         GGML_ASSERT(sched_ != nullptr && "compute called before sched_alloc_graph");
         GGML_ASSERT(graph != nullptr);
 
-        if (env_alloc_only_) {
-            ggml_backend_sched_synchronize(sched_);
-            log_sched_sizes("alloc-only");
-            return GGML_STATUS_SUCCESS;
-        }
-
         if (env_run_only_ != nullptr &&
             label_level(active_label_) > label_level(env_run_only_)) {
             ggml_backend_sched_synchronize(sched_);
@@ -415,10 +405,6 @@ public:
         return lstm_kernel_;
     }
 
-    bool use_metal_lstm(int64_t n_steps) const override {
-        return lstm_kernel_ != nullptr && n_steps >= env_lstm_min_steps_;
-    }
-
     void * metal_stft_kernel() const override {
         return stft_kernel_;
     }
@@ -427,15 +413,21 @@ public:
         return vocoder_kernel_;
     }
 
-    bool use_metal_vocoder_convt() const override {
-        return env_vocoder_convt_ && vocoder_kernel_ != nullptr;
-    }
-
     ggml_backend_buffer_type_t weight_buffer_type() const override {
         GGML_ASSERT(cpu_backend_ != nullptr);
+        GGML_ASSERT(metal_backend_ != nullptr);
 
-        // Keep weights CPU-resident by default. CPU graphs avoid Metal copies;
-        // Metal graphs let the scheduler materialize backend copies as needed.
+        // KOKOPOP_METAL_WEIGHTS=1 places weights in the Metal buffer so that
+        // matmuls and friends actually run on GPU (ggml-metal scheduler picks
+        // the backend of the op's inputs). Off by default: historically the
+        // LSTM MAP_CUSTOM2 ops forced CPU↔Metal sync points at every LSTM
+        // layer, which made Metal-resident weights a net loss. With Metal
+        // LSTM disabled (default since opt A), the frontend LSTMs run on CPU
+        // but the splits are still expensive, so leave this opt-in until
+        // benchmarked end-to-end.
+        if (std::getenv("KOKOPOP_METAL_WEIGHTS") != nullptr) {
+            return ggml_backend_get_default_buffer_type(metal_backend_);
+        }
         return ggml_backend_get_default_buffer_type(cpu_backend_);
     }
 

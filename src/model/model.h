@@ -173,7 +173,9 @@ struct Model {
     // Scratch storage for experimental Metal vocoder custom-op parameters.
     // Reserved before building the generator graph so userdata pointers remain
     // stable until graph execution completes.
-    std::vector<MetalVocoderConvTransposeParams> metal_vocoder_convt_params;
+    std::vector<MetalVocoderConvTransposeParams>  metal_vocoder_convt_params;
+    std::vector<MetalGeneratorResblockParams>     metal_vocoder_resblock_params;
+    std::vector<MetalGeneratorStageParams>        metal_vocoder_stage_params;
 
     // Lazily cached inference constants derived from immutable model weights.
     std::unordered_map<std::string, std::vector<float>> depthwise_pool_kernels;

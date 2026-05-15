@@ -623,6 +623,10 @@ bool ggml_generator(
 
     model.metal_vocoder_convt_params.clear();
     model.metal_vocoder_convt_params.reserve(4);
+    model.metal_vocoder_resblock_params.clear();
+    model.metal_vocoder_resblock_params.reserve(8);  // 2 stages × (1 noise + 3 main), fallback path only
+    model.metal_vocoder_stage_params.clear();
+    model.metal_vocoder_stage_params.reserve(2);     // 2 stages × 1 fully-fused stage op
 
     struct StageParams {
         int kernel;
@@ -677,6 +681,23 @@ bool ggml_generator(
     for (int stage = 0; stage < 2; ++stage) {
         const StageParams & sp = stage_params[stage];
 
+        // Fully-fused per-stage GPU op (Metal default). Runs the whole stage
+        // (leaky_relu + noise_conv + noise_resblock + convt + [pad] + add +
+        // 3 main resblocks + sum/3) in a single Metal command buffer.
+        // Returns nullptr on non-Metal backend, missing vocoder kernel,
+        // missing cached resblock, or when POST_STATS debug taps are needed.
+        if (!post_stats) {
+            ggml_tensor * fused = graph_generator_stage_fused(ctx, model, x, style_t, har_t, stage, error);
+            if (fused != nullptr) {
+                x = fused;
+                continue;
+            }
+            if (!error.empty()) {
+                ggml_free(ctx);
+                return false;
+            }
+        }
+
         x = ggml_leaky_relu(ctx, x, 0.1f, false);
 
         ggml_tensor * x_source = add_channel_bias(
@@ -730,18 +751,13 @@ bool ggml_generator(
             dbg_pre_rb[stage] = x;
         }
 
-        ggml_tensor * accum = nullptr;
-        for (int k = 0; k < 3; ++k) {
-            const std::string resblock_prefix = "kokopop.decoder.generator.resblocks." + std::to_string(stage * 3 + k);
-            ggml_tensor * branch = graph_generator_resblock(ctx, model, x, style_t, resblock_prefix, KOKOPOP_RESBLOCK_KERNELS[k], error);
-            if (branch == nullptr) {
-                ggml_free(ctx);
-                return false;
-            }
-            accum = accum == nullptr ? branch : ggml_add(ctx, accum, branch);
+        // 3-branch main resblock + sum/3. Reached on CPU/CUDA or as the
+        // Metal fallback when graph_generator_stage_fused is unavailable.
+        x = graph_3branch_main_sum(ctx, model, x, style_t, stage, error);
+        if (x == nullptr) {
+            ggml_free(ctx);
+            return false;
         }
-
-        x = ggml_scale(ctx, accum, 1.0f / 3.0f);
         if (std::getenv("KOKOPOP_POST_STATS") != nullptr) {
             x = ggml_cont(ctx, x);
             ggml_set_name(x, stage == 0 ? "kokopop_generator_stage0" : "kokopop_generator_stage1");
@@ -773,6 +789,12 @@ bool ggml_generator(
 
     int64_t t0g = gen_profile ? ggml_time_us() : 0;
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, generator_graph_size(decoder.length), false);
+    // Anchor har_t in the graph forward set so the scheduler always allocates
+    // a buffer for it. In the legacy per-op path, har_t is reached via the
+    // noise_convs conv1d nodes; in the fused per-stage path it's accessed
+    // only via params (callback userdata), so without this explicit expand
+    // the scheduler would prune it and tensor_set(har_t) would crash.
+    ggml_build_forward_expand(gf, har_t);
     ggml_build_forward_expand(gf, post);
     if (post_stats) {
         for (int stage = 0; stage < 2; ++stage) {
