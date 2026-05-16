@@ -655,9 +655,19 @@ def build_vocab(config: dict) -> list[str]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def _resolve_file(filename: str, args: argparse.Namespace) -> str:
+    """Return a local path for *filename*, from disk or by downloading from HF."""
+    if args.local_dir:
+        path = Path(args.local_dir) / filename
+        if not path.exists():
+            raise FileNotFoundError(f"expected {path} in --local-dir")
+        return str(path)
+    return hf_hub_download(repo_id=args.repo_id, filename=filename)
+
+
 def convert(args: argparse.Namespace) -> None:
-    config_path = hf_hub_download(repo_id=args.repo_id, filename="config.json")
-    model_path = hf_hub_download(repo_id=args.repo_id, filename=MODEL_NAME)
+    config_path = _resolve_file("config.json", args)
+    model_path = _resolve_file(MODEL_NAME, args)
     config = json.loads(Path(config_path).read_text())
 
     model = KModel(
@@ -676,7 +686,7 @@ def convert(args: argparse.Namespace) -> None:
     writer.add_u32("kokopop.sample_rate", 24000)
     writer.add_string("kokopop.arch", "kokoro-82m")
     writer.add_string("kokopop.tensor_layout", "runtime-v3")
-    writer.add_string("kokopop.source_repo", args.repo_id)
+    writer.add_string("kokopop.source_repo", args.local_dir or args.repo_id)
     writer.add_string("kokopop.quantization", args.tier)
     writer.add_string_array("tokenizer.ggml.tokens", build_vocab(config))
     writer.add_string_array("kokopop.voices", voices)
@@ -697,9 +707,7 @@ def convert(args: argparse.Namespace) -> None:
     add_regularized_modules("kokopop.decoder", model.decoder, writer)
 
     for voice in voices:
-        voice_path = hf_hub_download(
-            repo_id=args.repo_id, filename=f"voices/{voice}.pt"
-        )
+        voice_path = _resolve_file(f"voices/{voice}.pt", args)
         pack = torch.load(voice_path, weights_only=True).squeeze(1)
         writer.add_tensor(f"kokopop.voice.{voice}", pack)
 
@@ -713,6 +721,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output", required=True, help="output GGUF path")
     parser.add_argument("--repo-id", default=DEFAULT_REPO)
+    parser.add_argument(
+        "--local-dir", default=None,
+        help="load model files from this local directory instead of HuggingFace",
+    )
     parser.add_argument("--voices", default=DEFAULT_VOICES)
     parser.add_argument(
         "--tier", default="kokoro-md", choices=VALID_TIERS,
