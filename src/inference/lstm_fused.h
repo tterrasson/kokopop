@@ -36,6 +36,7 @@ void lstm_fused_callback(
 struct LstmPregatesParams {
     void       * metal_kernel; // MetalLstmKernelState *
     const char * wih_key;
+    const float * w_ih_f32;
     int          I;
     int          four_H;
     int          n_steps;

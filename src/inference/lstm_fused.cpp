@@ -67,7 +67,15 @@ static inline float sigmoidf_stable(float x) {
     return z / (1.0f + z);
 }
 
+static inline float sanitize_gate(float x) {
+    if (!std::isfinite(x)) return 0.0f;
+    if (x >  80.0f) return  80.0f;
+    if (x < -80.0f) return -80.0f;
+    return x;
+}
+
 static inline float clamp_cell(float x) {
+    if (!std::isfinite(x)) return 0.0f;
     if (x >  50.0f) return  50.0f;
     if (x < -50.0f) return -50.0f;
     return x;
@@ -219,14 +227,20 @@ static void cpu_lstm_contiguous(
 
         float * out_t = output + H * t;
         for (int64_t i = 0; i < H; ++i) {
-            const float i_gate = sigmoidf_stable(gates[static_cast<size_t>(i)]);
-            const float f_gate = sigmoidf_stable(gates[static_cast<size_t>(H + i)]);
-            const float g_gate = std::tanh(gates[static_cast<size_t>(2 * H + i)]);
-            const float o_gate = sigmoidf_stable(gates[static_cast<size_t>(3 * H + i)]);
+            const float x_i = sanitize_gate(gates[static_cast<size_t>(i)]);
+            const float x_f = sanitize_gate(gates[static_cast<size_t>(H + i)]);
+            const float x_g = sanitize_gate(gates[static_cast<size_t>(2 * H + i)]);
+            const float x_o = sanitize_gate(gates[static_cast<size_t>(3 * H + i)]);
+
+            const float i_gate = sigmoidf_stable(x_i);
+            const float f_gate = sigmoidf_stable(x_f);
+            const float g_gate = std::tanh(x_g);
+            const float o_gate = sigmoidf_stable(x_o);
 
             const float c_new = clamp_cell(f_gate * c[static_cast<size_t>(i)] + i_gate * g_gate);
             c[static_cast<size_t>(i)] = c_new;
-            h[static_cast<size_t>(i)] = o_gate * std::tanh(c_new);
+            const float h_new = o_gate * std::tanh(c_new);
+            h[static_cast<size_t>(i)] = std::isfinite(h_new) ? h_new : 0.0f;
             out_t[i] = h[static_cast<size_t>(i)];
         }
     }
@@ -266,14 +280,20 @@ static void cpu_lstm_strided(
         }
 
         for (int64_t i = 0; i < H; ++i) {
-            const float i_gate = sigmoidf_stable(gates[static_cast<size_t>(i)]);
-            const float f_gate = sigmoidf_stable(gates[static_cast<size_t>(H + i)]);
-            const float g_gate = std::tanh(gates[static_cast<size_t>(2 * H + i)]);
-            const float o_gate = sigmoidf_stable(gates[static_cast<size_t>(3 * H + i)]);
+            const float x_i = sanitize_gate(gates[static_cast<size_t>(i)]);
+            const float x_f = sanitize_gate(gates[static_cast<size_t>(H + i)]);
+            const float x_g = sanitize_gate(gates[static_cast<size_t>(2 * H + i)]);
+            const float x_o = sanitize_gate(gates[static_cast<size_t>(3 * H + i)]);
+
+            const float i_gate = sigmoidf_stable(x_i);
+            const float f_gate = sigmoidf_stable(x_f);
+            const float g_gate = std::tanh(x_g);
+            const float o_gate = sigmoidf_stable(x_o);
 
             const float c_new = clamp_cell(f_gate * c[static_cast<size_t>(i)] + i_gate * g_gate);
             c[static_cast<size_t>(i)] = c_new;
-            h[static_cast<size_t>(i)] = o_gate * std::tanh(c_new);
+            const float h_new = o_gate * std::tanh(c_new);
+            h[static_cast<size_t>(i)] = std::isfinite(h_new) ? h_new : 0.0f;
             tensor_set_f32_2d(output, i, t, h[static_cast<size_t>(i)]);
         }
     }
@@ -357,18 +377,58 @@ void lstm_fused_callback(
     cpu_lstm(*p, pre_gates, dst);
 }
 
+static void cpu_lstm_pregates(
+    const LstmPregatesParams & p,
+    const ggml_tensor * input,
+    ggml_tensor * dst,
+    int ith,
+    int nth) {
+
+    GGML_ASSERT(p.w_ih_f32 != nullptr);
+
+    const int64_t total = static_cast<int64_t>(p.four_H) * static_cast<int64_t>(p.n_steps);
+    const int64_t begin = (total * ith) / nth;
+    const int64_t end   = (total * (ith + 1)) / nth;
+
+    if (tensor_is_f32_2d_contiguous(input, p.I, p.n_steps) &&
+        tensor_is_f32_2d_contiguous(dst, p.four_H, p.n_steps)) {
+        const float * input_data = static_cast<const float *>(input->data);
+        float * dst_data = static_cast<float *>(dst->data);
+
+        for (int64_t index = begin; index < end; ++index) {
+            const int64_t g = index % p.four_H;
+            const int64_t t = index / p.four_H;
+            const float * w_col = p.w_ih_f32 + static_cast<size_t>(p.I) * static_cast<size_t>(g);
+            const float * x_col = input_data + static_cast<size_t>(p.I) * static_cast<size_t>(t);
+
+            dst_data[static_cast<size_t>(g + static_cast<int64_t>(p.four_H) * t)] =
+                dot_product(w_col, x_col, p.I);
+        }
+        return;
+    }
+
+    for (int64_t index = begin; index < end; ++index) {
+        const int64_t g = index % p.four_H;
+        const int64_t t = index / p.four_H;
+        const float * w_col = p.w_ih_f32 + static_cast<size_t>(p.I) * static_cast<size_t>(g);
+
+        float acc = 0.0f;
+        for (int64_t i = 0; i < p.I; ++i) {
+            acc += w_col[i] * tensor_get_f32_2d(input, i, t);
+        }
+        tensor_set_f32_2d(dst, g, t, acc);
+    }
+}
+
 // Pre-gates matmul callback. Computes dst = w_ih @ input using the Metal
-// LSTM kernel state. On Metal failure the function emits zeros and logs
-// (loud failure rather than silent degradation).
+// LSTM kernel when available, otherwise a deterministic CPU F32 matmul.
 void lstm_pregates_callback(
     ggml_tensor       * dst,
     const ggml_tensor * /*dst_unused*/,
     const ggml_tensor * input,
     int ith,
-    int /*nth*/,
+    int nth,
     void * userdata) {
-
-    if (ith != 0) return;
 
     const LstmPregatesParams * p = static_cast<const LstmPregatesParams *>(userdata);
     GGML_ASSERT(p != nullptr);
@@ -379,6 +439,7 @@ void lstm_pregates_callback(
     if (p->metal_kernel != nullptr &&
         tensor_is_f32_2d_contiguous(input, p->I, p->n_steps) &&
         tensor_is_f32_2d_contiguous(dst, p->four_H, p->n_steps)) {
+        if (ith != 0) return;
         if (metal_lstm_pregates_matmul(
                 static_cast<MetalLstmKernelState *>(p->metal_kernel),
                 p->wih_key,
@@ -390,9 +451,16 @@ void lstm_pregates_callback(
     }
 #endif
 
-    std::fprintf(stderr, "[lstm_pregates] Metal call failed for %s\n",
-                 p->wih_key ? p->wih_key : "(unknown)");
-    std::memset(dst->data, 0, ggml_nbytes(dst));
+    if (p->w_ih_f32 != nullptr) {
+        cpu_lstm_pregates(*p, input, dst, ith, nth);
+        return;
+    }
+
+    if (ith == 0) {
+        std::fprintf(stderr, "[lstm_pregates] no CPU fallback weights for %s\n",
+                     p->wih_key ? p->wih_key : "(unknown)");
+        std::memset(dst->data, 0, ggml_nbytes(dst));
+    }
 }
 
 } // namespace kokopop
