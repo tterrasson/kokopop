@@ -224,10 +224,20 @@ void SynthesisScheduler::_worker_loop() {
                     std::chrono::duration<double, std::milli>(end - start).count();
                 const double audio_ms = static_cast<double>(audio.size()) /
                     static_cast<double>(_model.sample_rate) * 1000.0;
-                ctx->adaptative_controller.observe(n_tokens, generation_ms, audio_ms);
+                // Skip observe() for the first chunk when the client explicitly set a
+                // target size. The oversized first chunk is intentionally out-of-band;
+                // seeding the EWMA and lead from it would depress subsequent targets.
+                // The controller starts cold from chunk 2, giving a higher initial
+                // estimate (700ms / 12ms = 58 tokens) before converging on real RTF.
+                const bool first_chunk_oversized =
+                    (idx == 0 && ctx->chunk_config.first_chunk_target_max_tokens > 0);
+                if (!first_chunk_oversized) {
+                    ctx->adaptative_controller.observe(n_tokens, generation_ms, audio_ms);
+                }
+
                 ctx->chunks_total = is_last_chunk ? idx + 1 : 0;
-                const int next_target = ctx->adaptative_controller.target_tokens(
-                    queued_after_pop);
+                const int next_target = ctx->adaptative_controller.target_tokens(queued_after_pop);
+
                 std::fprintf(stderr,
                     "[scheduler] request #%u chunk %d: gen=%.0fms audio=%.0fms"
                     " rtf=%.2f lead=%.0fms cap=%d → next_target=%d tokens\n",

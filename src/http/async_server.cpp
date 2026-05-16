@@ -630,6 +630,12 @@ void AsyncHttpServer::_dispatch_request(int fd, Connection & conn) {
             ogg_prebuffer_chunks = std::max(0, static_cast<int>(yyjson_get_int(prebuffer_val)));
         }
 
+        int first_chunk_target_tokens = 0;
+        yyjson_val * fct_val = yyjson_obj_get(root, "first_chunk_target_tokens");
+        if (fct_val && !yyjson_is_null(fct_val) && yyjson_is_num(fct_val)) {
+            first_chunk_target_tokens = std::max(1, static_cast<int>(yyjson_get_int(fct_val)));
+        }
+
         // "format": "pcm"     → stream raw float32 PCM (default)
         // "format": "wav"     → accumulate and return a complete WAV file
         // "format": "ogg"     → stream Ogg/Opus with Transfer-Encoding: chunked
@@ -686,10 +692,16 @@ void AsyncHttpServer::_dispatch_request(int fd, Connection & conn) {
                      text_str.size(), current_voice.c_str(), spd, fmt_name);
 
         // Submit to scheduler (round-robin interleaving)
+        ChunkConfig chunk_cfg_override;
+        bool has_chunk_cfg_override = false;
+        if (first_chunk_target_tokens > 0) {
+            chunk_cfg_override.first_chunk_target_max_tokens = first_chunk_target_tokens;
+            has_chunk_cfg_override = true;
+        }
         auto ctx = _scheduler->submit(
             text_str, current_voice, spd, current_mode, fmt,
             ogg_prebuffer_chunks,
-            ChunkConfig{}, false);
+            chunk_cfg_override, has_chunk_cfg_override);
 
         _send_streaming_response(fd, conn, ctx);
         return;

@@ -145,6 +145,7 @@ struct AdaptativeChunkController {
     // Closed-loop state
     double cumulative_audio_ms = 0.0;
     double cumulative_gen_ms_after_first = 0.0;
+    double first_gen_ms = 0.0;       // gen time of the first observed chunk (initial TTFB cost)
     bool first_observed = false;
     int growth_max_tokens = 80;      // dynamic cap, starts at target_max_tokens
 
@@ -156,7 +157,7 @@ struct AdaptativeChunkController {
 
     int target_tokens(size_t queued_requests = 0) const;
     void observe(int n_tokens, double generation_ms, double audio_ms);
-    double lead_ms() const { return cumulative_audio_ms - cumulative_gen_ms_after_first; }
+    double lead_ms() const { return cumulative_audio_ms - cumulative_gen_ms_after_first - first_gen_ms; }
 };
 
 // ---------------------------------------------------------------------------

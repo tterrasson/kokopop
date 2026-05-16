@@ -19,7 +19,7 @@ ChunkConfig make_adaptative_config() {
     cfg.target_max_tokens = 80;
     cfg.soft_max_tokens = 320;
     cfg.hard_max_tokens = 510;
-    cfg.first_chunk_target_max_tokens = 64;
+    cfg.first_chunk_target_max_tokens = 0; // 0 = flush at first boundary (default TTFB behaviour)
     cfg.allow_short_first_chunk = true;
     cfg.comma_pause_ms = 70;
     cfg.sentence_pause_ms = 170;
@@ -526,7 +526,12 @@ int AdaptativeChunkController::target_tokens(size_t queued_requests) const {
     }
     const int estimate = static_cast<int>(adjusted_target_ms / baseline);
     const int cap = std::max(min_tokens, std::min(max_tokens, growth_max_tokens));
-    return std::max(min_tokens, std::min(cap, estimate));
+    // When the buffer is comfortable, aim for the cap directly.
+    // On fast hardware (RTF << 1) estimate often falls below min_tokens,
+    // making the AIMD cap irrelevant. Using cap as the target lets chunks
+    // grow as the buffer deepens and amortizes per-chunk synthesis overhead.
+    const int base = (lead_ms() >= comfort_lead_ms) ? cap : estimate;
+    return std::max(min_tokens, std::min(cap, base));
 }
 
 void AdaptativeChunkController::observe(int n_tokens, double generation_ms, double audio_ms) {
@@ -546,6 +551,7 @@ void AdaptativeChunkController::observe(int n_tokens, double generation_ms, doub
         cumulative_gen_ms_after_first += generation_ms;
     } else {
         first_observed = true;
+        first_gen_ms = generation_ms;  // TTFB cost: excluded from gen_after but deducted from lead
     }
 
     const double lead = lead_ms();
@@ -602,9 +608,12 @@ Chunk build_adaptative_chunk(
         ++next_unit;
 
         if (is_first) {
-            // For adaptative TTFB, the first natural pause is enough. This
-            // keeps "Bonjour," quick while preserving a long pre-comma clause.
-            if (chunk.boundary_after != Boundary::None) break;
+            if (chunk.boundary_after != Boundary::None) {
+                // first_chunk_target_max_tokens == 0  → flush at first boundary (default)
+                // first_chunk_target_max_tokens  > 0  → keep accumulating until that threshold
+                if (config.first_chunk_target_max_tokens <= 0 ||
+                    chunk.n_tokens >= config.first_chunk_target_max_tokens) break;
+            }
             if (chunk.n_tokens >= config.hard_max_tokens) break;
             continue;
         }
@@ -612,10 +621,9 @@ Chunk build_adaptative_chunk(
         if (chunk.n_tokens >= target && chunk.boundary_after != Boundary::None) {
             break;
         }
-        // Hard cap at target_max even without a boundary: prevents a long
-        // unpunctuated sentence from creating a chunk that takes longer to
-        // synthesise than the previous chunk takes to play, causing a gap.
-        if (chunk.n_tokens >= config.target_max_tokens) break;
+        // Hard cap: max(target, target_max_tokens) lets a large controller
+        // target override the static 80-token cap when the buffer is deep.
+        if (chunk.n_tokens >= std::max(config.target_max_tokens, target)) break;
         if (chunk.n_tokens >= config.soft_max_tokens &&
             chunk.boundary_after != Boundary::None) {
             break;

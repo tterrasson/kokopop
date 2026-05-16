@@ -59,12 +59,16 @@ def _build_payload(
     mode: str,
     fmt: str,
     prebuffer_chunks: int,
+    first_chunk_tokens: int | None,
 ) -> dict:
     payload = {"text": text, "speed": speed, "mode": mode, "format": fmt}
     if voice:
         payload["voice"] = voice
     if fmt == "ogg" and prebuffer_chunks > 0:
         payload["prebuffer_chunks"] = prebuffer_chunks
+    if first_chunk_tokens is not None:
+        payload["first_chunk_target_tokens"] = first_chunk_tokens
+
     return payload
 
 
@@ -89,8 +93,9 @@ def fetch_tts(
     url: str,
     emit_stdout: bool,
     prebuffer_chunks: int,
+    first_chunk_tokens: int | None = None,
 ) -> bytes:
-    payload = _build_payload(text, voice, speed, mode, fmt, prebuffer_chunks)
+    payload = _build_payload(text, voice, speed, mode, fmt, prebuffer_chunks, first_chunk_tokens)
     return _send_tts(url, payload, lambda resp: _read_stream(resp, emit_stdout))
 
 
@@ -109,6 +114,8 @@ def main() -> None:
                         dest="fmt", help="Output format: pcm, wav, or ogg")
     parser.add_argument("--prebuffer-chunks", type=int, default=0,
                         help="Server-side Ogg synthesis chunks to buffer before playback")
+    parser.add_argument("--first-chunk-tokens", type=int, default=None,
+                        help="Target max tokens for the first audio chunk (adaptive mode only)")
     parser.add_argument("--out", default=None,
                         help="Output file. If omitted, streaming formats write to stdout.")
     args = parser.parse_args()
@@ -123,7 +130,7 @@ def main() -> None:
     emit_stdout = args.out is None and not sys.stdout.buffer.isatty()
     data = fetch_tts(
         text, args.voice, args.speed, args.mode, args.fmt, args.url,
-        emit_stdout, max(0, args.prebuffer_chunks))
+        emit_stdout, max(0, args.prebuffer_chunks), args.first_chunk_tokens)
 
     if args.out:
         output = _pcm_to_wav(data) if args.fmt == "pcm" else data
