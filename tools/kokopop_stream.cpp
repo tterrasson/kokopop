@@ -62,6 +62,7 @@ void usage(const char * argv0) {
         "  --http          Run in HTTP server mode (async, event-driven)\n"
         "  --port N        HTTP server port (default: 8080)\n"
         "  --bind ADDR     HTTP server bind address (default: 127.0.0.1)\n"
+        "  --idle-unload N Unload model after N minutes of inactivity (HTTP mode, default: disabled)\n"
         "\n"
         "Examples:\n",
         stderr);
@@ -160,36 +161,112 @@ static bool handle_not_found(kokopop::HttpRequest & /*req*/, kokopop::HttpRespon
 
 } // namespace
 
-static int run_http_mode(kokopop::Model * model, const std::string & default_voice,
+static int run_http_mode(const std::string & model_path,
+                         const kokopop_model_options & model_options,
+                         kokopop_model * initial_model_c,
+                         const std::string & default_voice,
                          float speed, kokopop::StreamMode stream_mode,
-                         const std::string & bind_addr, int port) {
-    kokopop::AsyncHttpServer server;
-    kokopop::SynthesisScheduler scheduler(*model);
+                         const std::string & bind_addr, int port,
+                         int idle_unload_seconds) {
+    // Lifecycle state shared between the server callbacks.
+    struct LifecycleState {
+        std::string              model_path;
+        kokopop_model_options    model_options{};
+        kokopop_model          * model_c  = nullptr;
+        kokopop::Model         * model    = nullptr;
+        std::unique_ptr<kokopop::SynthesisScheduler> scheduler;
+    };
 
-    server.set_scheduler(scheduler);
-    server.set_model(model);
+    auto ls = std::make_shared<LifecycleState>();
+    ls->model_path    = model_path;
+    ls->model_options = model_options;
+    ls->model_c       = initial_model_c;
+    ls->model         = kokopop_model_get_impl(initial_model_c);
+    ls->scheduler     = std::make_unique<kokopop::SynthesisScheduler>(*ls->model);
+
+    kokopop::AsyncHttpServer server;
+
+    server.set_scheduler(*ls->scheduler);
+    server.set_model(ls->model);
     server.set_default_voice(default_voice);
     server.set_default_speed(speed);
     server.set_stream_mode(stream_mode);
 
+    if (idle_unload_seconds > 0) {
+        auto reload_fn = [ls, &server]() -> bool {
+            kokopop_model * new_model_c = nullptr;
+            int rc = kokopop_model_load(ls->model_path.c_str(), &ls->model_options, &new_model_c);
+            if (rc != KOKOPOP_OK) {
+                std::fprintf(stderr, "[kokopop] Model reload failed: %s\n", kokopop_last_error());
+                return false;
+            }
+            auto * new_model = kokopop_model_get_impl(new_model_c);
+            if (!new_model) {
+                kokopop_model_free(new_model_c);
+                return false;
+            }
+            ls->model_c   = new_model_c;
+            ls->model     = new_model;
+            ls->scheduler = std::make_unique<kokopop::SynthesisScheduler>(*ls->model);
+            server.set_model(ls->model);
+            server.set_scheduler(*ls->scheduler);
+            return true;
+        };
+
+        auto unload_fn = [ls]() {
+            if (ls->scheduler) {
+                ls->scheduler->stop();
+                ls->scheduler->join();
+                ls->scheduler.reset();
+            }
+            if (ls->model_c) {
+                kokopop_model_free(ls->model_c);
+                ls->model_c = nullptr;
+                ls->model   = nullptr;
+            }
+            std::fprintf(stderr, "[kokopop] Model unloaded, memory freed\n");
+        };
+
+        server.set_idle_unload(idle_unload_seconds, std::move(reload_fn), std::move(unload_fn));
+    }
+
     // /tts is handled in AsyncHttpServer::_dispatch_request (scheduler-based)
 
     server.route("/health",
-        [model](kokopop::HttpRequest & req, kokopop::HttpResponse & res) {
-            return handle_health(model, req, res);
+        [&ls](kokopop::HttpRequest & req, kokopop::HttpResponse & res) {
+            if (!ls->model) {
+                res.status_code = 503;
+                res.status_text = "Service Unavailable";
+                res.set_json_string("{\"status\":\"unloaded\"}");
+                return true;
+            }
+            return handle_health(ls->model, req, res);
         });
 
     server.route("/voices",
-        [model](kokopop::HttpRequest & req, kokopop::HttpResponse & res) {
-            return handle_voices(model, req, res);
+        [&ls](kokopop::HttpRequest & req, kokopop::HttpResponse & res) {
+            if (!ls->model) {
+                res.status_code = 503;
+                res.status_text = "Service Unavailable";
+                res.set_json_string("{\"status\":\"unloaded\"}");
+                return true;
+            }
+            return handle_voices(ls->model, req, res);
         });
 
     server.route_default(handle_not_found);
 
     server.start(bind_addr, port);
     server.join();
-    scheduler.stop();
-    scheduler.join();
+
+    // Cleanup (if model wasn't already unloaded by idle timeout)
+    if (ls->scheduler) {
+        ls->scheduler->stop();
+        ls->scheduler->join();
+    }
+    if (ls->model_c) {
+        kokopop_model_free(ls->model_c);
+    }
     return 0;
 }
 
@@ -209,6 +286,7 @@ int main(int argc, char ** argv) {
     bool http_mode = false;
     int http_port = 8080;
     std::string http_bind = "127.0.0.1";
+    int idle_unload_minutes = 0;
 
     try {
         for (int i = 1; i < argc; ++i) {
@@ -259,6 +337,14 @@ int main(int argc, char ** argv) {
                 const char * v = arg_value(i, argc, argv);
                 if (!v) { usage(argv[0]); return 2; }
                 http_bind = v;
+            } else if (std::strcmp(argv[i], "--idle-unload") == 0) {
+                const char * v = arg_value(i, argc, argv);
+                if (!v) { usage(argv[0]); return 2; }
+                idle_unload_minutes = std::stoi(v);
+                if (idle_unload_minutes < 0) {
+                    std::fprintf(stderr, "error: --idle-unload must be >= 0\n");
+                    return 2;
+                }
             } else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
                 usage(argv[0]);
                 return 0;
@@ -314,7 +400,10 @@ int main(int argc, char ** argv) {
 
     if (http_mode) {
         std::fprintf(stderr, "[kokopop] Starting HTTP server (async) on %s:%d\n", http_bind.c_str(), http_port);
-        return run_http_mode(model, voice, speed, stream_mode, http_bind, http_port);
+        // Transfer model ownership to run_http_mode which manages the lifecycle.
+        model_guard.release();
+        return run_http_mode(model_path, options, model_c, voice, speed, stream_mode,
+                             http_bind, http_port, idle_unload_minutes * 60);
     }
 
 #ifndef _WIN32

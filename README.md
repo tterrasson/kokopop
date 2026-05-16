@@ -193,6 +193,9 @@ Start an async, event-driven HTTP server for TTS synthesis. Uses `poll()` for no
 
 ```bash
 ./build/kokopop_stream --model models/kokoro.gguf --http --port 8080
+
+# Unload model after 10 minutes of inactivity (saves memory, reloads on next request)
+./build/kokopop_stream --model models/kokoro.gguf --http --port 8080 --idle-unload 10
 ```
 
 **Options:**
@@ -202,6 +205,7 @@ Start an async, event-driven HTTP server for TTS synthesis. Uses `poll()` for no
 | `--http` | — | Run in HTTP server mode |
 | `--port N` | `8080` | Server port |
 | `--bind ADDR` | `127.0.0.1` | Bind address |
+| `--idle-unload N` | disabled | Unload model after N minutes of inactivity, reload on next request |
 
 Available endpoints:
 

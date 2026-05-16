@@ -4,8 +4,12 @@
 #include "http/synthesis_scheduler.h"
 #include "http/http_server.h"  // for HttpRequest, HttpResponse, json_error, RequestHandler
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <poll.h>
 #include <string>
 #include <unordered_map>
@@ -84,6 +88,15 @@ public:
     float get_default_speed() const { return _default_speed; }
     StreamMode get_stream_mode() const { return _stream_mode; }
 
+    /// Enable automatic model unload after idle_seconds of inactivity.
+    /// reload_fn  — called on the next request when the model is unloaded;
+    ///              must update the server's _model and _scheduler via set_model/set_scheduler
+    ///              and return true on success.
+    /// unload_fn  — called by the idle monitor; must stop/join the scheduler and free the model.
+    using ModelReloadFn = std::function<bool()>;
+    using ModelUnloadFn = std::function<void()>;
+    void set_idle_unload(int idle_seconds, ModelReloadFn reload_fn, ModelUnloadFn unload_fn);
+
 private:
     struct Connection {
         int fd = -1;
@@ -93,6 +106,7 @@ private:
         std::shared_ptr<RequestContext> req_ctx{nullptr};
         std::string write_buffer;
         bool write_in_progress{false};
+        bool was_streaming = false; // set on streaming start, used to update _active_streams on close
 
         enum {
             STATE_IDLE,
@@ -109,6 +123,7 @@ private:
     };
 
     void _event_loop();
+    void _idle_loop();
     void _handle_server_accept();
     void _handle_connection_read(int fd, Connection & conn);
     void _handle_connection_write(int fd, Connection & conn);
@@ -126,6 +141,11 @@ private:
 
     bool _parse_request_line(const std::string & request_line, std::string & method,
                              std::string & path, std::string & query_string);
+
+    static int64_t _now_ms() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
 
     int _server_fd = -1;
     std::string _addr;
@@ -145,6 +165,18 @@ private:
     std::string _default_voice;
     float _default_speed = 1.0f;
     StreamMode _stream_mode = StreamMode::Adaptative;
+
+    // Idle unload
+    int _idle_unload_seconds = 0;
+    ModelReloadFn _reload_fn;
+    ModelUnloadFn _unload_fn;
+    std::atomic<int64_t> _last_activity_ms{0};
+    std::atomic<int>     _active_streams{0};
+    std::atomic<bool>    _model_loaded{true};
+    std::mutex           _lifecycle_mutex;
+    std::thread          _idle_thread;
+    std::condition_variable _idle_cv;
+    std::mutex              _idle_cv_mutex;
 
     // Maximum connections
     static constexpr int MAX_CONNECTIONS = 64;

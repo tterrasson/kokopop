@@ -178,15 +178,30 @@ bool AsyncHttpServer::start(const std::string & addr, int port) {
     }
 
     _running.store(true);
+    _last_activity_ms.store(_now_ms());
     _loop_thread = std::thread(&AsyncHttpServer::_event_loop, this);
+
+    if (_idle_unload_seconds > 0) {
+        _idle_thread = std::thread(&AsyncHttpServer::_idle_loop, this);
+        std::fprintf(stderr, "[http] Idle unload enabled: model will be unloaded after %ds of inactivity\n",
+                     _idle_unload_seconds);
+    }
 
     std::fprintf(stderr, "[http] Async server listening on %s:%d (max %d conns)\n",
                 addr.empty() ? "0.0.0.0" : addr.c_str(), port, MAX_CONNECTIONS);
     return true;
 }
 
+void AsyncHttpServer::set_idle_unload(int idle_seconds, ModelReloadFn reload_fn,
+                                      ModelUnloadFn unload_fn) {
+    _idle_unload_seconds = idle_seconds;
+    _reload_fn = std::move(reload_fn);
+    _unload_fn = std::move(unload_fn);
+}
+
 void AsyncHttpServer::stop() {
     _running.store(false);
+    _idle_cv.notify_all();
     if (_server_fd >= 0) {
         async_socket::close_fd(_server_fd);
         _server_fd = -1;
@@ -197,10 +212,56 @@ void AsyncHttpServer::join() {
     if (_loop_thread.joinable()) {
         _loop_thread.join();
     }
+    if (_idle_thread.joinable()) {
+        _idle_thread.join();
+    }
     for (auto & [fd, conn] : _connections) {
         if (conn.fd >= 0) async_socket::close_fd(conn.fd);
     }
     _connections.clear();
+}
+
+// ---------------------------------------------------------------------------
+// Idle unload loop
+// ---------------------------------------------------------------------------
+
+void AsyncHttpServer::_idle_loop() {
+    while (_running.load()) {
+        {
+            std::unique_lock<std::mutex> lk(_idle_cv_mutex);
+            _idle_cv.wait_for(lk, std::chrono::seconds(30),
+                              [this] { return !_running.load(); });
+        }
+        if (!_running.load()) break;
+        if (!_model_loaded.load()) continue;
+        if (_active_streams.load() > 0) continue;
+
+        int64_t elapsed_ms = _now_ms() - _last_activity_ms.load();
+        if (elapsed_ms < static_cast<int64_t>(_idle_unload_seconds) * 1000) continue;
+
+        // Acquire lifecycle lock. If a request just came in, it will hold the lock
+        // — try_lock avoids blocking the idle thread indefinitely; we'll retry next round.
+        std::unique_lock<std::mutex> lock(_lifecycle_mutex, std::try_to_lock);
+        if (!lock.owns_lock()) continue;
+
+        // Re-check under lock
+        if (!_model_loaded.load()) continue;
+        if (_active_streams.load() > 0) continue;
+        elapsed_ms = _now_ms() - _last_activity_ms.load();
+        if (elapsed_ms < static_cast<int64_t>(_idle_unload_seconds) * 1000) continue;
+
+        std::fprintf(stderr, "[http] No activity for %llds — unloading model\n",
+                     (long long)(elapsed_ms / 1000));
+
+        _model_loaded.store(false);
+        _model     = nullptr;
+        _scheduler = nullptr;
+
+        // unload_fn stops/joins the scheduler and frees the model.
+        // We hold _lifecycle_mutex so any concurrent /tts will wait; this is
+        // intentional — the request will then trigger a reload once we release.
+        if (_unload_fn) _unload_fn();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -588,6 +649,23 @@ void AsyncHttpServer::_dispatch_request(int fd, Connection & conn) {
                         json_error("POST required"));
             return;
         }
+
+        // Ensure model is loaded; reload if it was unloaded due to idle timeout.
+        if (_idle_unload_seconds > 0) {
+            std::unique_lock<std::mutex> lock(_lifecycle_mutex);
+            if (!_model_loaded.load()) {
+                std::fprintf(stderr, "[http] Reloading model for incoming request\n");
+                if (!_reload_fn || !_reload_fn()) {
+                    _send_error(fd, conn, 503, "Service Unavailable",
+                                json_error("Model reload failed"));
+                    return;
+                }
+                _model_loaded.store(true);
+                std::fprintf(stderr, "[http] Model reloaded\n");
+            }
+            _last_activity_ms.store(_now_ms());
+        }
+
         if (!_scheduler) {
             _send_error(fd, conn, 503, "Service Unavailable",
                         json_error("Scheduler not configured"));
@@ -761,6 +839,8 @@ void AsyncHttpServer::_send_response(int fd, Connection & conn,
 void AsyncHttpServer::_send_streaming_response(int fd, Connection & conn,
                                                 std::shared_ptr<RequestContext> ctx) {
     conn.req_ctx = std::move(ctx);
+    conn.was_streaming = true;
+    _active_streams.fetch_add(1);
     auto fmt = conn.req_ctx->format;
 
     if (fmt == RequestContext::AudioFormat::PCM) {
@@ -848,6 +928,10 @@ void AsyncHttpServer::_send_error(int fd, Connection & conn,
 void AsyncHttpServer::_close_connection(int fd) {
     auto it = _connections.find(fd);
     if (it != _connections.end()) {
+        if (it->second.was_streaming) {
+            _active_streams.fetch_sub(1);
+            _last_activity_ms.store(_now_ms());
+        }
         if (it->second.fd >= 0) async_socket::close_fd(it->second.fd);
         _connections.erase(it);
     }
