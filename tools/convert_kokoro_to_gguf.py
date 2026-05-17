@@ -11,6 +11,7 @@ import hashlib
 import json
 import logging
 import struct
+import tempfile
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -665,16 +666,63 @@ def _resolve_file(filename: str, args: argparse.Namespace) -> str:
     return hf_hub_download(repo_id=args.repo_id, filename=filename)
 
 
+def _normalize_wn_checkpoint(model_path: str) -> str:
+    """Remap new-style parametrizations.weight_norm keys to old weight_g/weight_v.
+
+    Training with torch.nn.utils.parametrizations.weight_norm stores weights as
+    ``*.parametrizations.weight.original0`` (g) and ``*.original1`` (v).
+    KModel (pip-installed kokoro) uses the old torch.nn.utils.weight_norm API
+    which expects ``*.weight_g`` / ``*.weight_v``.  Without remapping, KModel
+    silently skips all weight-normed layers via strict=False, leaving them at
+    their random initial values and producing noise in the GGUF output.
+    """
+    checkpoint = torch.load(model_path, map_location="cpu", weights_only=True)
+    needs_fix = any(
+        ".parametrizations.weight." in k
+        for sd in checkpoint.values()
+        if isinstance(sd, dict)
+        for k in sd
+    )
+    if not needs_fix:
+        return model_path
+
+    logger.info("checkpoint uses new parametrizations weight_norm API — remapping keys")
+
+    def _remap(sd: dict) -> dict:
+        out = {}
+        for k, v in sd.items():
+            if ".parametrizations.weight.original0" in k:
+                out[k.replace(".parametrizations.weight.original0", ".weight_g")] = v
+            elif ".parametrizations.weight.original1" in k:
+                out[k.replace(".parametrizations.weight.original1", ".weight_v")] = v
+            else:
+                out[k] = v
+        return out
+
+    normalized = {section: _remap(sd) for section, sd in checkpoint.items()}
+    tmp = tempfile.NamedTemporaryFile(suffix=".pth", delete=False)
+    torch.save(normalized, tmp.name)
+    tmp.close()
+
+    return tmp.name
+
+
 def convert(args: argparse.Namespace) -> None:
     config_path = _resolve_file("config.json", args)
     model_path = _resolve_file(MODEL_NAME, args)
     config = json.loads(Path(config_path).read_text())
 
-    model = KModel(
-        repo_id=args.repo_id,
-        config=config_path,
-        model=model_path,
-    ).eval()
+    normalized_path = _normalize_wn_checkpoint(model_path)
+    try:
+        model = KModel(
+            repo_id=args.repo_id,
+            config=config_path,
+            model=normalized_path,
+        ).eval()
+    finally:
+        if normalized_path != model_path:
+            Path(normalized_path).unlink(missing_ok=True)
+
     voices = [v.strip() for v in args.voices.split(",") if v.strip()]
 
     writer = GGUFWriter(Path(args.output))
