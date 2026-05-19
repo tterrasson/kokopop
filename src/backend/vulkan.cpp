@@ -53,12 +53,17 @@ class VulkanBackend final : public Backend {
         // CPU backend must be last. It handles unsupported ops and fallback copies.
         ggml_backend_t backends[] = { backend_, cpu_backend_ };
 
+        // parallel=false (5th arg): on ggml-vulkan + MoltenVK, running CPU and
+        // Vulkan splits concurrently races on the generator graph (CPU fallback
+        // for CONV_TRANSPOSE_1D / PAD_REFLECT_1D bounces 39 MiB tensors back
+        // and forth), and a downstream MUL_MAT silently outputs zeros → mute
+        // audio for long inputs. Keep this serialised; do not flip back to true.
         sched_ = ggml_backend_sched_new(
             backends,
             nullptr,
             2,
             required,
-            true,
+            false,
             true);
 
         if (sched_ != nullptr) {
