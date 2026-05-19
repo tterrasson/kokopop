@@ -302,21 +302,27 @@ bool run_kokoro_frontend_probe(
         return false;
     }
 
+    // Stop at dur_logits and finish sigmoid+sum_rows on host. The GPU result of
+    // sum_rows(sigmoid(logits)) is off by ~1e-3 vs CPU on Vulkan/MoltenVK, and
+    // duration_to_frames() rounds via std::lrint — when a token's predicted
+    // duration sits near k+0.5, the two backends round to different ints,
+    // shifting total_frames by a few frames and desynchronising the entire
+    // downstream pipeline (audible as "deformed voice" with timing drift).
+    // Doing the final reduction on host is identical across backends.
     ggml_tensor * dur_logits = linear(ctx, duration_w, duration_b, dur_hidden);
-    ggml_tensor * pred_dur = ggml_sum_rows(ctx, ggml_sigmoid(ctx, dur_logits));
+    dur_logits = ggml_cont(ctx, dur_logits);
 
     // Make host-read outputs explicit and materialized.
     d = ggml_cont(ctx, d);
-    pred_dur = ggml_cont(ctx, pred_dur);
 
     ggml_set_name(d, "kokopop_duration_hidden_probe");
-    ggml_set_name(pred_dur, "kokopop_duration_probe");
+    ggml_set_name(dur_logits, "kokopop_duration_logits_probe");
     ggml_set_output(d);
-    ggml_set_output(pred_dur);
+    ggml_set_output(dur_logits);
 
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, frontend_graph_size(n_tokens), false);
     ggml_build_forward_expand(gf, d);
-    ggml_build_forward_expand(gf, pred_dur);
+    ggml_build_forward_expand(gf, dur_logits);
 
     model.backend->sched_reset();
     if (!model.backend->sched_alloc_graph(gf)) {
@@ -345,15 +351,45 @@ bool run_kokoro_frontend_probe(
     }
 
     const int64_t n_hidden = ggml_nelements(d);
-    const int64_t n_dur    = ggml_nelements(pred_dur);
+    const int64_t n_logits = ggml_nelements(dur_logits);
+    const int64_t n_buckets = dur_logits->ne[0];
 
     probe.hidden.resize(static_cast<size_t>(n_hidden));
-    probe.durations.resize(static_cast<size_t>(n_dur));
+    probe.durations.resize(static_cast<size_t>(n_tokens));
     probe.n_tokens   = n_tokens;
     probe.hidden_dim = d->ne[0];
 
-    model.backend->tensor_get(d,        probe.hidden.data(),    0, static_cast<size_t>(n_hidden) * sizeof(float));
-    model.backend->tensor_get(pred_dur, probe.durations.data(), 0, static_cast<size_t>(n_dur)    * sizeof(float));
+    model.backend->tensor_get(d, probe.hidden.data(), 0, static_cast<size_t>(n_hidden) * sizeof(float));
+
+    std::vector<float> logits(static_cast<size_t>(n_logits));
+    model.backend->tensor_get(dur_logits, logits.data(), 0, logits.size() * sizeof(float));
+
+    // pred_dur[t] = sum_k sigmoid(logits[k, t])   (k in [0, n_buckets))
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        double sum = 0.0;
+        const float * row = logits.data() + t * n_buckets;
+        for (int64_t k = 0; k < n_buckets; ++k) {
+            const float x = row[k];
+            sum += (x >= 0.0f)
+                ? 1.0 / (1.0 + std::exp(-static_cast<double>(x)))
+                : std::exp(static_cast<double>(x)) / (1.0 + std::exp(static_cast<double>(x)));
+        }
+        probe.durations[static_cast<size_t>(t)] = static_cast<float>(sum);
+    }
+
+    if (const char * dump_dir = std::getenv("KOKOPOP_DUMP_DIR")) {
+        auto dump = [&](const char * name, const float * data, size_t n) {
+            char path[1024];
+            std::snprintf(path, sizeof(path), "%s/front_%s.bin", dump_dir, name);
+            if (FILE * f = std::fopen(path, "wb")) {
+                std::fwrite(data, sizeof(float), n, f);
+                std::fclose(f);
+            }
+        };
+        dump("hidden",      probe.hidden.data(),    probe.hidden.size());
+        dump("dur_logits",  logits.data(),          logits.size());
+        dump("durations",   probe.durations.data(), probe.durations.size());
+    }
 
     ggml_free(ctx);
     return true;
@@ -653,6 +689,46 @@ bool run_kokoro_generation_probe(
 
     model.tmp_decoder_style_f32.resize(128);
     model.backend->tensor_get(decoder_style, model.tmp_decoder_style_f32.data(), 0, model.tmp_decoder_style_f32.size() * sizeof(float));
+
+    if (std::getenv("KOKOPOP_GEN_STATS") != nullptr) {
+        auto dbg_stats = [&](const char * name, const std::vector<float> & v) {
+            double s = 0, s2 = 0;
+            float mn = std::numeric_limits<float>::infinity();
+            float mx = -std::numeric_limits<float>::infinity();
+            for (float x : v) {
+                s += x; s2 += static_cast<double>(x) * x;
+                if (x < mn) mn = x;
+                if (x > mx) mx = x;
+            }
+            const double n = static_cast<double>(v.size());
+            std::fprintf(stderr, "[gen-stats %s] n=%zu min=%.4f max=%.4f mean=%.4f rms=%.4f\n",
+                         name, v.size(), mn, mx, s / n, std::sqrt(s2 / n));
+        };
+        std::fprintf(stderr, "[gen-stats tokens=%lld total_frames=%lld]\n",
+                     static_cast<long long>(n_tokens), static_cast<long long>(total_frames));
+        dbg_stats("f0",      probe.f0);
+        dbg_stats("noise",   probe.noise);
+        dbg_stats("asr",     probe.asr);
+        dbg_stats("decoder", probe.decoder);
+        dbg_stats("style",   model.tmp_decoder_style_f32);
+        std::fflush(stderr);
+    }
+
+    if (const char * dump_dir = std::getenv("KOKOPOP_DUMP_DIR")) {
+        auto dump = [&](const char * name, const std::vector<float> & v) {
+            char path[1024];
+            std::snprintf(path, sizeof(path), "%s/gen_%s.bin", dump_dir, name);
+            if (FILE * f = std::fopen(path, "wb")) {
+                std::fwrite(v.data(), sizeof(float), v.size(), f);
+                std::fclose(f);
+            }
+        };
+        dump("f0",      probe.f0);
+        dump("noise",   probe.noise);
+        dump("asr",     probe.asr);
+        dump("decoder", probe.decoder);
+        dump("style",   model.tmp_decoder_style_f32);
+    }
 
     if (!all_finite(probe.f0, "f0", error) ||
         !all_finite(probe.noise, "noise", error) ||

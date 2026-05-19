@@ -53,17 +53,12 @@ class VulkanBackend final : public Backend {
         // CPU backend must be last. It handles unsupported ops and fallback copies.
         ggml_backend_t backends[] = { backend_, cpu_backend_ };
 
-        // parallel=false (5th arg): on ggml-vulkan + MoltenVK, running CPU and
-        // Vulkan splits concurrently races on the generator graph (CPU fallback
-        // for CONV_TRANSPOSE_1D / PAD_REFLECT_1D bounces 39 MiB tensors back
-        // and forth), and a downstream MUL_MAT silently outputs zeros → mute
-        // audio for long inputs. Keep this serialised; do not flip back to true.
         sched_ = ggml_backend_sched_new(
             backends,
             nullptr,
             2,
             required,
-            false,
+            true,
             true);
 
         if (sched_ != nullptr) {
@@ -353,6 +348,16 @@ public:
 
     ggml_backend_buffer_type_t weight_buffer_type() const override {
         GGML_ASSERT(backend_ != nullptr);
+        GGML_ASSERT(cpu_backend_ != nullptr);
+        // KOKOPOP_VULKAN_WEIGHTS_CPU=1 places model weights in CPU memory and
+        // lets the scheduler stage them to Vulkan as needed. This is much slower
+        // (the generator graph goes from ~250 ms to ~5 s on M1/MoltenVK) but
+        // works around precision/correctness issues observed with VRAM-resident
+        // quantized weights on MoltenVK for long inputs ("deformed voice" on
+        // some texts). Default keeps weights in VRAM for full speed.
+        if (std::getenv("KOKOPOP_VULKAN_WEIGHTS_CPU") != nullptr) {
+            return ggml_backend_get_default_buffer_type(cpu_backend_);
+        }
         return ggml_backend_vk_buffer_type(static_cast<size_t>(device_id_));
     }
 

@@ -555,33 +555,33 @@ Run `kokopop_rt` to get a detailed per-chunk real-time factor breakdown:
   Sample Rate: 24000 Hz
   Sentences:   10 → 14 chunk(s) (923 tokens)
 
-  Model load time:   65.6 ms
-  Prepare time:      13.1 ms (chunking + phonemization)
+  Model load time:   54.3 ms
+  Prepare time:      13.7 ms (chunking + phonemization)
 
   ┌──────┬────────┬────────────┬──────────┬──────────┬──────────┐
   │ Chunk│ Tokens │  Gen Time  │ Duration │    RT    │ Samples  │
   ├──────┼────────┼────────────┼──────────┼──────────┼──────────┤
-  │     1│       4│    497.9ms │     0.98s│     1.97x│     23520│
-  │     2│      77│   2058.2ms │     4.24s│     2.06x│    101640│
-  │     3│      54│   1498.5ms │     3.19s│     2.13x│     76560│
-  │     4│      67│   2112.1ms │     4.57s│     2.16x│    109560│
-  │     5│      77│   2216.0ms │     4.58s│     2.07x│    110040│
-  │     6│      74│   2038.1ms │     4.29s│     2.10x│    102840│
-  │     7│      77│   2075.7ms │     4.41s│     2.12x│    105840│
-  │     8│      67│   1723.7ms │     3.89s│     2.26x│     93360│
-  │     9│      76│   2204.9ms │     4.71s│     2.14x│    113040│
-  │    10│      66│   1730.4ms │     3.71s│     2.15x│     89160│
-  │    11│      53│   1573.4ms │     3.37s│     2.14x│     80760│
-  │    12│      70│   2064.5ms │     4.51s│     2.19x│    108360│
-  │    13│      89│   2691.3ms │     5.51s│     2.05x│    132360│
-  │    14│      72│   1982.4ms │     4.17s│     2.10x│    100080│
+  │     1│       4│    497.1ms │     0.98s│     1.97x│     23520│
+  │     2│      77│   2038.4ms │     4.24s│     2.08x│    101640│
+  │     3│      54│   1392.5ms │     3.04s│     2.18x│     72960│
+  │     4│      67│   2051.9ms │     4.54s│     2.21x│    108960│
+  │     5│      77│   2166.2ms │     4.58s│     2.12x│    110040│
+  │     6│      74│   2050.4ms │     4.29s│     2.09x│    102840│
+  │     7│      77│   2082.7ms │     4.41s│     2.12x│    105840│
+  │     8│      67│   1746.9ms │     3.92s│     2.24x│     93960│
+  │     9│      76│   2259.0ms │     4.71s│     2.09x│    113040│
+  │    10│      66│   1676.6ms │     3.67s│     2.19x│     87960│
+  │    11│      53│   1581.0ms │     3.34s│     2.11x│     80160│
+  │    12│      70│   2031.6ms │     4.54s│     2.23x│    108960│
+  │    13│      89│   2599.2ms │     5.59s│     2.15x│    134160│
+  │    14│      72│   1947.4ms │     4.17s│     2.14x│    100080│
   └──────┴────────┴────────────┴──────────┴──────────┴──────────┘
 
-  Total Generation:  26467.1 ms
-  Total Audio:        56.13 s  (1347120 samples @ 24000 Hz)
-  Overall RT:         2.12x
-  TTFB warm-start:    497.9 ms (1st chunk inference)
-  TTFB cold-start:    576.6 ms (load + prepare + 1st chunk)
+  Total Generation:  26120.8 ms
+  Total Audio:        56.00 s  (1344120 samples @ 24000 Hz)
+  Overall RT:         2.14x
+  TTFB warm-start:    497.1 ms (1st chunk inference)
+  TTFB cold-start:    565.1 ms (load + prepare + 1st chunk)
   → 2.1x faster than real-time
 ```
 
@@ -594,34 +594,34 @@ Run `kokopop_rt` to get a detailed per-chunk real-time factor breakdown:
   Sample Rate: 24000 Hz
   Sentences:   10 → 14 chunk(s) (923 tokens)
 
-  Model load time:  232.3 ms
-  Prepare time:      12.8 ms (chunking + phonemization)
+  Model load time:  256.8 ms
+  Prepare time:      14.0 ms (chunking + phonemization)
 
   ┌──────┬────────┬────────────┬──────────┬──────────┬──────────┐
   │ Chunk│ Tokens │  Gen Time  │ Duration │    RT    │ Samples  │
   ├──────┼────────┼────────────┼──────────┼──────────┼──────────┤
-  │     1│       4│    328.0ms │     0.95s│     2.91x│     22920│
-  │     2│      77│    843.5ms │     4.24s│     5.02x│    101640│
-  │     3│      54│    634.7ms │     3.19s│     5.03x│     76560│
-  │     4│      67│    839.0ms │     4.54s│     5.41x│    108960│
-  │     5│      77│    884.1ms │     4.56s│     5.16x│    109440│
-  │     6│      74│    826.6ms │     4.29s│     5.18x│    102840│
-  │     7│      77│    838.8ms │     4.43s│     5.29x│    106440│
-  │     8│      67│    727.9ms │     3.89s│     5.34x│     93360│
-  │     9│      76│    896.7ms │     4.74s│     5.28x│    113640│
-  │    10│      66│    701.1ms │     3.69s│     5.26x│     88560│
-  │    11│      53│    666.3ms │     3.31s│     4.98x│     79560│
-  │    12│      70│    830.6ms │     4.54s│     5.47x│    108960│
-  │    13│      89│    983.9ms │     5.51s│     5.61x│    132360│
-  │    14│      72│    790.0ms │     4.14s│     5.25x│     99480│
+  │     1│       4│    319.7ms │     0.95s│     2.99x│     22920│
+  │     2│      77│    833.7ms │     4.24s│     5.08x│    101640│
+  │     3│      54│    585.6ms │     3.09s│     5.28x│     74160│
+  │     4│      67│    798.1ms │     4.46s│     5.59x│    107160│
+  │     5│      77│    896.6ms │     4.56s│     5.09x│    109440│
+  │     6│      74│    822.0ms │     4.29s│     5.21x│    102840│
+  │     7│      77│    830.7ms │     4.43s│     5.34x│    106440│
+  │     8│      67│    710.0ms │     3.89s│     5.48x│     93360│
+  │     9│      76│    888.0ms │     4.74s│     5.33x│    113640│
+  │    10│      66│    698.0ms │     3.67s│     5.25x│     87960│
+  │    11│      53│    647.9ms │     3.31s│     5.12x│     79560│
+  │    12│      70│    812.9ms │     4.57s│     5.62x│    109560│
+  │    13│      89│    977.6ms │     5.59s│     5.72x│    134160│
+  │    14│      72│    780.0ms │     4.14s│     5.31x│     99480│
   └──────┴────────┴────────────┴──────────┴──────────┴──────────┘
 
-  Total Generation:  10791.2 ms
-  Total Audio:        56.03 s  (1344720 samples @ 24000 Hz)
-  Overall RT:         5.19x
-  TTFB warm-start:    328.0 ms (1st chunk inference)
-  TTFB cold-start:    573.1 ms (load + prepare + 1st chunk)
-  → 5.2x faster than real-time
+  Total Generation:  10600.8 ms
+  Total Audio:        55.93 s  (1342320 samples @ 24000 Hz)
+  Overall RT:         5.28x
+  TTFB warm-start:    319.7 ms (1st chunk inference)
+  TTFB cold-start:    590.5 ms (load + prepare + 1st chunk)
+  → 5.3x faster than real-time
 ```
 
 **Hardware:** AMD Ryzen 9 7950X 16-Core Processor, **Backend:** CPU, **Threads:** 16

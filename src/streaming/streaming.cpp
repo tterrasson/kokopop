@@ -112,6 +112,11 @@ std::vector<float> infer_chunk(
     if (!chunk.is_last) {
         trim_trailing_chunk_punctuation(chunk_phonemes);
     }
+    if (std::getenv("KOKOPOP_DUMP_CHUNK_PHONEMES") != nullptr) {
+        std::fprintf(stderr, "[chunk-phonemes idx=%d] >>>%s<<<\n",
+                     chunk_idx + 1, chunk_phonemes.c_str());
+        std::fflush(stderr);
+    }
 
     kokopop_audio raw{};
     if (!synthesize_phonemes(model, chunk_phonemes, plan.voice, plan.speed, raw, error)) {
