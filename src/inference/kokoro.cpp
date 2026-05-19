@@ -262,11 +262,14 @@ bool run_kokoro_frontend_probe(
         k = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
 
         ggml_tensor * scores = ggml_mul_mat(ctx, k, q);
+        // Force fp32 accumulation; see graph_ops::linear comment.
+        ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
         scores = ggml_soft_max_ext(ctx, scores, nullptr, attn_scale, 0.0f);
 
         v = ggml_cont_3d(ctx, ggml_transpose(ctx, v), n_tokens, head_size, n_heads);
 
         ggml_tensor * attended = ggml_mul_mat(ctx, scores, v);
+        ggml_mul_mat_set_prec(attended, GGML_PREC_F32);
         attended = ggml_permute(ctx, attended, 2, 0, 1, 3);
         attended = ggml_cont_2d(ctx, attended, hidden_size, n_tokens);
         attended = linear(ctx, layer.o_w, layer.o_b, attended);
@@ -507,6 +510,7 @@ bool run_kokoro_generation_probe(
         ctx,
         ggml_cont(ctx, ggml_transpose(ctx, duration_mask)),
         ggml_cont(ctx, ggml_transpose(ctx, duration_pred)));
+    ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
     cur = ggml_cont(ctx, ggml_transpose(ctx, cur));
 
     cur = bidirectional_lstm(ctx, model, cur, "kokopop.predictor.shared", total_frames, error);

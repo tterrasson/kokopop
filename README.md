@@ -100,19 +100,17 @@ Requires [uv](https://docs.astral.sh/uv/getting-started/installation/).
 ```bash
 uv run python tools/convert_kokoro_to_gguf.py \
   --output models/kokoro.gguf \
-  --voices af_heart,ff_siwis,zf_xiaoxiao,im_nicola \
-  --tier kokoro-md
+  --voices af_heart,ff_siwis,zf_xiaoxiao,im_nicola
 ```
 
 > **Note:** The Kokoro PyTorch model is automatically downloaded from [Hugging Face](https://huggingface.co/hexgrad/Kokoro-82M) on first run.
 
-Three tiers are available:
-
-| Tier         | Description                                   |
-|--------------|-----------------------------------------------|
-| `kokoro-md`  | Balanced (Q5_K/Q6_K, ~default)                |
-| `kokoro-lg`  | Quality first (Q6_K/Q8_0)                     |
-| `kokoro-f16` | Diagnostic — all quantizable tensors at F16   |
+The converter emits a single F16 model (~157 MiB). Earlier tier-based
+quantization (`kokoro-md` / `kokoro-lg`) was removed: any K-quant on the
+acoustic path produces small per-element errors that compound through AdaIN
++ Snake1D, and any K-quant on ALBERT compounds through 12 transformer
+layers — both eventually destabilise the duration head or saturate the
+vocoder on some inputs. F16 stays bit-stable across all backends.
 
 ### Usage
 
@@ -361,20 +359,18 @@ ffmpeg -f f32le -ar 24000 -ac 1 -i output.raw output.wav
 # (af_heart, ff_siwis, zf_xiaoxiao, im_nicola)
 docker build --format docker -t kokopop-cpu .
 
-# Build the CPU image with custom voices and tier
+# Build the CPU image with custom voices
 docker build --format docker \
   --build-arg VOICES="af_heart,bf_emma,zf_xiaoxiao" \
-  --build-arg TIER="kokoro-lg" \
   -t kokopop-cpu .
 
 # Build the CUDA image
 docker build --format docker --target runtime-cuda -t kokopop-cuda .
 
-# Build the CUDA image with custom voices and tier
+# Build the CUDA image with custom voices
 docker build --format docker \
   --target runtime-cuda \
   --build-arg VOICES="af_heart,bf_emma,zf_xiaoxiao" \
-  --build-arg TIER="kokoro-lg" \
   -t kokopop-cuda .
 ```
 

@@ -92,6 +92,5 @@ All Python work uses **uv**
 # Convert a Kokoro model to GGUF format
 uv run python tools/convert_kokoro_to_gguf.py \
   --output models/kokoro.gguf \
-  --voices af_heart,ff_siwis,zf_xiaoni,im_nicola \
-  --tier kokoro-md
+  --voices af_heart,ff_siwis,zf_xiaoni,im_nicola
 ```

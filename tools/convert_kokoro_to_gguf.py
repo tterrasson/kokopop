@@ -79,7 +79,7 @@ _GGML_BLOCK_SIZES: dict[int, int] = {
     GGML_TYPE_F32: 1,
 }
 
-VALID_TIERS = ("kokoro-md", "kokoro-lg", "kokoro-f16")
+QUANTIZATION_LABEL = "kokoro-f16"
 
 # Patterns indicating a regular Conv1d weight (gets reshape [OC,IC,K] -> [OC,IC*K]).
 # The runtime calls `conv1d()` with these — they MUST all be reshaped to 2D so
@@ -165,102 +165,59 @@ def _downgrade_type(ggml_type: int, innermost_dim: int) -> int:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Tiered quantization (kokoro-md / kokoro-lg)
+# Quantization rules
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _tier_type(tier: str, logical: str, ndim: int) -> int:
-    """Target GGML type for *logical* in the given tier.
+def _target_type(logical: str, ndim: int) -> int:
+    """Target GGML type for *logical*.
 
     Conv1d weights are quantizable here because they're stored 2D in the GGUF
     (innermost dim = IC*K). Block-size downgrade still applies afterwards.
     The runtime decomposes conv1d into im2col + mul_mat to consume the
     quantized kernels directly.
+
+    Previously this function selected between three quantization tiers
+    (kokoro-md / kokoro-lg / kokoro-f16). All three produced equivalent
+    audio quality on Vulkan only when ALBERT stayed at F16 — once that was
+    forced, the three tiers collapsed to ~the same file size (~157 MiB) and
+    the same per-tensor types. The tier concept was removed.
     """
     # 1D / biases / norm params → F32
     if ndim <= 1:
         return GGML_TYPE_F32
 
-    # Snake activation alpha — broadcasted into element-wise math, must
-    # stay full precision (Snake uses sin²(xα)/α which is α-sensitive).
+    # Snake activation alpha — broadcasted into element-wise math, must stay
+    # full precision (Snake uses sin²(xα)/α which is α-sensitive).
     if ".alpha" in logical and ".weight" not in logical:
         return GGML_TYPE_F32
 
-    # Voice embedding pack: F16 (used as a row-lookup, no matmul)
-    if logical.startswith("kokopop.voice."):
-        return GGML_TYPE_F16
-
-    # Embedding lookup tables (text_encoder.embedding, ALBERT word/pos embs) → F32
+    # Embedding lookup tables (text_encoder.embedding, ALBERT word/pos embs)
+    # → F32. They're indexed by token id, never matmul'd.
     if logical.endswith(".weight") and (
         ".embeddings." in logical or ".embedding.weight" in logical
     ):
         return GGML_TYPE_F32
 
-    # Harmonic source merge weights and depthwise pool kernels: small, keep F16.
-    if "m_source" in logical or ".pool.weight" in logical:
-        return GGML_TYPE_F16
-
-    # ConvTranspose1d (vocoder upsampling) — runtime keeps it F16.
-    if ".ups." in logical:
-        return GGML_TYPE_F16
-
-    # Acoustic path (predictor + decoder + vocoder generator + text_encoder +
-    # bert_encoder) must stay at F16. K-quant / Q8_0 weights produce small
-    # per-element errors that compound through the AdaIN + Snake1D stack inside
-    # the generator and the AdaIN-LeakyReLU stack inside the predictor F0/N
-    # branches and decoder encode/decode blocks. For some (voice row, phoneme)
-    # combinations the cumulative error tips the output into near-silence or
-    # full saturation, even though Python at FP32 stays in range. F16 is
-    # empirically the coarsest representation that stays stable.
-    # Only the (large) ALBERT BERT, which only feeds duration encoding via a
-    # linear projection, can be safely quantized.
-    if (
-        logical.startswith("kokopop.predictor.")
-        or logical.startswith("kokopop.decoder.")
-        or logical.startswith("kokopop.text_encoder.")
-        or logical.startswith("kokopop.bert_encoder.")
-    ):
-        return GGML_TYPE_F16
-
-    # Diagnostic tier: everything quantizable goes to F16. No K-quant lossy fits.
-    if tier == "kokoro-f16":
-        return GGML_TYPE_F16
-
-    # Per-tier mapping of every other 2D+ tensor.
-    if tier == "kokoro-md":
-        # Balanced: Q5_K majority, Q6_K for FFN out / AdaIn FC, Q8_0 for conv_post.
-        if logical.startswith("kokopop.albert.") or logical.startswith("kokopop.bert_encoder."):
-            return GGML_TYPE_Q6_K if "ffn_output" in logical else GGML_TYPE_Q5_K
-        if (".fc.gamma.weight" in logical or ".fc.beta.weight" in logical) and (
-            logical.startswith("kokopop.predictor.F0.")
-            or logical.startswith("kokopop.predictor.N.")
-        ):
-            return GGML_TYPE_Q6_K
-        if "conv_post" in logical:
-            return GGML_TYPE_Q8_0
-        return GGML_TYPE_Q5_K
-
-    # tier == "kokoro-lg"
-    # Quality first: Q6_K for everything quantizable, Q8_0 for vocoder.
-    if "conv_post" in logical:
-        return GGML_TYPE_Q8_0
-    if (
-        ".generator." in logical
-        or ".F0_conv." in logical
-        or ".N_conv." in logical
-    ):
-        return GGML_TYPE_Q8_0
-    return GGML_TYPE_Q6_K
+    # Everything else: F16. K-quants (Q5_K/Q6_K/Q8_0) introduce per-element
+    # dequant noise that compounds through AdaIN + Snake1D in the generator,
+    # AdaIN-LeakyReLU in predictor F0/N and decoder, and through 12 ALBERT
+    # transformer layers — for some (voice row, phoneme) combinations the
+    # cumulative error tips the duration head's `lrint` rounding at k+0.5
+    # boundaries (audibly deformed voice on Vulkan/MoltenVK) or saturates the
+    # vocoder. F16 reads match CPU bit-for-bit and stay stable across backends.
+    return GGML_TYPE_F16
 
 
 def resolve_tensor_type(writer, name: str, data: np.ndarray) -> int:
-    """Resolve final GGML type for a tensor in the writer's tier.
+    """Resolve final GGML type for a tensor.
 
     The tensor's *data* is already in the on-disk layout (conv1d kernels
     have been reshaped to 2D before this is called), so `data.shape[-1]`
     is the correct innermost dim for block-size alignment.
     """
-    target = _tier_type(writer.tier, name, data.ndim)
+    del writer  # No per-writer state: same rules for every conversion.
+    target = _target_type(name, data.ndim)
     if data.ndim > 1:
         target = _downgrade_type(target, data.shape[-1])
     return target
@@ -430,7 +387,6 @@ class GGUFWriter:
         self.logical_names: list[str] = []
         self.physical_names: list[str] = []
         self.used_tensor_names: set[str] = set()
-        self.tier: str = "kokoro-md"
 
     # -- metadata helpers ---------------------------------------------------
 
@@ -726,7 +682,6 @@ def convert(args: argparse.Namespace) -> None:
     voices = [v.strip() for v in args.voices.split(",") if v.strip()]
 
     writer = GGUFWriter(Path(args.output))
-    writer.tier = args.tier
 
     # Metadata
     writer.add_u32("kokopop.kokoro.version", KOKOPOP_GGUF_VERSION)
@@ -735,7 +690,7 @@ def convert(args: argparse.Namespace) -> None:
     writer.add_string("kokopop.arch", "kokoro-82m")
     writer.add_string("kokopop.tensor_layout", "runtime-v3")
     writer.add_string("kokopop.source_repo", args.local_dir or args.repo_id)
-    writer.add_string("kokopop.quantization", args.tier)
+    writer.add_string("kokopop.quantization", QUANTIZATION_LABEL)
     writer.add_string_array("tokenizer.ggml.tokens", build_vocab(config))
     writer.add_string_array("kokopop.voices", voices)
 
@@ -760,7 +715,7 @@ def convert(args: argparse.Namespace) -> None:
         writer.add_tensor(f"kokopop.voice.{voice}", pack)
 
     writer.write()
-    print(f"wrote {args.output} (tier={args.tier})")
+    print(f"wrote {args.output}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -774,10 +729,6 @@ def parse_args() -> argparse.Namespace:
         help="load model files from this local directory instead of HuggingFace",
     )
     parser.add_argument("--voices", default=DEFAULT_VOICES)
-    parser.add_argument(
-        "--tier", default="kokoro-md", choices=VALID_TIERS,
-        help="Quantization tier: md=balanced, lg=quality",
-    )
     return parser.parse_args()
 
 

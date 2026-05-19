@@ -572,6 +572,8 @@ static ggml_tensor * conv1d_im2col_mulmat(
     im2col_2d = ggml_cont(ctx, im2col_2d);
 
     ggml_tensor * out = ggml_mul_mat(ctx, weight, im2col_2d);
+    // Force fp32 accumulation; see linear() above for rationale.
+    ggml_mul_mat_set_prec(out, GGML_PREC_F32);
 
     if (channel_first) {
         return ggml_reshape_3d(ctx, out, oc, ol, n);
@@ -612,7 +614,14 @@ ggml_tensor * linear(
         x = ggml_cast(ctx, x, GGML_TYPE_F32);
     }
 
-    return ggml_add(ctx, ggml_mul_mat(ctx, weight, x), bias);
+    ggml_tensor * mm = ggml_mul_mat(ctx, weight, x);
+    // Force fp32 accumulation. ggml-vulkan defaults to f16 accumulator when
+    // device->fp16 is true (the case on MoltenVK / Apple Silicon and most
+    // discrete GPUs), which combined with K-quant dequant noise produces
+    // ~0.1+ drift on 768-dim matmuls — enough to flip duration rounding at
+    // k+0.5 boundaries and cause "deformed voice" on Vulkan.
+    ggml_mul_mat_set_prec(mm, GGML_PREC_F32);
+    return ggml_add(ctx, mm, bias);
 }
 
 ggml_tensor * add_channel_bias(ggml_context * ctx, ggml_tensor * x, ggml_tensor * bias) {
@@ -1337,6 +1346,8 @@ ggml_tensor * lstm_direction(
     // sequences ending on an orphan stressed syllable). The backend mul_mat
     // path with quantized weights is numerically stable across all backends.
     ggml_tensor * mul_result = ggml_mul_mat(ctx, w.w_ih_packed, input);
+    // Force fp32 accumulation; see linear() above for rationale.
+    ggml_mul_mat_set_prec(mul_result, GGML_PREC_F32);
     ggml_tensor * pre_input_gates_packed = ggml_add(ctx, mul_result, w.b_ih_packed);
 
     const std::string whh_key = prefix + ".weight_hh_l0" + (reverse ? "_reverse" : "");
@@ -1486,10 +1497,12 @@ ggml_tensor * text_encoder(
         return nullptr;
     }
 
-    return ggml_mul_mat(
+    ggml_tensor * out = ggml_mul_mat(
         ctx,
         ggml_cont(ctx, ggml_transpose(ctx, cur)),
         ggml_cont(ctx, ggml_transpose(ctx, duration_mask)));
+    ggml_mul_mat_set_prec(out, GGML_PREC_F32);
+    return out;
 }
 
 } // namespace kokopop

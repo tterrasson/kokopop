@@ -103,7 +103,7 @@ def levenshtein(a: str, b: str) -> int:
 # TTS generation
 # ─────────────────────────────────────────────────────────────────────────────
 
-DEFAULT_MODEL = str(Path(__file__).resolve().parent.parent / "models" / "kokoro-md.gguf")
+DEFAULT_MODEL = str(Path(__file__).resolve().parent.parent / "models" / "kokoro.gguf")
 DEFAULT_VOICE = "zf_xiaobei"
 
 

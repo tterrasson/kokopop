@@ -319,7 +319,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("text")
     parser.add_argument("--voice", default="zf_xiaoni")
-    parser.add_argument("--model", default="models/kokoro-md.gguf")
+    parser.add_argument("--model", default="models/kokoro.gguf")
     parser.add_argument(
         "--mode",
         choices=("text", "phonemes", "both"),
