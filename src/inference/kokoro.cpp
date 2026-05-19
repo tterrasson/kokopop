@@ -522,6 +522,9 @@ bool run_kokoro_generation_probe(
             ggml_free(ctx);
             return false;
         }
+        // Same anchor as for the decoder AdaIN chain — prevents scheduler
+        // aliasing of intermediate buffers on Vulkan/MoltenVK.
+        ggml_set_output(f0_curve);
     }
     f0_curve = ggml_cont(ctx, ggml_transpose(ctx, f0_curve));
     f0_curve = add_channel_bias(ctx, conv1d(ctx, f0_proj_w, ggml_cont(ctx, ggml_transpose(ctx, f0_curve)), 1, 0, 1, 1), f0_proj_b);
@@ -534,6 +537,7 @@ bool run_kokoro_generation_probe(
             ggml_free(ctx);
             return false;
         }
+        ggml_set_output(n_curve);
     }
     n_curve = ggml_cont(ctx, ggml_transpose(ctx, n_curve));
     n_curve = add_channel_bias(ctx, conv1d(ctx, n_proj_w, ggml_cont(ctx, ggml_transpose(ctx, n_curve)), 1, 0, 1, 1), n_proj_b);
@@ -578,6 +582,12 @@ bool run_kokoro_generation_probe(
         ggml_free(ctx);
         return false;
     }
+    // Anchor each AdaIN-block output as a graph output. Without this, the
+    // Vulkan/MoltenVK scheduler aliases intermediate block-output buffers in a
+    // way that produces audibly deformed audio on longer inputs (metallic /
+    // phased — bug 3 in VULKAN.md). The set_output flag does not force a
+    // materialised copy, only prevents reuse of the buffer; cost is negligible.
+    ggml_set_output(decoder_cur);
 
     ggml_tensor * asr_res = add_channel_bias(ctx, conv1d(ctx, asr_res_w, ggml_cont(ctx, ggml_transpose(ctx, asr)), 1, 0, 1, 1), asr_res_b);
 
@@ -588,6 +598,7 @@ bool run_kokoro_generation_probe(
             ggml_free(ctx);
             return false;
         }
+        ggml_set_output(decoder_cur);
     }
 
     // Make all host-read outputs explicit and materialized.

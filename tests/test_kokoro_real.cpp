@@ -208,6 +208,83 @@ TEST_CASE("real_kokoro_cpu_metal_parity_when_available") {
     CHECK_NEAR(stats(metal_gen.audio).rms, stats(cpu_gen.audio).rms, 0.05);
 }
 
+// Regression: on long inputs, the Vulkan/MoltenVK scheduler
+// aliased the buffers of intermediate AdaIN-block outputs in the predictor
+// (F0/N) and decoder sections of the generation graph, producing audibly
+// deformed audio (metallic / phased). The fix is `ggml_set_output` on those
+// intermediate outputs so the allocator cannot reuse their buffers. Without
+// the fix the decoder tensor RMS / peak diverges dramatically from CPU; with
+// the fix the gap is dominated by harmless upstream fp drift.
+//
+// Two phrases are checked because they exercise different aliasing paths:
+// the first triggered only the decoder-chain bug, the second additionally
+// triggered the F0/N predictor-chain bug.
+static void check_vulkan_long_input(
+    kokopop::Model & cpu_model,
+    kokopop::Model & vk_model,
+    const std::string & phonemes,
+    const std::string & voice) {
+
+    std::string error;
+    std::vector<uint32_t> ids;
+    CHECK(cpu_model.tokenize_phonemes(phonemes, ids, error));
+    CHECK(ids.size() > 50);  // bug 3 only triggers on long inputs
+
+    kokopop::KokoroFrontendProbe cpu_front, vk_front;
+    CHECK(kokopop::run_kokoro_frontend_probe(cpu_model, ids, voice, cpu_front, error));
+    CHECK(kokopop::run_kokoro_frontend_probe(vk_model,  ids, voice, vk_front,  error));
+
+    kokopop::KokoroGenerationProbe cpu_gen, vk_gen;
+    CHECK(kokopop::run_kokoro_generation_probe(cpu_model, ids, voice, 1.0f, cpu_front, cpu_gen, error));
+    CHECK(kokopop::run_kokoro_generation_probe(vk_model,  ids, voice, 1.0f, vk_front,  vk_gen,  error));
+
+    // Decoder tensor RMS / peak must match CPU closely. Without the fix
+    // Vulkan diverges by tens of percent.
+    const Stats cpu_dec = stats(cpu_gen.decoder);
+    const Stats vk_dec  = stats(vk_gen.decoder);
+    CHECK(cpu_dec.rms > 0.5);
+    CHECK_NEAR(vk_dec.rms,  cpu_dec.rms,  0.10);
+    CHECK_NEAR(vk_dec.peak, cpu_dec.peak, 5.0);
+
+    // Audio-level sanity: same overall energy.
+    CHECK_NEAR(stats(vk_gen.audio).rms, stats(cpu_gen.audio).rms, 0.05);
+}
+
+TEST_CASE("real_kokoro_cpu_vulkan_decoder_parity_long_input") {
+    auto * cpu_model = shared_real_model();
+    if (!cpu_model) { MESSAGE("skipping: models/kokoro-md.gguf not found"); return; }
+
+    std::string error;
+    kokopop_model_options vk_options{};
+    vk_options.n_threads = 1;
+    vk_options.backend = KOKOPOP_BACKEND_VULKAN;
+    std::unique_ptr<kokopop::Model> vk_model;
+    if (!kokopop::load_model_from_gguf(real_model_path(), &vk_options, vk_model, error)) {
+        MESSAGE("skipping: Vulkan backend unavailable: " << error);
+        return;
+    }
+
+    // Phrase 1 — triggered the decoder-chain aliasing (without the F0/N fix
+    // it would still pass this case).
+    SUBCASE("decoder chain") {
+        const std::string phonemes =
+            "ˈA dˈɪɹ ɪmˈɜɹʤd fɹʌm ðə ʃˈædOz, pˈɔzɪŋ tə ɡlˈæns. ɪʦ ˈæmbəɹɹ ˈIz "
+            "mˈɛt mˈIn fəɹɹə hˈɑɹtbit, ðˈɛn ɪt flˈɛd. fˈɜɹðəɹɹ əhˈɛd, ən "
+            "əbˈændənd stˈOn kˈɑTɪʤ stˈʊd. vˈInz klˈAmd ðə ɹˈuf";
+        check_vulkan_long_input(*cpu_model, *vk_model, phonemes, "af_heart");
+    }
+
+    // Phrase 2 — additionally triggered the F0/N predictor-chain aliasing.
+    SUBCASE("F0/N predictor chain") {
+        const std::string phonemes =
+            "ðə wˈɪnd ɹˈʌsᵊld ðə ˈOld kˈɜɹtənz, ˈɛkOɪŋ sˈɔft lˈʌləbˌIz. "
+            "sˈʌnlIt fˈɪltəɹd θɹu kɹˈækt wˈɪndOz, kˈæstɪŋ pˈætəɹnz. "
+            "I fˈɛlt ə pɹəfˈWnd pˈis, æz ɪf tˈIm ɪʦˈɛlf sˈɔfənd. "
+            "ðə pˈæθ klˈImd stˈipəɹ, ɹᵻvˈilɪŋ ˈA vˈæli bᵻlˈO";
+        check_vulkan_long_input(*cpu_model, *vk_model, phonemes, "af_heart");
+    }
+}
+
 TEST_CASE("real_model_token_counts_consistency") {
     auto * model = shared_real_model();
     if (!model) { MESSAGE("skipping: models/kokoro-md.gguf not found"); return; }
