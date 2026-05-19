@@ -564,11 +564,19 @@ bool run_kokoro_generation_probe(
     ggml_set_name(n_curve, "kokopop_noise_probe");
     ggml_set_name(asr, "kokopop_asr_probe");
     ggml_set_name(decoder_cur, "kokopop_decoder_probe");
+    ggml_set_name(decoder_style, "kokopop_decoder_style_probe");
 
     ggml_set_output(f0_curve);
     ggml_set_output(n_curve);
     ggml_set_output(asr);
     ggml_set_output(decoder_cur);
+    // decoder_style is read back via tensor_get after compute (feeds the CPU
+    // vocoder). Without ggml_set_output, the scheduler allocator may alias its
+    // buffer once the graph stops referencing it, and the read-back returns
+    // overwritten bytes. Symptom on Vulkan: style values ~20× too large,
+    // saturating the vocoder output to ±1.0 (white noise). CPU happened to
+    // dodge the aliasing.
+    ggml_set_output(decoder_style);
 
     const bool gen_profile = std::getenv("KOKOPOP_GEN_PROFILE") != nullptr;
     int64_t t_build = 0;
