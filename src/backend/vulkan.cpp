@@ -1,8 +1,10 @@
 #include "backend.h"
-#include "cuda.h"
+#include "vulkan.h"
 
 #include <algorithm>
 #include <cstdint>
+#include <exception>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <utility>
@@ -11,18 +13,20 @@
 #include <ggml.h>
 #include <ggml-backend.h>
 #include <ggml-cpu.h>
-#include <ggml-cuda.h>
+#include <ggml-vulkan.h>
 
 namespace kokopop {
 namespace {
 
-class CudaBackend final : public Backend {
+class VulkanBackend final : public Backend {
     ggml_backend_t backend_ = nullptr;
     ggml_backend_t cpu_backend_ = nullptr;
     ggml_backend_sched_t sched_ = nullptr;
     size_t sched_capacity_ = 0;
     uint64_t sched_signature_ = 0;
     int device_id_ = 0;
+    bool env_log_sched_ = false;
+    bool env_op_trace_ = false;
     std::vector<PendingInit> pending_inits_;
 
     bool ensure_scheduler(ggml_cgraph * graph) {
@@ -46,8 +50,7 @@ class CudaBackend final : public Backend {
             return true;
         }
 
-        // ggml's scheduler expects the CPU backend last: it is used for ops not
-        // supported by CUDA and for cross-backend fallback/copies.
+        // CPU backend must be last. It handles unsupported ops and fallback copies.
         ggml_backend_t backends[] = { backend_, cpu_backend_ };
 
         sched_ = ggml_backend_sched_new(
@@ -71,29 +74,126 @@ class CudaBackend final : public Backend {
                 (tensor->view_src != nullptr && tensor->view_src->buffer != nullptr));
     }
 
+    void log_sched_sizes(const char * stage) const {
+        if (sched_ == nullptr || !env_log_sched_) {
+            return;
+        }
+
+        const int n_splits = ggml_backend_sched_get_n_splits(sched_);
+        const size_t vk_bytes = ggml_backend_sched_get_buffer_size(sched_, backend_);
+        const size_t cpu_bytes = ggml_backend_sched_get_buffer_size(sched_, cpu_backend_);
+
+        std::fprintf(
+            stderr,
+            "[vulkan-sched %s] splits=%d vulkan_buf=%.1f MiB cpu_buf=%.1f MiB\n",
+            stage,
+            n_splits,
+            vk_bytes / 1048576.0,
+            cpu_bytes / 1048576.0);
+    }
+
+    static bool eval_trace_cb(ggml_tensor * tensor, bool ask, void * user_data) {
+        if (ask) {
+            return true;
+        }
+
+        auto * sched = static_cast<ggml_backend_sched_t>(user_data);
+
+        const char * op_name = tensor == nullptr
+            ? "?"
+            : (tensor->op == GGML_OP_UNARY
+                ? ggml_unary_op_name(ggml_get_unary_op(tensor))
+                : ggml_op_name(tensor->op));
+
+        ggml_backend_t backend = (sched != nullptr && tensor != nullptr)
+            ? ggml_backend_sched_get_tensor_backend(sched, tensor)
+            : nullptr;
+
+        const char * backend_name = backend != nullptr ? ggml_backend_name(backend) : "?";
+
+        std::fprintf(
+            stderr,
+            "[op %-6s] %-20s %-32s shape=[%lld,%lld,%lld,%lld]\n",
+            backend_name,
+            op_name,
+            tensor != nullptr && tensor->name[0] ? tensor->name : "",
+            static_cast<long long>(tensor != nullptr ? tensor->ne[0] : 0),
+            static_cast<long long>(tensor != nullptr ? tensor->ne[1] : 0),
+            static_cast<long long>(tensor != nullptr ? tensor->ne[2] : 0),
+            static_cast<long long>(tensor != nullptr ? tensor->ne[3] : 0));
+
+        std::fflush(stderr);
+        return true;
+    }
+
 public:
-    explicit CudaBackend(int32_t n_threads) {
-        const char * env = std::getenv("KOKOPOP_CUDA_DEVICE");
-        const int requested = env ? std::atoi(env) : 0;
-        const int count = ggml_backend_cuda_get_device_count();
-        if (count <= 0) {
-            return;
-        }
+    explicit VulkanBackend(int32_t n_threads) {
+        try {
+            env_log_sched_ = std::getenv("KOKOPOP_VULKAN_LOG_SCHED") != nullptr;
+            env_op_trace_ = std::getenv("KOKOPOP_VULKAN_OP_TRACE") != nullptr;
 
-        device_id_ = (requested >= 0 && requested < count) ? requested : 0;
+            const char * env = std::getenv("KOKOPOP_VULKAN_DEVICE");
+            const int requested = env ? std::atoi(env) : 0;
+            const int count = ggml_backend_vk_get_device_count();
+            if (count <= 0) {
+                return;
+            }
 
-        backend_ = ggml_backend_cuda_init(device_id_);
-        if (backend_ == nullptr) {
-            return;
-        }
+            device_id_ = (requested >= 0 && requested < count) ? requested : 0;
 
-        cpu_backend_ = ggml_backend_cpu_init();
-        if (cpu_backend_ != nullptr) {
-            ggml_backend_cpu_set_n_threads(cpu_backend_, std::max<int32_t>(1, n_threads));
+            if (env_log_sched_) {
+                char desc[256] = {};
+                ggml_backend_vk_get_device_description(device_id_, desc, sizeof(desc));
+                size_t free_mem = 0;
+                size_t total_mem = 0;
+                ggml_backend_vk_get_device_memory(device_id_, &free_mem, &total_mem);
+                std::fprintf(
+                    stderr,
+                    "[vulkan] device=%d/%d %s free=%.1f MiB total=%.1f MiB\n",
+                    device_id_,
+                    count,
+                    desc[0] ? desc : "?",
+                    free_mem / 1048576.0,
+                    total_mem / 1048576.0);
+            }
+
+            backend_ = ggml_backend_vk_init(static_cast<size_t>(device_id_));
+            if (backend_ == nullptr) {
+                return;
+            }
+
+            cpu_backend_ = ggml_backend_cpu_init();
+            if (cpu_backend_ != nullptr) {
+                ggml_backend_cpu_set_n_threads(cpu_backend_, std::max<int32_t>(1, n_threads));
+            }
+        } catch (const std::exception & e) {
+            if (env_log_sched_) {
+                std::fprintf(stderr, "[vulkan] init failed: %s\n", e.what());
+            }
+            if (backend_ != nullptr) {
+                ggml_backend_free(backend_);
+                backend_ = nullptr;
+            }
+            if (cpu_backend_ != nullptr) {
+                ggml_backend_free(cpu_backend_);
+                cpu_backend_ = nullptr;
+            }
+        } catch (...) {
+            if (env_log_sched_) {
+                std::fprintf(stderr, "[vulkan] init failed: unknown exception\n");
+            }
+            if (backend_ != nullptr) {
+                ggml_backend_free(backend_);
+                backend_ = nullptr;
+            }
+            if (cpu_backend_ != nullptr) {
+                ggml_backend_free(cpu_backend_);
+                cpu_backend_ = nullptr;
+            }
         }
     }
 
-    ~CudaBackend() override {
+    ~VulkanBackend() override {
         if (sched_ != nullptr) {
             ggml_backend_sched_free(sched_);
             sched_ = nullptr;
@@ -127,7 +227,15 @@ public:
             return false;
         }
 
-        return ggml_backend_sched_alloc_graph(sched_, graph);
+        if (env_op_trace_) {
+            ggml_backend_sched_set_eval_callback(sched_, eval_trace_cb, sched_);
+        }
+
+        const bool ok = ggml_backend_sched_alloc_graph(sched_, graph);
+        if (ok) {
+            log_sched_sizes("alloc");
+        }
+        return ok;
     }
 
     void clear_pending_inits() override {
@@ -208,6 +316,7 @@ public:
         GGML_ASSERT(sched_ != nullptr && "compute called before sched_alloc_graph");
         GGML_ASSERT(graph != nullptr);
 
+        log_sched_sizes("compute-begin");
         return ggml_backend_sched_graph_compute(sched_, graph);
     }
 
@@ -239,18 +348,15 @@ public:
 
     ggml_backend_buffer_type_t weight_buffer_type() const override {
         GGML_ASSERT(backend_ != nullptr);
-
-        // Weights live in CUDA VRAM. Fused LSTM recurrence uses separate
-        // host-side w_hh/b_hh caches, so model weights can remain device-side.
-        return ggml_backend_cuda_buffer_type(device_id_);
+        return ggml_backend_vk_buffer_type(static_cast<size_t>(device_id_));
     }
 
     const char * label() const override {
-        return "CUDA (GPU)";
+        return "Vulkan (GPU)";
     }
 
     int32_t type() const override {
-        return KOKOPOP_BACKEND_CUDA;
+        return KOKOPOP_BACKEND_VULKAN;
     }
 
     size_t generation_context_bytes(int64_t total_frames, int64_t n_tokens) const override {
@@ -285,8 +391,8 @@ public:
 
 } // anonymous namespace
 
-std::unique_ptr<Backend> create_cuda_backend(int32_t n_threads) {
-    auto backend = std::make_unique<CudaBackend>(n_threads);
+std::unique_ptr<Backend> create_vulkan_backend(int32_t n_threads) {
+    auto backend = std::make_unique<VulkanBackend>(n_threads);
     if (!backend->valid()) {
         return nullptr;
     }

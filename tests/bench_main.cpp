@@ -60,9 +60,9 @@ std::string find_model(const char * hint) {
 
 void usage(const char * argv0) {
     std::fprintf(stderr,
-        "usage: %s [--model PATH] [--backend cpu|metal] [--phonemes IPA] [--repeat N] "
+        "usage: %s [--model PATH] [--backend cpu|metal|cuda|vulkan] [--phonemes IPA] [--repeat N] "
         "[--voice NAME] [--threads N] [--iters N]\n"
-        "  --backend cpu|metal  force inference backend (default: auto)\n"
+        "  --backend cpu|metal|cuda|vulkan  force inference backend (default: auto)\n"
         "  --repeat N  repeat the phoneme string N times (multiplies token count)\n",
         argv0);
 }
@@ -128,8 +128,12 @@ int main(int argc, char ** argv) {
                 backend = KOKOPOP_BACKEND_CPU;
             } else if (std::strcmp(b, "metal") == 0) {
                 backend = KOKOPOP_BACKEND_METAL;
+            } else if (std::strcmp(b, "cuda") == 0) {
+                backend = KOKOPOP_BACKEND_CUDA;
+            } else if (std::strcmp(b, "vulkan") == 0) {
+                backend = KOKOPOP_BACKEND_VULKAN;
             } else {
-                std::fprintf(stderr, "[BENCH] unknown backend: %s (expected cpu|metal)\n", b);
+                std::fprintf(stderr, "[BENCH] unknown backend: %s (expected cpu|metal|cuda|vulkan)\n", b);
                 usage(argv[0]);
                 return 2;
             }
@@ -167,7 +171,9 @@ int main(int argc, char ** argv) {
     std::printf("[BENCH] threads  : %d (hw=%d)\n", threads, hw);
     std::printf("[BENCH] iters    : %d\n", iters);
     std::printf("[BENCH] backend  : %s\n\n", backend == KOKOPOP_BACKEND_CPU ? "cpu"
-                                         : backend == KOKOPOP_BACKEND_METAL ? "metal" : "auto");
+                                         : backend == KOKOPOP_BACKEND_METAL ? "metal"
+                                         : backend == KOKOPOP_BACKEND_CUDA ? "cuda"
+                                         : backend == KOKOPOP_BACKEND_VULKAN ? "vulkan" : "auto");
 
     ggml_log_set(null_log, nullptr);
 

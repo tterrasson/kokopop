@@ -44,7 +44,7 @@ void usage(const char * argv0) {
         "  --text STR      Text to synthesize (mutually exclusive with --file)\n"
         "  --file PATH     Read text from file (mutually exclusive with --text)\n"
         "  --threads N     Number of threads (default: min(4, hw_concurrency))\n"
-        "  --backend       cpu, metal, or cuda (default: auto)\n"
+        "  --backend       cpu, metal, cuda, or vulkan (default: auto)\n"
         "  --speed FLOAT   Synthesis speed (default: 1.0)\n"
         "  --runs N        Number of benchmark runs (default: 3)\n"
         "\n",
@@ -115,6 +115,7 @@ int main(int argc, char ** argv) {
                 if      (std::strcmp(v, "cpu")   == 0) backend = KOKOPOP_BACKEND_CPU;
                 else if (std::strcmp(v, "metal") == 0) backend = KOKOPOP_BACKEND_METAL;
                 else if (std::strcmp(v, "cuda")  == 0) backend = KOKOPOP_BACKEND_CUDA;
+                else if (std::strcmp(v, "vulkan") == 0) backend = KOKOPOP_BACKEND_VULKAN;
                 else { std::fprintf(stderr, "error: invalid backend '%s'\n", v); return 2; }
             } else if (std::strcmp(argv[i], "--speed") == 0) {
                 speed = std::stof(arg_value(i, argc, argv));

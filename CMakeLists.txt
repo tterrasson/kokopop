@@ -9,6 +9,11 @@ option(KOKOPOP_BUILD_TESTS "Build kokopop unit tests" ON)
 option(KOKOPOP_BUILD_TOOLS "Build kokopop command line tools" ON)
 option(KOKOPOP_ENABLE_METAL "Enable Metal (GPU) backend" OFF)
 option(KOKOPOP_ENABLE_CUDA "Enable CUDA (GPU) backend" OFF)
+option(KOKOPOP_ENABLE_VULKAN "Enable Vulkan (GPU) backend" OFF)
+option(KOKOPOP_VULKAN_VALIDATE "Enable Vulkan validation layers in ggml" OFF)
+option(KOKOPOP_VULKAN_DEBUG "Enable Vulkan debug output in ggml" OFF)
+option(KOKOPOP_VULKAN_MEMORY_DEBUG "Enable Vulkan memory debug output in ggml" OFF)
+option(KOKOPOP_VULKAN_SHADER_DEBUG_INFO "Enable Vulkan shader debug info in ggml" OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -44,7 +49,34 @@ FetchContent_Declare(
 if(KOKOPOP_ENABLE_CUDA)
   set(GGML_CUDA ON CACHE BOOL "" FORCE)
 endif()
+if(KOKOPOP_ENABLE_VULKAN)
+  find_path(KOKOPOP_SPIRV_HEADERS_INCLUDE_DIR
+    NAMES
+      spirv/unified1/spirv.hpp
+      spirv-headers/spirv.hpp
+      spirv.hpp
+    PATHS
+      ENV VULKAN_SDK
+    PATH_SUFFIXES
+      include
+      Include
+  )
+  if(NOT KOKOPOP_SPIRV_HEADERS_INCLUDE_DIR)
+    message(FATAL_ERROR
+      "kokopop: Vulkan backend requires SPIR-V headers "
+      "(spirv/unified1/spirv.hpp). Install spirv-headers, e.g. "
+      "`brew install spirv-headers` on macOS.")
+  endif()
+  set(GGML_VULKAN ON CACHE BOOL "" FORCE)
+  set(GGML_VULKAN_VALIDATE ${KOKOPOP_VULKAN_VALIDATE} CACHE BOOL "" FORCE)
+  set(GGML_VULKAN_DEBUG ${KOKOPOP_VULKAN_DEBUG} CACHE BOOL "" FORCE)
+  set(GGML_VULKAN_MEMORY_DEBUG ${KOKOPOP_VULKAN_MEMORY_DEBUG} CACHE BOOL "" FORCE)
+  set(GGML_VULKAN_SHADER_DEBUG_INFO ${KOKOPOP_VULKAN_SHADER_DEBUG_INFO} CACHE BOOL "" FORCE)
+endif()
 FetchContent_MakeAvailable(ggml)
+if(KOKOPOP_ENABLE_VULKAN AND TARGET ggml-vulkan)
+  target_include_directories(ggml-vulkan PRIVATE ${KOKOPOP_SPIRV_HEADERS_INCLUDE_DIR})
+endif()
 
 FetchContent_Declare(
   doctest
@@ -135,6 +167,9 @@ if(KOKOPOP_ENABLE_METAL)
 endif()
 if(KOKOPOP_ENABLE_CUDA)
   list(APPEND _kokopop_backend_sources src/backend/cuda.cpp)
+endif()
+if(KOKOPOP_ENABLE_VULKAN)
+  list(APPEND _kokopop_backend_sources src/backend/vulkan.cpp)
 endif()
 
 # Model module (GGUF loading)
@@ -267,6 +302,13 @@ if(KOKOPOP_ENABLE_CUDA)
   message(STATUS "kokopop: CUDA backend enabled")
 else()
   message(STATUS "kokopop: CUDA backend disabled")
+endif()
+
+if(KOKOPOP_ENABLE_VULKAN)
+  target_compile_definitions(kokopop PUBLIC KOKOPOP_HAS_VULKAN)
+  message(STATUS "kokopop: Vulkan backend enabled")
+else()
+  message(STATUS "kokopop: Vulkan backend disabled")
 endif()
 
 if(MSVC)

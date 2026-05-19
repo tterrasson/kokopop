@@ -8,6 +8,7 @@ A standalone C++ library and toolkit for running [Kokoro](https://github.com/hex
 - **CPU inference** with configurable thread count
 - **Metal GPU backend** (macOS) for accelerated inference
 - **CUDA backend** (Linux/Windows) for accelerated inference on NVIDIA GPUs
+- **Vulkan backend** (Linux/Windows/macOS via MoltenVK) for portable GPU acceleration
 - **Streaming API** for real-time audio generation
 - **Chunked synthesis** for long-form text processing
 - **WAV output** and optional direct playback (Core Audio on macOS)
@@ -56,6 +57,23 @@ cmake --build build
 
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DKOKOPOP_ENABLE_CUDA=ON
+cmake --build build
+```
+
+### Build with Vulkan support
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DKOKOPOP_ENABLE_VULKAN=ON
+cmake --build build
+```
+
+On macOS, install the Vulkan SDK plus SPIR-V headers so CMake can find Vulkan, `glslc`, MoltenVK, and `spirv/unified1/spirv.hpp`:
+
+```bash
+brew install vulkan-sdk vulkan-headers spirv-headers
+cmake -B build -DCMAKE_BUILD_TYPE=Debug \
+  -DKOKOPOP_ENABLE_VULKAN=ON \
+  -DKOKOPOP_VULKAN_VALIDATE=ON
 cmake --build build
 ```
 
@@ -436,7 +454,7 @@ kokopop_model_free(model);
 include/     — Public headers (kokopop.h)
 src/         — Source code
   core/      — Error handling, string utilities, WAV I/O
-  backend/   — CPU, Metal, and CUDA backend implementations
+  backend/   — CPU, Metal, CUDA, and Vulkan backend implementations
   inference/ — Kokoro graph operations and audio utilities
   synthesis/ — Phonemizer, text chunking, G2P (zh_g2p, pinyin), and main synthesis pipeline
   audio/     — Audio post-processing
@@ -492,6 +510,11 @@ Kokopop supports the following languages:
 | `KOKOPOP_BUILD_TOOLS` | `ON`    | Build CLI tools                  |
 | `KOKOPOP_ENABLE_METAL`| `OFF`   | Enable Metal GPU backend (macOS) |
 | `KOKOPOP_ENABLE_CUDA` | `OFF`   | Enable CUDA backend (NVIDIA GPUs) |
+| `KOKOPOP_ENABLE_VULKAN` | `OFF` | Enable Vulkan GPU backend |
+| `KOKOPOP_VULKAN_VALIDATE` | `OFF` | Enable Vulkan validation layers in ggml |
+| `KOKOPOP_VULKAN_DEBUG` | `OFF` | Enable Vulkan debug output in ggml |
+| `KOKOPOP_VULKAN_MEMORY_DEBUG` | `OFF` | Enable Vulkan memory debug output in ggml |
+| `KOKOPOP_VULKAN_SHADER_DEBUG_INFO` | `OFF` | Build Vulkan shaders with debug info |
 | `KOKOPOP_BUILD_BENCH` | `OFF`   | Build benchmarks (requires model)|
 
 ## Testing
@@ -530,32 +553,75 @@ Run `kokopop_rt` to get a detailed per-chunk real-time factor breakdown:
   Voice:       af_heart
   Threads:     4
   Sample Rate: 24000 Hz
-  Sentences:   10 → 10 chunk(s) (924 tokens)
+  Sentences:   10 → 14 chunk(s) (923 tokens)
 
-  Model load time:  100.8 ms
-  Prepare time:       6.1 ms (chunking + phonemization)
+  Model load time:   65.6 ms
+  Prepare time:      13.1 ms (chunking + phonemization)
 
   ┌──────┬────────┬────────────┬──────────┬──────────┬──────────┐
   │ Chunk│ Tokens │  Gen Time  │ Duration │    RT    │ Samples  │
   ├──────┼────────┼────────────┼──────────┼──────────┼──────────┤
-  │     1│     178│   5216.9ms │    11.76s│     2.25x│    282240│
-  │     2│      39│   1304.8ms │     2.84s│     2.18x│     68160│
-  │     3│     177│   5148.6ms │    11.34s│     2.20x│    272160│
-  │     4│      20│    848.4ms │     1.76s│     2.08x│     42360│
-  │     5│     121│   3562.6ms │     7.67s│     2.15x│    183960│
-  │     6│      99│   3046.2ms │     6.29s│     2.06x│    150960│
-  │     7│      66│   2063.0ms │     4.37s│     2.12x│    104760│
-  │     8│      90│   2725.3ms │     5.71s│     2.10x│    137160│
-  │     9│      62│   1833.2ms │     3.81s│     2.08x│     91560│
-  │    10│      72│   2031.2ms │     4.17s│     2.05x│    100080│
+  │     1│       4│    497.9ms │     0.98s│     1.97x│     23520│
+  │     2│      77│   2058.2ms │     4.24s│     2.06x│    101640│
+  │     3│      54│   1498.5ms │     3.19s│     2.13x│     76560│
+  │     4│      67│   2112.1ms │     4.57s│     2.16x│    109560│
+  │     5│      77│   2216.0ms │     4.58s│     2.07x│    110040│
+  │     6│      74│   2038.1ms │     4.29s│     2.10x│    102840│
+  │     7│      77│   2075.7ms │     4.41s│     2.12x│    105840│
+  │     8│      67│   1723.7ms │     3.89s│     2.26x│     93360│
+  │     9│      76│   2204.9ms │     4.71s│     2.14x│    113040│
+  │    10│      66│   1730.4ms │     3.71s│     2.15x│     89160│
+  │    11│      53│   1573.4ms │     3.37s│     2.14x│     80760│
+  │    12│      70│   2064.5ms │     4.51s│     2.19x│    108360│
+  │    13│      89│   2691.3ms │     5.51s│     2.05x│    132360│
+  │    14│      72│   1982.4ms │     4.17s│     2.10x│    100080│
   └──────┴────────┴────────────┴──────────┴──────────┴──────────┘
 
-  Total Generation:  27780.1 ms
-  Total Audio:        59.72 s  (1433400 samples @ 24000 Hz)
-  Overall RT:         2.15x
-  TTFB warm-start:   5216.9 ms (1st chunk inference)
-  TTFB cold-start:   5323.9 ms (load + prepare + 1st chunk)
+  Total Generation:  26467.1 ms
+  Total Audio:        56.13 s  (1347120 samples @ 24000 Hz)
+  Overall RT:         2.12x
+  TTFB warm-start:    497.9 ms (1st chunk inference)
+  TTFB cold-start:    576.6 ms (load + prepare + 1st chunk)
   → 2.1x faster than real-time
+```
+
+**Hardware:** MacBook Pro M1, **Backend:** Vulkan, **Threads:** 4
+
+```
+  Backend:     Vulkan
+  Voice:       af_heart
+  Threads:     4
+  Sample Rate: 24000 Hz
+  Sentences:   10 → 14 chunk(s) (923 tokens)
+
+  Model load time:  232.3 ms
+  Prepare time:      12.8 ms (chunking + phonemization)
+
+  ┌──────┬────────┬────────────┬──────────┬──────────┬──────────┐
+  │ Chunk│ Tokens │  Gen Time  │ Duration │    RT    │ Samples  │
+  ├──────┼────────┼────────────┼──────────┼──────────┼──────────┤
+  │     1│       4│    328.0ms │     0.95s│     2.91x│     22920│
+  │     2│      77│    843.5ms │     4.24s│     5.02x│    101640│
+  │     3│      54│    634.7ms │     3.19s│     5.03x│     76560│
+  │     4│      67│    839.0ms │     4.54s│     5.41x│    108960│
+  │     5│      77│    884.1ms │     4.56s│     5.16x│    109440│
+  │     6│      74│    826.6ms │     4.29s│     5.18x│    102840│
+  │     7│      77│    838.8ms │     4.43s│     5.29x│    106440│
+  │     8│      67│    727.9ms │     3.89s│     5.34x│     93360│
+  │     9│      76│    896.7ms │     4.74s│     5.28x│    113640│
+  │    10│      66│    701.1ms │     3.69s│     5.26x│     88560│
+  │    11│      53│    666.3ms │     3.31s│     4.98x│     79560│
+  │    12│      70│    830.6ms │     4.54s│     5.47x│    108960│
+  │    13│      89│    983.9ms │     5.51s│     5.61x│    132360│
+  │    14│      72│    790.0ms │     4.14s│     5.25x│     99480│
+  └──────┴────────┴────────────┴──────────┴──────────┴──────────┘
+
+  Total Generation:  10791.2 ms
+  Total Audio:        56.03 s  (1344720 samples @ 24000 Hz)
+  Overall RT:         5.19x
+  TTFB warm-start:    328.0 ms (1st chunk inference)
+  TTFB cold-start:    573.1 ms (load + prepare + 1st chunk)
+  → 5.2x faster than real-time
 ```
 
 **Hardware:** AMD Ryzen 9 7950X 16-Core Processor, **Backend:** CPU, **Threads:** 16

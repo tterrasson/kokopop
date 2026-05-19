@@ -558,7 +558,8 @@ bool load_model_from_gguf(
     if (requested_backend != KOKOPOP_BACKEND_AUTO &&
         requested_backend != KOKOPOP_BACKEND_CPU &&
         requested_backend != KOKOPOP_BACKEND_METAL &&
-        requested_backend != KOKOPOP_BACKEND_CUDA) {
+        requested_backend != KOKOPOP_BACKEND_CUDA &&
+        requested_backend != KOKOPOP_BACKEND_VULKAN) {
         error = "invalid kokopop backend option";
         return false;
     }
@@ -651,17 +652,8 @@ bool load_model_from_gguf(
         return false;
     }
     // Record the actual backend type based on what was created, not what
-    // was requested (AUTO can resolve to CUDA, Metal, or CPU). Use the
-    // backend's own label() — weight_buffer_type varies by backend
-    // (CPU buffer on CPU/Metal, CUDA VRAM on CUDA), so it's not a
-    // reliable discriminator.
-    if (std::strcmp(m->backend->label(), "Metal (GPU)") == 0) {
-        m->backend_type = KOKOPOP_BACKEND_METAL;
-    } else if (std::strcmp(m->backend->label(), "CUDA (GPU)") == 0) {
-        m->backend_type = KOKOPOP_BACKEND_CUDA;
-    } else {
-        m->backend_type = KOKOPOP_BACKEND_CPU;
-    }
+    // was requested (AUTO can resolve to any compiled backend).
+    m->backend_type = m->backend->type();
 
     m->weight_buffer = ggml_backend_alloc_ctx_tensors_from_buft(
         m->weight_ctx,

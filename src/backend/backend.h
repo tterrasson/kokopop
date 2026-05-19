@@ -8,6 +8,8 @@
 #include <ggml.h>
 #include <ggml-backend.h>
 
+#include "kokopop.h"
+
 namespace kokopop {
 
 // Abstract backend interface — zero #ifdef GGML_USE_METAL in inference code.
@@ -67,6 +69,9 @@ struct Backend {
 
     // Human-readable backend name for display purposes.
     virtual const char * label() const { return "CPU"; }
+
+    // Backend enum value stored on Model after AUTO has been resolved.
+    virtual int32_t type() const { return KOKOPOP_BACKEND_CPU; }
 
     // Optional: tag the next compute call with a label (e.g. "frontend",
     // "generation", "generator"). Backends may use it for diagnostics or
@@ -225,7 +230,8 @@ std::unique_ptr<Backend> create_cpu_backend(int32_t n_threads);
 
 // Factory: create the backend for the given request.
 // requested: KOKOPOP_BACKEND_AUTO (0), KOKOPOP_BACKEND_CPU (1),
-//            KOKOPOP_BACKEND_METAL (2), KOKOPOP_BACKEND_CUDA (3)
+//            KOKOPOP_BACKEND_METAL (2), KOKOPOP_BACKEND_CUDA (3),
+//            KOKOPOP_BACKEND_VULKAN (4)
 std::unique_ptr<Backend> create_backend(
     int32_t requested, int32_t n_threads, std::string & error);
 

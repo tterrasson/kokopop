@@ -1345,17 +1345,20 @@ ggml_tensor * lstm_direction(
     const std::string wih_key = prefix + ".weight_ih_l0" + (reverse ? "_reverse" : "");
     const auto wih_it = model.lstm_w_ih_f32.find(wih_key);
 
-    // CUDA keeps using backend mul_mat; CPU and Metal use pre-dequantized F32
-    // weights for numerically stable LSTM pre-gates.
+    // CUDA/Vulkan keep using backend mul_mat; CPU and Metal use pre-dequantized
+    // F32 weights for numerically stable LSTM pre-gates.
     ggml_tensor * w_ih = w.w_ih_packed;
-    if (model.backend_type != KOKOPOP_BACKEND_CUDA) {
+    const bool use_backend_pregates =
+        model.backend_type == KOKOPOP_BACKEND_CUDA ||
+        model.backend_type == KOKOPOP_BACKEND_VULKAN;
+    if (!use_backend_pregates) {
         if (wih_it == model.lstm_w_ih_f32.end()) {
             error = "fused LSTM: w_ih not preloaded for " + wih_key;
             return nullptr;
         }
     }
 
-    if (model.backend_type != KOKOPOP_BACKEND_CUDA) {
+    if (!use_backend_pregates) {
         const int64_t I      = w.w_ih_packed->ne[0];
         const int64_t four_H = w.w_ih_packed->ne[1];
 

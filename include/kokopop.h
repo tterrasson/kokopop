@@ -24,7 +24,8 @@ enum {
     KOKOPOP_BACKEND_AUTO = 0,
     KOKOPOP_BACKEND_CPU = 1,
     KOKOPOP_BACKEND_METAL = 2,
-    KOKOPOP_BACKEND_CUDA = 3
+    KOKOPOP_BACKEND_CUDA = 3,
+    KOKOPOP_BACKEND_VULKAN = 4
 };
 
 typedef struct kokopop_model_options {

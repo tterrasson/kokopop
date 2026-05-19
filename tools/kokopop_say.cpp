@@ -19,11 +19,11 @@ namespace {
 void usage(const char * argv0) {
     std::fprintf(stderr,
         "usage: %s --model kokoro.gguf --voice ff_siwis (--text TEXT | --phonemes PHONEMES) "
-        "[--out out.wav | --play] [--speed 1.0] [--threads N] [--backend cpu|metal|cuda]\n"
+        "[--out out.wav | --play] [--speed 1.0] [--threads N] [--backend cpu|metal|cuda|vulkan]\n"
         "\n"
         "  --out out.wav   Write audio to a WAV file\n"
         "  --play          Play audio directly (mutually exclusive with --out)\n"
-        "  --backend       Use CPU, Metal, or CUDA backend (default: auto)\n",
+        "  --backend       Use CPU, Metal, CUDA, or Vulkan backend (default: auto)\n",
         argv0);
 }
 
@@ -96,8 +96,10 @@ int main(int argc, char ** argv) {
                 backend = KOKOPOP_BACKEND_METAL;
             } else if (std::strcmp(v, "cuda") == 0) {
                 backend = KOKOPOP_BACKEND_CUDA;
+            } else if (std::strcmp(v, "vulkan") == 0) {
+                backend = KOKOPOP_BACKEND_VULKAN;
             } else {
-                std::fprintf(stderr, "error: invalid backend '%s' (use 'cpu', 'metal', or 'cuda')\n", v);
+                std::fprintf(stderr, "error: invalid backend '%s' (use 'cpu', 'metal', 'cuda', or 'vulkan')\n", v);
                 return 2;
             }
         } else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
@@ -168,4 +170,3 @@ int main(int argc, char ** argv) {
     kokopop_model_free(model);
     return rc;
 }
-

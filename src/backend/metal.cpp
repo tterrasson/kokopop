@@ -387,6 +387,10 @@ public:
         return "Metal (GPU)";
     }
 
+    int32_t type() const override {
+        return KOKOPOP_BACKEND_METAL;
+    }
+
     void set_active_label(const char * label) override {
         active_label_ = label;
     }

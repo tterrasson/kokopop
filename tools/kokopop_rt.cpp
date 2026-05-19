@@ -55,7 +55,7 @@ void usage(const char * argv0) {
         "Options:\n"
         "  --model PATH        Path to Kokoro GGUF model (required)\n"
         "  --voice NAME        Voice name (default: auto-resolve to first available)\n"
-        "  --backend cpu|metal|cuda Inference backend (default: auto)\n"
+        "  --backend cpu|metal|cuda|vulkan Inference backend (default: auto)\n"
         "  --threads N         Thread count (default: min(4, hw_concurrency))\n"
         "  --n-sentences N     Number of sentences to use (default: 10, range: 3-12)\n"
         "  --speed F           Synthesis speed multiplier (default: 1.0)\n"
@@ -116,8 +116,10 @@ bool parse_args(int argc, char ** argv, Options & opts) {
                 opts.backend = KOKOPOP_BACKEND_METAL;
             } else if (std::strcmp(v, "cuda") == 0) {
                 opts.backend = KOKOPOP_BACKEND_CUDA;
+            } else if (std::strcmp(v, "vulkan") == 0) {
+                opts.backend = KOKOPOP_BACKEND_VULKAN;
             } else {
-                std::fprintf(stderr, "error: invalid backend '%s' (use 'cpu', 'metal', or 'cuda')\n", v);
+                std::fprintf(stderr, "error: invalid backend '%s' (use 'cpu', 'metal', 'cuda', or 'vulkan')\n", v);
                 return false;
             }
         } else if (std::strcmp(argv[i], "--seed") == 0) {
@@ -279,6 +281,7 @@ void print_summary(const std::vector<ChunkResult> & results,
 const char * backend_label(int backend_type) {
     if (backend_type == KOKOPOP_BACKEND_METAL) return "Metal";
     if (backend_type == KOKOPOP_BACKEND_CUDA)  return "CUDA";
+    if (backend_type == KOKOPOP_BACKEND_VULKAN) return "Vulkan";
     return "CPU";
 }
 
