@@ -13,6 +13,11 @@
 namespace kokopop {
 namespace {
 
+bool ends_with(const std::string & text, const char * suffix) {
+    const size_t n = std::strlen(suffix);
+    return text.size() >= n && std::memcmp(text.data() + text.size() - n, suffix, n) == 0;
+}
+
 float hash_freq(const std::vector<uint32_t> & ids, const std::string & voice) {
     uint32_t h = 2166136261u;
     for (uint32_t id : ids) {
@@ -86,6 +91,38 @@ bool run_real_synthesis(
 }
 
 } // namespace
+
+void trim_trailing_chunk_punctuation(std::string & phonemes) {
+    auto trim_spaces = [&]() {
+        while (!phonemes.empty() && phonemes.back() == ' ') {
+            phonemes.pop_back();
+        }
+    };
+
+    trim_spaces();
+    for (;;) {
+        bool trimmed = false;
+        if (!phonemes.empty()) {
+            const char c = phonemes.back();
+            if (c == ',' || c == '.' || c == ';' || c == ':' || c == '!' || c == '?') {
+                phonemes.pop_back();
+                trimmed = true;
+            }
+        }
+        if (!trimmed && ends_with(phonemes, "…")) {
+            phonemes.erase(phonemes.size() - std::strlen("…"));
+            trimmed = true;
+        }
+        if (!trimmed && ends_with(phonemes, "—")) {
+            phonemes.erase(phonemes.size() - std::strlen("—"));
+            trimmed = true;
+        }
+        if (!trimmed) {
+            break;
+        }
+        trim_spaces();
+    }
+}
 
 bool synthesize_phonemes(
     Model & model, const std::string & phonemes,

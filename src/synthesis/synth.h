@@ -12,5 +12,11 @@ bool synthesize_phonemes(
     const std::string & voice, float speed,
     kokopop_audio & out, std::string & error);
 
+// Strip trailing punctuation (and trailing spaces) from a phoneme string.
+// Used at intermediate chunk boundaries: keeping the punctuation tokens there
+// destabilises the Kokoro model without improving prosody, since the chunk
+// pause is already added by audio post-processing.
+void trim_trailing_chunk_punctuation(std::string & phonemes);
+
 } // namespace kokopop
 

@@ -97,38 +97,6 @@ void log_zh_chunk_trace(const kokopop::Chunk & chunk,
                  synth_trailing.empty() ? "<none>" : synth_trailing.c_str());
 }
 
-void trim_trailing_chunk_punctuation(std::string & phonemes) {
-    auto trim_spaces = [&]() {
-        while (!phonemes.empty() && phonemes.back() == ' ') {
-            phonemes.pop_back();
-        }
-    };
-
-    trim_spaces();
-    for (;;) {
-        bool trimmed = false;
-        if (!phonemes.empty()) {
-            const char c = phonemes.back();
-            if (c == ',' || c == '.' || c == ';' || c == ':' || c == '!' || c == '?') {
-                phonemes.pop_back();
-                trimmed = true;
-            }
-        }
-        if (!trimmed && ends_with(phonemes, "…")) {
-            phonemes.erase(phonemes.size() - std::strlen("…"));
-            trimmed = true;
-        }
-        if (!trimmed && ends_with(phonemes, "—")) {
-            phonemes.erase(phonemes.size() - std::strlen("—"));
-            trimmed = true;
-        }
-        if (!trimmed) {
-            break;
-        }
-        trim_spaces();
-    }
-}
-
 kokopop::ChunkConfig text_synthesis_config_for_voice(const std::string & voice) {
     kokopop::ChunkConfig config = kokopop::make_long_form_config();
     const char lang = voice.empty() ? 'a' : voice[0];
@@ -216,7 +184,7 @@ int kokopop_synthesize_text(
             // Chunk pauses are added by postprocess_chunk_audio(), so keeping
             // punctuation tokens at an intermediate chunk boundary only makes
             // the model less stable without improving prosody.
-            trim_trailing_chunk_punctuation(chunk_phonemes);
+            kokopop::trim_trailing_chunk_punctuation(chunk_phonemes);
         }
         if (trace_zh) {
             log_zh_chunk_trace(chunk, chunk_phonemes, i, chunks.size());

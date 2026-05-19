@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <future>
 #include <memory>
 #include <string>
@@ -104,8 +105,16 @@ std::vector<float> infer_chunk(
                 chunk.n_tokens, chunk.phonemes.size());
 
     // --- Synthesize raw audio ---
+    // Strip trailing punctuation on intermediate chunks: keeping it
+    // destabilises Kokoro at chunk boundaries (gibberish/noise after a few
+    // chunks). The boundary pause is reinserted by postprocess_chunk_audio.
+    std::string chunk_phonemes = chunk.phonemes;
+    if (!chunk.is_last) {
+        trim_trailing_chunk_punctuation(chunk_phonemes);
+    }
+
     kokopop_audio raw{};
-    if (!synthesize_phonemes(model, chunk.phonemes, plan.voice, plan.speed, raw, error)) {
+    if (!synthesize_phonemes(model, chunk_phonemes, plan.voice, plan.speed, raw, error)) {
         return {};
     }
 
@@ -224,9 +233,14 @@ StreamHandle stream_synthesize(
                     r.error = "stopped";
                     return r;
                 }
+                const auto & chunk = plan.chunks[static_cast<size_t>(idx)];
+                std::string chunk_phonemes = chunk.phonemes;
+                if (!chunk.is_last) {
+                    trim_trailing_chunk_punctuation(chunk_phonemes);
+                }
+
                 kokopop_audio raw{};
-                if (!synthesize_phonemes(*model,
-                                          plan.chunks[static_cast<size_t>(idx)].phonemes,
+                if (!synthesize_phonemes(*model, chunk_phonemes,
                                           plan.voice, plan.speed, raw, r.error)) {
                     return r;
                 }

@@ -618,6 +618,15 @@ Chunk build_adaptative_chunk(
             continue;
         }
 
+        // Prefer to break at any strong (sentence/paragraph) boundary once we
+        // are past target_min_tokens, rather than holding out for the full
+        // controller target. Crossing a sentence boundary inside a chunk only
+        // marginally improves prosody and risks orphan-tail bugs when the next
+        // unit is a single-letter word.
+        if (chunk.n_tokens >= config.target_min_tokens &&
+            is_strong_boundary(chunk.boundary_after)) {
+            break;
+        }
         if (chunk.n_tokens >= target && chunk.boundary_after != Boundary::None) {
             break;
         }
