@@ -67,6 +67,14 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release -DKOKOPOP_ENABLE_VULKAN=ON
 cmake --build build
 ```
 
+On Linux (Debian/Ubuntu), install the Vulkan SDK plus SPIR-V headers so CMake can find Vulkan and `glslc`:
+
+```bash
+sudo apt install libvulkan-dev vulkan-tools glslang-tools glslc spirv-headers
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DKOKOPOP_ENABLE_VULKAN=ON
+cmake --build build
+```
+
 On macOS, install the Vulkan SDK plus SPIR-V headers so CMake can find Vulkan, `glslc`, MoltenVK, and `spirv/unified1/spirv.hpp`:
 
 ```bash
