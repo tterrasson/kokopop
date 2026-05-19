@@ -30,23 +30,4 @@ void lstm_fused_callback(
     int ith, int nth,
     void * userdata);
 
-// Pre-gates matmul callback. Runs `dst = w_ih @ input` on the Metal LSTM
-// kernel state. The wih_key must have been preloaded via
-// Backend::preload_lstm_wih at model load.
-struct LstmPregatesParams {
-    void       * metal_kernel; // MetalLstmKernelState *
-    const char * wih_key;
-    const float * w_ih_f32;
-    int          I;
-    int          four_H;
-    int          n_steps;
-};
-
-void lstm_pregates_callback(
-    ggml_tensor       * dst,
-    const ggml_tensor * /*dst_unused*/,
-    const ggml_tensor * input,
-    int ith, int nth,
-    void * userdata);
-
 } // namespace kokopop

@@ -94,13 +94,6 @@ struct Backend {
         (void)key; (void)w_hh_f32; (void)H; (void)four_H;
     }
 
-    // Preload the LSTM input weight matrix w_ih (dequantized) for the Metal
-    // pre-gates matmul path. Default: no-op.
-    virtual void preload_lstm_wih(const std::string & key,
-                                   const float * w_ih_f32, int I, int four_H) {
-        (void)key; (void)w_ih_f32; (void)I; (void)four_H;
-    }
-
     // Return the fused LSTM kernel handle cast to void* (null for CPU backend).
     // Used by graph_ops::lstm_direction to fill LstmCustomParams::metal_kernel.
     virtual void * metal_lstm_kernel() const { return nullptr; }

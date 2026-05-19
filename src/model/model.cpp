@@ -471,23 +471,8 @@ void Model::preload_tensor_cache() {
         }
     }
 
-    // LSTM input weights feed the gate pre-activation matmul. Keep host F32
-    // copies so CPU/Metal graphs can bypass quantized backend matmul for this
-    // numerically sensitive path while CUDA keeps using its faster kernels.
-    lstm_w_ih_f32.clear();
-    for (const auto & kv : tensors) {
-        if (kv.first.find("weight_ih_l0") == std::string::npos) continue;
-        if (kv.second == nullptr) continue;
-        std::vector<float> data;
-        if (tensor_to_f32(*backend, kv.second, data)) {
-            // Push to Metal pre-gates cache (no-op on non-Metal).
-            // ggml mul_mat conventions: w_ih has shape [I, 4H] (ne[0]=I fast).
-            const int I      = static_cast<int>(kv.second->ne[0]);
-            const int four_H = static_cast<int>(kv.second->ne[1]);
-            backend->preload_lstm_wih(kv.first, data.data(), I, four_H);
-            lstm_w_ih_f32.emplace(kv.first, std::move(data));
-        }
-    }
+    // LSTM input weights (weight_ih_l0) are consumed via backend mul_mat on
+    // every backend; no host-side F32 cache is needed.
 }
 
 void Model::prereserve_scratch_buffers() {

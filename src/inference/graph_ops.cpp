@@ -10,6 +10,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -1330,59 +1331,12 @@ ggml_tensor * lstm_direction(
 
     const int64_t hidden = w.hidden;
 
-    // Pre-gates matmul. Runs `pre_gates = w_ih @ input` with an explicit
-    // F32 kernel for CPU/Metal, matching the layout used by the Metal kernel:
-    //   w_ih[i + I*g] * input[i + I*t] -> pre_gates[g + 4H*t].
-    ggml_tensor * mul_result = nullptr;
-#ifdef KOKOPOP_HAS_METAL
-    const bool use_pregates_metal =
-        model.backend != nullptr &&
-        model.backend->metal_lstm_kernel() != nullptr;
-#else
-    const bool use_pregates_metal = false;
-#endif
-
-    const std::string wih_key = prefix + ".weight_ih_l0" + (reverse ? "_reverse" : "");
-    const auto wih_it = model.lstm_w_ih_f32.find(wih_key);
-
-    // CUDA/Vulkan keep using backend mul_mat; CPU and Metal use pre-dequantized
-    // F32 weights for numerically stable LSTM pre-gates.
-    ggml_tensor * w_ih = w.w_ih_packed;
-    const bool use_backend_pregates =
-        model.backend_type == KOKOPOP_BACKEND_CUDA ||
-        model.backend_type == KOKOPOP_BACKEND_VULKAN;
-    if (!use_backend_pregates) {
-        if (wih_it == model.lstm_w_ih_f32.end()) {
-            error = "fused LSTM: w_ih not preloaded for " + wih_key;
-            return nullptr;
-        }
-    }
-
-    if (!use_backend_pregates) {
-        const int64_t I      = w.w_ih_packed->ne[0];
-        const int64_t four_H = w.w_ih_packed->ne[1];
-
-        model.lstm_pregates_params.push_back(LstmPregatesParams{
-            use_pregates_metal ? model.backend->metal_lstm_kernel() : nullptr,
-            wih_it->first.c_str(),
-            wih_it->second.data(),
-            static_cast<int>(I),
-            static_cast<int>(four_H),
-            static_cast<int>(n_steps),
-        });
-        const LstmPregatesParams * pg = &model.lstm_pregates_params.back();
-
-        ggml_tensor * dst = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, four_H, n_steps);
-        mul_result = ggml_map_custom2_inplace(
-            ctx, dst, input,
-            lstm_pregates_callback,
-            use_pregates_metal ? 1 : GGML_N_TASKS_MAX,
-            const_cast<LstmPregatesParams *>(pg));
-    }
-
-    if (mul_result == nullptr) {
-        mul_result = ggml_mul_mat(ctx, w_ih, input);
-    }
+    // Pre-gates matmul: pre_gates = w_ih @ input via backend mul_mat on every
+    // backend. An earlier F32 pre-dequantized fallback for CPU/Metal was
+    // removed after it was found to produce noise on edge-case inputs (e.g.
+    // sequences ending on an orphan stressed syllable). The backend mul_mat
+    // path with quantized weights is numerically stable across all backends.
+    ggml_tensor * mul_result = ggml_mul_mat(ctx, w.w_ih_packed, input);
     ggml_tensor * pre_input_gates_packed = ggml_add(ctx, mul_result, w.b_ih_packed);
 
     const std::string whh_key = prefix + ".weight_hh_l0" + (reverse ? "_reverse" : "");

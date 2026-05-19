@@ -156,23 +156,12 @@ struct Model {
     // Key = tensor logical name (e.g. "kokopop.text_encoder.lstm.bias_hh_l0").
     std::unordered_map<std::string, std::vector<float>> lstm_b_hh_f32;
 
-    // Pre-dequantized LSTM input matrices. CPU and Metal both showed
-    // saturation on long multi-chunk synthesis when these gates were computed
-    // through quantized backend matmul; CUDA uses its own kernels and can keep
-    // the original quantized tensors.
-    // Key = tensor logical name (e.g. "kokopop.text_encoder.lstm.weight_ih_l0").
-    std::unordered_map<std::string, std::vector<float>> lstm_w_ih_f32;
-
     // Scratch storage for LstmCustomParams instances built during graph
     // construction.  Reserve 24 slots before building the generation graph
     // (12 LSTM directions × safety margin) so no reallocation occurs and
     // stored pointers remain valid until after graph execution.
     // See graph_ops.cpp::lstm_direction for usage.
     std::vector<struct LstmCustomParams> lstm_custom_params;
-
-    // Scratch storage for Metal LSTM pre-gates matmul params. Reserved
-    // alongside lstm_custom_params; same lifetime semantics.
-    std::vector<struct LstmPregatesParams> lstm_pregates_params;
 
     // Scratch storage for experimental Metal vocoder custom-op parameters.
     // Reserved before building the generator graph so userdata pointers remain

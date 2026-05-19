@@ -37,22 +37,4 @@ void metal_lstm_run(
     float       * output,
     int H, int N, bool reverse);
 
-// Pre-gates matmul. Preload w_ih (dequantized) once per direction, then call
-// the matmul per chunk to compute pre_gates = w_ih @ input on GPU.
-//   w_ih shape: [I, 4H] f32, ggml col-major (ne[0]=I fast dim)
-void metal_lstm_preload_wih(
-    MetalLstmKernelState * state,
-    const char * key,
-    const float * w_ih_f32,
-    int I, int four_H);
-
-// Returns false if the kernel/preload is unavailable; caller then falls
-// back to the ggml mul_mat CPU path.
-bool metal_lstm_pregates_matmul(
-    MetalLstmKernelState * state,
-    const char * key,
-    const float * input,    // [I, N] f32 col-major
-    float       * pre_gates, // [4H, N] f32 col-major
-    int I, int four_H, int N);
-
 #endif // KOKOPOP_HAS_METAL
