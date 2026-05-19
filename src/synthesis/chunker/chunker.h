@@ -33,6 +33,12 @@ struct ChunkConfig {
     int first_chunk_target_max_tokens = 100;
     bool allow_short_first_chunk = true;
 
+    // Tokens of overshoot allowed past `target_tokens` while searching for a
+    // stronger boundary. Lets the chunker prefer a sentence end over a comma
+    // even if it means a slightly larger chunk. Capped by target_max_tokens
+    // and hard_max_tokens regardless.
+    int target_overshoot_tokens = 24;
+
     // Pause durations (ms) per boundary type
     int comma_pause_ms = 80;
     int sentence_pause_ms = 180;
@@ -177,5 +183,9 @@ void clear_chunk_data(Chunk & chunk);
 // ---------------------------------------------------------------------------
 bool is_strong_boundary(Boundary b);
 bool is_reasonable_boundary(Boundary b);
+
+/// Boundary quality, higher = stronger prosodic break.
+///   None=0, ClauseWeak=1, ClauseStrong=2, Newline=3, Sentence=4, Paragraph=5.
+int boundary_score(Boundary b);
 
 } // namespace kokopop

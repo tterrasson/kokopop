@@ -437,4 +437,16 @@ bool is_reasonable_boundary(Boundary b) {
            b == Boundary::Newline;
 }
 
+int boundary_score(Boundary b) {
+    switch (b) {
+        case Boundary::Paragraph:    return 5;
+        case Boundary::Sentence:     return 4;
+        case Boundary::Newline:      return 3;
+        case Boundary::ClauseStrong: return 2;
+        case Boundary::ClauseWeak:   return 1;
+        case Boundary::None:         return 0;
+    }
+    return 0;
+}
+
 } // namespace kokopop

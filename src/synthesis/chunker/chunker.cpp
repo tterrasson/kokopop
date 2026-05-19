@@ -61,6 +61,8 @@ ChunkConfig merge_chunk_config(ChunkConfig base, ChunkConfig overrides) {
         base.first_chunk_target_max_tokens = overrides.first_chunk_target_max_tokens;
     if (overrides.allow_short_first_chunk != def.allow_short_first_chunk)
         base.allow_short_first_chunk = overrides.allow_short_first_chunk;
+    if (overrides.target_overshoot_tokens != def.target_overshoot_tokens)
+        base.target_overshoot_tokens = overrides.target_overshoot_tokens;
     if (overrides.comma_pause_ms != def.comma_pause_ms)
         base.comma_pause_ms = overrides.comma_pause_ms;
     if (overrides.sentence_pause_ms != def.sentence_pause_ms)
@@ -618,18 +620,30 @@ Chunk build_adaptative_chunk(
             continue;
         }
 
-        // Prefer to break at any strong (sentence/paragraph) boundary once we
-        // are past target_min_tokens, rather than holding out for the full
-        // controller target. Crossing a sentence boundary inside a chunk only
-        // marginally improves prosody and risks orphan-tail bugs when the next
-        // unit is a single-letter word.
+        // Break at any strong (sentence/paragraph) boundary once we are past
+        // target_min_tokens. Avoids orphan-tail bugs and yields natural cuts.
         if (chunk.n_tokens >= config.target_min_tokens &&
             is_strong_boundary(chunk.boundary_after)) {
             break;
         }
+
+        // Boundary-scored break around target:
+        //   - Past `target` with a strong boundary  → break (good cut).
+        //   - Past `target` with a weak boundary    → only break if we already
+        //     overshot beyond `target + overshoot`, otherwise keep going to
+        //     try to reach a stronger boundary.
+        // The overshoot is bounded by target_max_tokens / soft_max_tokens
+        // below so we don't snowball.
+        const int overshoot = std::max(0, config.target_overshoot_tokens);
         if (chunk.n_tokens >= target && chunk.boundary_after != Boundary::None) {
-            break;
+            const int score = boundary_score(chunk.boundary_after);
+            const bool strong = score >= boundary_score(Boundary::Sentence);
+            const bool past_overshoot = chunk.n_tokens >= target + overshoot;
+            if (strong || past_overshoot) {
+                break;
+            }
         }
+
         // Hard cap: max(target, target_max_tokens) lets a large controller
         // target override the static 80-token cap when the buffer is deep.
         if (chunk.n_tokens >= std::max(config.target_max_tokens, target)) break;
@@ -638,6 +652,23 @@ Chunk build_adaptative_chunk(
             break;
         }
         if (chunk.n_tokens >= config.hard_max_tokens) break;
+    }
+
+    // Tail-merge: if the units remaining after this chunk would form a single
+    // tiny last chunk (< target_min_tokens), absorb them now so we don't end
+    // up with a dry, undersized final chunk. Bounded by hard_max_tokens.
+    if (!is_first && next_unit < units.size() && !chunk.tokens.empty()) {
+        int remaining = 0;
+        for (size_t i = next_unit; i < units.size(); ++i) {
+            remaining += units[i].n_tokens;
+        }
+        if (remaining > 0 && remaining < config.target_min_tokens &&
+            chunk.n_tokens + remaining <= config.hard_max_tokens) {
+            while (next_unit < units.size()) {
+                append_unit(units[next_unit]);
+                ++next_unit;
+            }
+        }
     }
 
     chunk.is_first = is_first;
