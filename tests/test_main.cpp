@@ -24,3 +24,4 @@
 #include "test_chunker.cpp"
 #include "test_file_mapping.cpp"
 #include "test_streaming_pipeline.cpp"
+#include "test_http_async_parser.cpp"

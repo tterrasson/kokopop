@@ -15,7 +15,7 @@ TEST_CASE("real_kokoro_frontend_probe") {
     CHECK(ids.size() > 0);
 
     kokopop::KokoroFrontendProbe probe;
-    CHECK(kokopop::run_kokoro_frontend_probe(*model, ids, "ff_siwis", probe, error));
+    CHECK(kokopop::run_kokoro_frontend_probe(*model, ids, "af_heart", probe, error));
 
     // Structural invariants: sizes depend on token count and architecture constants
     CHECK_EQ(probe.n_tokens, static_cast<int64_t>(ids.size()));
@@ -38,14 +38,14 @@ TEST_CASE("real_kokoro_frontend_probe_handles_punctuation") {
 
     std::string phonemes;
     std::string error;
-    CHECK(kokopop::phonemize_text("Tu aimes les films ? Oui ? Non ? Bonjour, comment tu vas ?", "ff_siwis", phonemes, error));
+    CHECK(kokopop::phonemize_text("Tu aimes les films ? Oui ? Non ? Bonjour, comment tu vas ?", "af_heart", phonemes, error));
 
     std::vector<uint32_t> ids;
     CHECK(model->tokenize_phonemes(phonemes, ids, error));
     CHECK(ids.size() > 20);
 
     kokopop::KokoroFrontendProbe probe;
-    CHECK(kokopop::run_kokoro_frontend_probe(*model, ids, "ff_siwis", probe, error));
+    CHECK(kokopop::run_kokoro_frontend_probe(*model, ids, "af_heart", probe, error));
     CHECK_EQ(probe.n_tokens, static_cast<int64_t>(ids.size()));
     CHECK_EQ(probe.durations.size(), ids.size());
 }
@@ -59,9 +59,9 @@ TEST_CASE("real_kokoro_generation_probe") {
     CHECK(model->tokenize_phonemes("bɔ̃ʒˈuʁ", ids, error));
 
     kokopop::KokoroFrontendProbe frontend;
-    CHECK(kokopop::run_kokoro_frontend_probe(*model, ids, "ff_siwis", frontend, error));
+    CHECK(kokopop::run_kokoro_frontend_probe(*model, ids, "af_heart", frontend, error));
     kokopop::KokoroGenerationProbe gen;
-    CHECK(kokopop::run_kokoro_generation_probe(*model, ids, "ff_siwis", 1.0f, frontend, gen, error));
+    CHECK(kokopop::run_kokoro_generation_probe(*model, ids, "af_heart", 1.0f, frontend, gen, error));
 
     // Structural invariants: sizes are architecture constants × n_frames
     // (512 ASR channels, 1024 decoder channels, 600 audio samples per frame)
@@ -150,8 +150,8 @@ TEST_CASE("real_kokoro_scratch_reuse") {
 
     kokopop::KokoroFrontendProbe front1;
     kokopop::KokoroGenerationProbe gen1;
-    CHECK(kokopop::run_kokoro_frontend_probe(*model, ids, "ff_siwis", front1, error));
-    CHECK(kokopop::run_kokoro_generation_probe(*model, ids, "ff_siwis", 1.0f, front1, gen1, error));
+    CHECK(kokopop::run_kokoro_frontend_probe(*model, ids, "af_heart", front1, error));
+    CHECK(kokopop::run_kokoro_generation_probe(*model, ids, "af_heart", 1.0f, front1, gen1, error));
 
     const size_t frontend_cap   = model->frontend_scratch.capacity();
     const size_t generation_cap = model->generation_scratch.capacity();
@@ -162,8 +162,8 @@ TEST_CASE("real_kokoro_scratch_reuse") {
 
     kokopop::KokoroFrontendProbe front2;
     kokopop::KokoroGenerationProbe gen2;
-    CHECK(kokopop::run_kokoro_frontend_probe(*model, ids, "ff_siwis", front2, error));
-    CHECK(kokopop::run_kokoro_generation_probe(*model, ids, "ff_siwis", 1.0f, front2, gen2, error));
+    CHECK(kokopop::run_kokoro_frontend_probe(*model, ids, "af_heart", front2, error));
+    CHECK(kokopop::run_kokoro_generation_probe(*model, ids, "af_heart", 1.0f, front2, gen2, error));
 
     // Same-sized input: scratch buffers must not reallocate.
     CHECK_EQ(model->frontend_scratch.capacity(),   frontend_cap);
@@ -192,8 +192,8 @@ TEST_CASE("real_kokoro_cpu_metal_parity_when_available") {
 
     kokopop::KokoroFrontendProbe cpu_front;
     kokopop::KokoroFrontendProbe metal_front;
-    CHECK(kokopop::run_kokoro_frontend_probe(*cpu_model, ids, "ff_siwis", cpu_front, error));
-    CHECK(kokopop::run_kokoro_frontend_probe(*metal_model, ids, "ff_siwis", metal_front, error));
+    CHECK(kokopop::run_kokoro_frontend_probe(*cpu_model, ids, "af_heart", cpu_front, error));
+    CHECK(kokopop::run_kokoro_frontend_probe(*metal_model, ids, "af_heart", metal_front, error));
     CHECK_EQ(metal_front.durations.size(), cpu_front.durations.size());
     for (size_t i = 0; i < cpu_front.durations.size(); ++i) {
         CHECK_NEAR(metal_front.durations[i], cpu_front.durations[i], 1.5f);
@@ -201,8 +201,8 @@ TEST_CASE("real_kokoro_cpu_metal_parity_when_available") {
 
     kokopop::KokoroGenerationProbe cpu_gen;
     kokopop::KokoroGenerationProbe metal_gen;
-    CHECK(kokopop::run_kokoro_generation_probe(*cpu_model, ids, "ff_siwis", 1.0f, cpu_front, cpu_gen, error));
-    CHECK(kokopop::run_kokoro_generation_probe(*metal_model, ids, "ff_siwis", 1.0f, metal_front, metal_gen, error));
+    CHECK(kokopop::run_kokoro_generation_probe(*cpu_model, ids, "af_heart", 1.0f, cpu_front, cpu_gen, error));
+    CHECK(kokopop::run_kokoro_generation_probe(*metal_model, ids, "af_heart", 1.0f, metal_front, metal_gen, error));
     CHECK(metal_gen.n_frames > 0);
     CHECK(metal_gen.audio.size() > 0);
     CHECK_NEAR(stats(metal_gen.audio).rms, stats(cpu_gen.audio).rms, 0.05);
@@ -294,7 +294,7 @@ TEST_CASE("real_model_token_counts_consistency") {
     CHECK(model->tokenize_phonemes("bɔ̃ʒˈuʁ", ids, error));
 
     kokopop::KokoroFrontendProbe probe;
-    CHECK(kokopop::run_kokoro_frontend_probe(*model, ids, "ff_siwis", probe, error));
+    CHECK(kokopop::run_kokoro_frontend_probe(*model, ids, "af_heart", probe, error));
     CHECK_EQ(probe.n_tokens, static_cast<int64_t>(ids.size()));
 }
 
@@ -307,7 +307,7 @@ TEST_CASE("real_model_durations_all_positive") {
     CHECK(model->tokenize_phonemes("bɔ̃ʒˈuʁ", ids, error));
 
     kokopop::KokoroFrontendProbe probe;
-    CHECK(kokopop::run_kokoro_frontend_probe(*model, ids, "ff_siwis", probe, error));
+    CHECK(kokopop::run_kokoro_frontend_probe(*model, ids, "af_heart", probe, error));
     for (float d : probe.durations) {
         CHECK(d > 0.0f);
     }
@@ -322,9 +322,9 @@ TEST_CASE("real_model_f0_reasonable_range") {
     CHECK(model->tokenize_phonemes("bɔ̃ʒˈuʁ", ids, error));
 
     kokopop::KokoroFrontendProbe frontend;
-    CHECK(kokopop::run_kokoro_frontend_probe(*model, ids, "ff_siwis", frontend, error));
+    CHECK(kokopop::run_kokoro_frontend_probe(*model, ids, "af_heart", frontend, error));
     kokopop::KokoroGenerationProbe gen;
-    CHECK(kokopop::run_kokoro_generation_probe(*model, ids, "ff_siwis", 1.0f, frontend, gen, error));
+    CHECK(kokopop::run_kokoro_generation_probe(*model, ids, "af_heart", 1.0f, frontend, gen, error));
 
     bool has_nonzero = false;
     for (float f : gen.f0) {
@@ -343,13 +343,13 @@ TEST_CASE("real_model_speed_affects_duration") {
     CHECK(model->tokenize_phonemes("bɔ̃ʒˈuʁ", ids, error));
 
     kokopop::KokoroFrontendProbe frontend;
-    CHECK(kokopop::run_kokoro_frontend_probe(*model, ids, "ff_siwis", frontend, error));
+    CHECK(kokopop::run_kokoro_frontend_probe(*model, ids, "af_heart", frontend, error));
 
     kokopop::KokoroGenerationProbe gen_slow;
-    CHECK(kokopop::run_kokoro_generation_probe(*model, ids, "ff_siwis", 0.5f, frontend, gen_slow, error));
+    CHECK(kokopop::run_kokoro_generation_probe(*model, ids, "af_heart", 0.5f, frontend, gen_slow, error));
 
     kokopop::KokoroGenerationProbe gen_fast;
-    CHECK(kokopop::run_kokoro_generation_probe(*model, ids, "ff_siwis", 2.0f, frontend, gen_fast, error));
+    CHECK(kokopop::run_kokoro_generation_probe(*model, ids, "af_heart", 2.0f, frontend, gen_fast, error));
 
     CHECK(gen_slow.n_frames > gen_fast.n_frames);
     const double ratio = static_cast<double>(gen_slow.n_frames) / static_cast<double>(gen_fast.n_frames);
@@ -372,9 +372,9 @@ TEST_CASE("real_model_audio_finite") {
     CHECK(model->tokenize_phonemes("bɔ̃ʒˈuʁ", ids, error));
 
     kokopop::KokoroFrontendProbe frontend;
-    CHECK(kokopop::run_kokoro_frontend_probe(*model, ids, "ff_siwis", frontend, error));
+    CHECK(kokopop::run_kokoro_frontend_probe(*model, ids, "af_heart", frontend, error));
     kokopop::KokoroGenerationProbe gen;
-    CHECK(kokopop::run_kokoro_generation_probe(*model, ids, "ff_siwis", 1.0f, frontend, gen, error));
+    CHECK(kokopop::run_kokoro_generation_probe(*model, ids, "af_heart", 1.0f, frontend, gen, error));
 
     for (float sample : gen.audio) {
         CHECK(std::isfinite(sample));
