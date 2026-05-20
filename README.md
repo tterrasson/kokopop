@@ -190,26 +190,58 @@ Start an async, event-driven HTTP server for TTS synthesis. Uses `poll()` for no
 
 # Unload model after 10 minutes of inactivity (saves memory, reloads on next request)
 ./build/kokopop_stream --model models/kokoro.gguf --http --port 8080 --idle-unload 10
+
+# Bind to all interfaces, use a different port
+./build/kokopop_stream --model models/kokoro.gguf --http --port 9000 --bind 0.0.0.0
+
+# Force a specific backend (cpu, metal, cuda, vulkan)
+./build/kokopop_stream --model models/kokoro.gguf --http --backend cuda
+
+# Set default speed and mode for all requests
+./build/kokopop_stream --model models/kokoro.gguf --http --speed 1.2 --mode long_form
+
+# Use a specific voice as the default for all requests
+./build/kokopop_stream --model models/kokoro.gguf --http --voice af_heart
+
+# Set thread count
+./build/kokopop_stream --model models/kokoro.gguf --http --threads 8
 ```
 
 **Options:**
 
 | Option | Default | Description |
 |---|---|---|
-| `--http` | — | Run in HTTP server mode |
-| `--port N` | `8080` | Server port |
-| `--bind ADDR` | `127.0.0.1` | Bind address |
-| `--idle-unload N` | disabled | Unload model after N minutes of inactivity, reload on next request |
+| `--http` | — | Run in HTTP server mode (async, event-driven) |
+| `--port N` | `8080` | HTTP server port |
+| `--bind ADDR` | `127.0.0.1` | HTTP server bind address (use `0.0.0.0` for all interfaces) |
+| `--idle-unload N` | disabled | Unload model after N minutes of inactivity; reload on next request (saves memory) |
+| `--backend` | `auto` | Inference backend: `cpu`, `metal`, `cuda`, or `vulkan` |
+| `--threads N` | `min(4, hw_concurrency)` | Number of inference threads (affects model loading; scheduler worker is single-threaded) |
+| `--speed FLOAT` | `1.0` | Default synthesis speed for HTTP requests |
+| `--mode MODE` | `adaptative` | Default synthesis mode: `adaptative` or `long_form` |
+| `--voice NAME` | — | Default voice for HTTP requests (overrides per-request `voice` field) |
 
-Available endpoints:
+> **Note:** In HTTP server mode, `--voice` sets the server-wide default voice. Individual requests can override it by including a `voice` field in the JSON payload. Without `--http`, `--voice` is required.
+
+**Architecture:**
+
+- Single-threaded event loop using `poll()` with non-blocking sockets
+- Max **64 concurrent connections** (configurable via `MAX_CONNECTIONS`)
+- Max **16 MiB request body** (`MAX_BODY_SIZE`)
+- Max **64 KiB headers** (`MAX_HEADER_SIZE`)
+- **30-second idle timeout** for connections not fully receiving headers/body
+- **256 KiB write buffer high-water mark** for back-pressure on slow clients
+- Round-robin chunk interleaving across concurrent requests via `SynthesisScheduler`
+
+**Available endpoints:**
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/tts` | `POST` | Synthesize text to audio — PCM float32 stream, Ogg/Opus stream, or complete WAV file |
-| `/health` | `GET` | Server health check |
-| `/voices` | `GET` | List voices embedded in the GGUF model |
+| `/tts` | `POST` | Synthesize text to audio — PCM float32, Ogg/Opus, or complete WAV |
+| `/health` | `GET` | Server health check — returns `{"status":"ready","sample_rate":24000}` or `{"status":"unloaded"}` if model was idle-unloaded |
+| `/voices` | `GET` | List all voices embedded in the GGUF model — returns `{"voices":[{"name":"..."}, ...]}` |
 
-Example requests:
+**Example requests:**
 
 ```bash
 # Stream raw PCM float32 (default) — chunked transfer encoding
@@ -227,22 +259,46 @@ curl -X POST http://localhost:8080/tts \
   -d '{"text": "Hello world", "voice": "ff_siwis", "format": "wav"}' \
   -o output.wav
 
-# Stream Ogg/Opus
+# Stream Ogg/Opus (requires Ogg/Opus libraries at build time)
 curl -X POST http://localhost:8080/tts \
   -H 'Content-Type: application/json' \
   -d '{"text": "Hello world", "voice": "af_heart", "format": "ogg"}' \
   -o output.ogg
+
+# Health check
+curl http://localhost:8080/health
+
+# List voices
+curl http://localhost:8080/voices
 ```
 
-Request body fields:
+**POST /tts request body fields:**
 
-| Field | Type | Description |
-|---|---|---|
-| `text` | string | **Required** — text to synthesize |
-| `voice` | string | Override default voice (e.g., `ff_siwis`) |
-| `speed` | float | Synthesis speed (default: from CLI `--speed`) |
-| `mode` | string | `adaptative` (default) or `long_form` |
-| `format` | string | `pcm` (default) — raw float32 stream; `wav` — complete WAV file; `ogg` — Ogg/Opus stream |
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `text` | string | **required** | Text to synthesize (max 100,000 characters) |
+| `voice` | string | CLI `--voice` | Voice name (required if not set via CLI `--voice`) |
+| `speed` | float | CLI `--speed` (1.0) | Synthesis speed multiplier |
+| `mode` | string | CLI `--mode` (`adaptative`) | `adaptative` (fast TTFB, dynamic chunk sizing) or `long_form` (larger chunks, better prosody) |
+| `format` | string | `pcm` | Output format: `pcm` (raw float32 stream), `wav` (complete WAV file), or `ogg` (Ogg/Opus stream) |
+| `prebuffer_chunks` | int | `0` | For `ogg` format: number of server-side Ogg synthesis chunks to buffer before starting playback |
+| `first_chunk_target_tokens` | int | preset default | Override the first-chunk token target to reduce TTFB (e.g., `50` for faster initial audio) |
+
+**Response formats:**
+
+- **PCM** (`format: pcm`): Raw float32 big-endian or native-endian PCM stream with `Transfer-Encoding: chunked` and `Content-Type: audio/pcm-f32le`
+- **WAV** (`format: wav`): Complete WAV file returned as a single response (server accumulates all chunks)
+- **Ogg/Opus** (`format: ogg`): Ogg/Opus stream with `Transfer-Encoding: chunked` and `Content-Type: audio/ogg`
+
+**Error responses:**
+
+| HTTP Status | Meaning |
+|---|---|
+| `400 Bad Request` | Invalid JSON, missing fields, unknown mode/format |
+| `405 Method Not Allowed` | Wrong HTTP method on `/tts` (POST required) |
+| `413 Payload Too Large` | Text exceeds 100,000 characters |
+| `501 Not Implemented` | Ogg/Opus not available in this build |
+| `503 Service Unavailable` | Model unloaded (idle timeout) and reload failed; or scheduler not configured |
 
 #### Python client (`tools/tts_client.py`)
 
@@ -299,6 +355,11 @@ All options:
 A multi-stage [Dockerfile](Dockerfile) is provided for building and running kokopop without local dependencies.
 The default image is CPU-only. A separate CUDA target builds against NVIDIA CUDA and uses
 `nvidia/cuda:13.2.1-runtime-ubuntu24.04` for the runtime image.
+
+> **⚠️ Performance note:** The pre-built Docker images use conservative SIMD flags. If your host
+> CPU lacks **AVX2** (x86_64/amd64) or **NEON** (ARM64), inference will fall back to slower
+> scalar code and may be noticeably slower. For best performance on older or embedded hardware,
+> build the image locally so CMake can detect and enable the appropriate SIMD instructions.
 
 ### Pre-built image (CPU)
 
