@@ -31,15 +31,15 @@ include(FetchContent)
 FetchContent_Declare(
   ggml
   GIT_REPOSITORY https://github.com/ggml-org/ggml.git
-  GIT_TAG        a056a26f508b6160438ddd8aabbc859d2a2e7a97
+  GIT_TAG        0ce7ad348a3151e1da9f65d962044546bcaad421
   GIT_SHALLOW    FALSE
   # Fix 4: dispatch CONV_TRANSPOSE_1D with 32 threads/group and simd_sum
   #         reduction, avoiding GPU watchdog on large generator dims.
   # Apply only when the patch still matches. This keeps re-configure
   # idempotent without leaving .rej files in FetchContent sources.
   # Fix 5 (CUDA): IM2COL crashes with "invalid argument" when OW exceeds 65535
-  #         (long vocoder sequences). Clamp grid Y dim and loop the kernel
-  #         over OW chunks of MAX_GRIDDIM_Z.
+  #         (long vocoder sequences). Merged upstream in GGML 0ce7ad3; the
+  #         patch is retained so older local fetches remain idempotent.
   # Note: Fix 3 (scalar NORM kernel) is now merged upstream in GGML a056a26.
   PATCH_COMMAND
     ${CMAKE_COMMAND} -DPATCH_FILE=${CMAKE_SOURCE_DIR}/patches/ggml-conv-transpose-1d-simd.patch -P ${CMAKE_SOURCE_DIR}/tools/apply_patch_if_needed.cmake
