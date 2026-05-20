@@ -5,13 +5,14 @@ A standalone C++ library and toolkit for running [Kokoro](https://github.com/hex
 ## Features
 
 - **Zero dependencies beyond libespeak-ng and ggml** — no Python, no heavy ML frameworks
-- **CPU inference** with configurable thread count
-- **Metal GPU backend** (macOS) for accelerated inference
-- **CUDA backend** (Linux/Windows) for accelerated inference on NVIDIA GPUs
-- **Vulkan backend** (Linux/Windows/macOS via MoltenVK) for portable GPU acceleration
+- **Inference backends**:
+  - **CPU** with configurable thread count
+  - **Metal GPU** (macOS)
+  - **CUDA** (Linux/Windows) on NVIDIA GPUs
+  - **Vulkan** (Linux/Windows/macOS via MoltenVK)
 - **Streaming API** for real-time audio generation
 - **Chunked synthesis** for long-form text processing
-- **WAV output** and optional direct playback (Core Audio on macOS)
+- **WAV, PCM (float32/s16), and Ogg/Opus audio output**
 - **Full C & C++ API** — usable from C, C++, Rust, Go, and other languages via FFI
 
 📊 See [Benchmarks](#benchmarks)
@@ -126,16 +127,6 @@ Synthesize text to a WAV file:
   --out hello.wav
 ```
 
-Synthesize and play directly (macOS):
-
-```bash
-./build/kokopop_say \
-  --model models/kokoro.gguf \
-  --voice af_heart \
-  --text "Hello world." \
-  --play
-```
-
 Generate audio from phonemes:
 
 ```bash
@@ -156,21 +147,6 @@ Adjust generation speed:
   --speed 1.5 \
   --out fast.wav
 ```
-
-### Audio playback
-
-The `kokopop_play` tool reads raw audio from stdin and plays it via Core Audio (macOS) or outputs PCM (other platforms):
-
-```bash
-# Pipe audio from kokopop_say directly to playback
-./build/kokopop_say \
-  --model models/kokoro.gguf \
-  --voice af_heart \
-  --text "Hello, world!" \
-  --play
-```
-
-See `kokopop_play --help` for format options (pcm-f32, pcm-s16, wav).
 
 ### Streaming mode
 
@@ -457,11 +433,10 @@ src/         — Source code
   synthesis/ — Phonemizer, text chunking, G2P (zh_g2p, pinyin), and main synthesis pipeline
   audio/     — Audio post-processing
   streaming/ — Streaming generation support
-  playback/  — Audio playback (stdout, Core Audio on macOS)
+  playback/  — Audio playback utilities
 tools/       — CLI tools
-  kokopop_say    — Synthesize text/phonemes to WAV or play directly
+  kokopop_say    — Synthesize text/phonemes to WAV, PCM, or Ogg/Opus
   kokopop_stream — STDIO streaming (stdin → stdout) and async HTTP server
-  kokopop_play   — Play raw audio from stdin
 tests/       — Unit and integration tests
 ```
 
