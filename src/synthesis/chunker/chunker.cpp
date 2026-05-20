@@ -560,12 +560,10 @@ void AdaptativeChunkController::observe(int n_tokens, double generation_ms, doub
     const double rtf = audio_ms > 0.0 ? generation_ms / audio_ms : 1.0;
 
     // Shrink when the buffer is critically low, OR when synthesis is losing
-    // ground (rtf > 1) and the buffer isn't already comfortable. Looking at
-    // rtf in addition to absolute lead lets us react one chunk earlier when
-    // generation slows down — otherwise we keep growing the cap until the
-    // buffer has already drained.
+    // ground (rtf > 1). Reacting regardless of current buffer depth lets us
+    // reduce chunk size before the buffer has already drained.
     const bool buffer_critical = lead < safety_floor_ms;
-    const bool losing_ground = rtf > 1.0 && lead < comfort_lead_ms;
+    const bool losing_ground = rtf > 1.0;
     if (buffer_critical || losing_ground) {
         const int shrunk = static_cast<int>(growth_max_tokens * shrink_factor);
         growth_max_tokens = std::max(min_tokens, shrunk);
