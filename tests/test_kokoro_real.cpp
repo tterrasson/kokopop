@@ -266,23 +266,19 @@ TEST_CASE("real_kokoro_cpu_vulkan_decoder_parity_long_input") {
 
     // Phrase 1 — triggered the decoder-chain aliasing (without the F0/N fix
     // it would still pass this case).
-    SUBCASE("decoder chain") {
-        const std::string phonemes =
-            "ˈA dˈɪɹ ɪmˈɜɹʤd fɹʌm ðə ʃˈædOz, pˈɔzɪŋ tə ɡlˈæns. ɪʦ ˈæmbəɹɹ ˈIz "
-            "mˈɛt mˈIn fəɹɹə hˈɑɹtbit, ðˈɛn ɪt flˈɛd. fˈɜɹðəɹɹ əhˈɛd, ən "
-            "əbˈændənd stˈOn kˈɑTɪʤ stˈʊd. vˈInz klˈAmd ðə ɹˈuf";
-        check_vulkan_long_input(*cpu_model, *vk_model, phonemes, "af_heart");
-    }
+    const std::string phonemes_decoder =
+        "ˈA dˈɪɹ ɪmˈɜɹʤd fɹʌm ðə ʃˈædOz, pˈɔzɪŋ tə ɡlˈæns. ɪʦ ˈæmbəɹɹ ˈIz "
+        "mˈɛt mˈIn fəɹɹə hˈɑɹtbit, ðˈɛn ɪt flˈɛd. fˈɜɹðəɹɹ əhˈɛd, ən "
+        "əbˈændənd stˈOn kˈɑTɪʤ stˈʊd. vˈInz klˈAmd ðə ɹˈuf";
+    check_vulkan_long_input(*cpu_model, *vk_model, phonemes_decoder, "af_heart");
 
     // Phrase 2 — additionally triggered the F0/N predictor-chain aliasing.
-    SUBCASE("F0/N predictor chain") {
-        const std::string phonemes =
-            "ðə wˈɪnd ɹˈʌsᵊld ðə ˈOld kˈɜɹtənz, ˈɛkOɪŋ sˈɔft lˈʌləbˌIz. "
-            "sˈʌnlIt fˈɪltəɹd θɹu kɹˈækt wˈɪndOz, kˈæstɪŋ pˈætəɹnz. "
-            "I fˈɛlt ə pɹəfˈWnd pˈis, æz ɪf tˈIm ɪʦˈɛlf sˈɔfənd. "
-            "ðə pˈæθ klˈImd stˈipəɹ, ɹᵻvˈilɪŋ ˈA vˈæli bᵻlˈO";
-        check_vulkan_long_input(*cpu_model, *vk_model, phonemes, "af_heart");
-    }
+    const std::string phonemes_f0 =
+        "ðə wˈɪnd ɹˈʌsᵊld ðə ˈOld kˈɜɹtənz, ˈɛkOɪŋ sˈɔft lˈʌləbˌIz. "
+        "sˈʌnlIt fˈɪltəɹd θɹu kɹˈækt wˈɪndOz, kˈæstɪŋ pˈætəɹnz. "
+        "I fˈɛlt ə pɹəfˈWnd pˈis, æz ɪf tˈIm ɪʦˈɛlf sˈɔfənd. "
+        "ðə pˈæθ klˈImd stˈipəɹ, ɹᵻvˈilɪŋ ˈA vˈæli bᵻlˈO";
+    check_vulkan_long_input(*cpu_model, *vk_model, phonemes_f0, "af_heart");
 }
 
 TEST_CASE("real_model_token_counts_consistency") {
