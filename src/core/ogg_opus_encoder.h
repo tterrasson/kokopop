@@ -1,7 +1,5 @@
 #pragma once
 
-#ifdef KOKOPOP_HAS_OPUS
-
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -57,5 +55,3 @@ private:
 };
 
 } // namespace kokopop
-
-#endif // KOKOPOP_HAS_OPUS

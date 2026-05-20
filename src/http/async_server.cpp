@@ -1,17 +1,15 @@
 #include "http/async_server.h"
 
+#include "http/http_response_writer.h"
 #include "http/http_server.h"  // for HttpRequest, HttpResponse, json_error
 #include "core/wav.h"
-#ifdef KOKOPOP_HAS_OPUS
-#  include "core/ogg_opus_encoder.h"
-#endif
 #include "yyjson.h"
 
 #include <algorithm>
+#include <cassert>
 #include <cstdio>
 #include <cstring>
 #include <sstream>
-#include <numeric>
 
 #ifdef _WIN32
   #include <winsock2.h>
@@ -346,6 +344,21 @@ void AsyncHttpServer::_event_loop() {
         // Drain output queue for streaming connections.
         // Collect fds to close after the loop to avoid iterator invalidation.
         std::vector<int> fds_to_close;
+
+        // Sweep for connections stuck in header/body reading past the idle timeout.
+        {
+            int64_t now = _now_ms();
+            for (auto & [fd, conn] : _connections) {
+                if ((conn.state == Connection::STATE_READING_HEADERS ||
+                     conn.state == Connection::STATE_READING_BODY) &&
+                    now - conn.last_activity_ms > CONN_IDLE_TIMEOUT_MS) {
+                    fds_to_close.push_back(fd);
+                }
+            }
+            for (int fd : fds_to_close) _close_connection(fd);
+            fds_to_close.clear();
+        }
+
         for (auto & [fd, conn] : _connections) {
             if (conn.state != Connection::STATE_STREAMING || !conn.req_ctx) continue;
 
@@ -361,85 +374,28 @@ void AsyncHttpServer::_event_loop() {
                                 rs == RequestContext::State::ERROR ||
                                 rs == RequestContext::State::CANCELLED);
 
-            // Drain all available chunks before pulling Ogg pages.
-            // Writing all chunks first then pulling once lets ffplay receive
-            // a coherent batch of pages covering the available audio instead
-            // of one tiny page per synthesis chunk.
-            bool ogg_has_writes = false;
             RequestContext::AudioChunk chunk;
-            while (conn.req_ctx->try_pop(chunk)) {
-                if (fmt == RequestContext::AudioFormat::PCM) {
-                    const char * p = reinterpret_cast<const char *>(chunk.samples.data());
-                    std::vector<char> raw(p, p + chunk.samples.size() * sizeof(float));
-                    _send_http_chunk(fd, conn, raw);
-                } else if (fmt == RequestContext::AudioFormat::OGG_OPUS) {
-#ifdef KOKOPOP_HAS_OPUS
-                    auto * req_ctx = conn.req_ctx.get();
-                    auto write_ogg_chunk = [req_ctx, &ogg_has_writes] (RequestContext::AudioChunk & audio_chunk) {
-                        req_ctx->opus_encoder->write(audio_chunk.samples.data(),
-                                                     static_cast<int>(audio_chunk.samples.size()));
-                        ogg_has_writes = true;
-                    };
-
-                    const int prebuffer_target = req_ctx->ogg_prebuffer_chunks;
-                    if (prebuffer_target > 0 && !req_ctx->ogg_prebuffer_released) {
-                        req_ctx->ogg_prebuffered_audio.push_back(std::move(chunk));
-                        const bool ready =
-                            static_cast<int>(req_ctx->ogg_prebuffered_audio.size()) >= prebuffer_target ||
-                            is_terminal;
-                        if (!ready) {
-                            continue;
-                        }
-                        for (auto & buffered : req_ctx->ogg_prebuffered_audio) {
-                            write_ogg_chunk(buffered);
-                        }
-                        req_ctx->ogg_prebuffered_audio.clear();
-                        req_ctx->ogg_prebuffer_released = true;
-                    } else {
-                        write_ogg_chunk(chunk);
+            while (conn.write_buffer.size() <= WRITE_BUFFER_HIGH_WATER &&
+                   conn.req_ctx->try_pop(chunk)) {
+                if (conn.stream_encoder) {
+                    std::vector<char> encoded;
+                    conn.stream_encoder->write(std::move(chunk), is_terminal, encoded);
+                    if (!encoded.empty()) {
+                        _send_http_chunk(fd, conn, encoded);
                     }
-#endif
                 } else {
                     auto & acc = conn.req_ctx->wav_accumulator;
                     acc.insert(acc.end(), chunk.samples.begin(), chunk.samples.end());
                 }
             }
-#ifdef KOKOPOP_HAS_OPUS
-            // Pull pages once, after all available chunks have been written.
-            // Do not force flush: ope_encoder_get_page(flush=1) is a muxer-level
-            // flush that only emits complete Opus frames. Samples that don't fill
-            // a full 20 ms frame stay in the Opus encoder buffer and would be
-            // silently dropped, causing audible truncation of the first chunk.
-            // With MUXING_DELAY=40 ms the natural page cadence is fast enough.
-            if (ogg_has_writes) {
-                auto & enc = *conn.req_ctx->opus_encoder;
-                enc.pull_pages(0);
-                if (enc.has_pending()) {
-                    auto pages = enc.take_pending();
-                    std::vector<char> raw(pages.begin(), pages.end());
-                    _send_http_chunk(fd, conn, raw);
-                }
-            }
-#endif
 
             if (is_terminal && conn.write_buffer.empty()) {
-                if (fmt == RequestContext::AudioFormat::PCM) {
-                    _send_final_chunk(fd, conn);
-                    if (rs == RequestContext::State::CANCELLED) {
-                        fds_to_close.push_back(fd);
+                if (conn.stream_encoder) {
+                    std::vector<char> tail;
+                    conn.stream_encoder->finish(rs == RequestContext::State::DONE, tail);
+                    if (!tail.empty()) {
+                        _send_http_chunk(fd, conn, tail);
                     }
-                } else if (fmt == RequestContext::AudioFormat::OGG_OPUS) {
-#ifdef KOKOPOP_HAS_OPUS
-                    if (rs == RequestContext::State::DONE) {
-                        auto & enc = *conn.req_ctx->opus_encoder;
-                        enc.drain();
-                        if (enc.has_pending()) {
-                            auto pages = enc.take_pending();
-                            std::vector<char> raw(pages.begin(), pages.end());
-                            _send_http_chunk(fd, conn, raw);
-                        }
-                    }
-#endif
                     _send_final_chunk(fd, conn);
                     if (rs == RequestContext::State::CANCELLED) {
                         fds_to_close.push_back(fd);
@@ -483,8 +439,8 @@ void AsyncHttpServer::_handle_server_accept() {
 
     Connection conn;
     conn.fd = fd;
+    conn.last_activity_ms = _now_ms();
     conn.state = Connection::STATE_READING_HEADERS;
-    conn.read_buffer.reserve(4096);
     _connections[fd] = std::move(conn);
 }
 
@@ -506,114 +462,31 @@ void AsyncHttpServer::_handle_connection_read(int fd, Connection & conn) {
         return;
     }
 
-    conn.read_buffer.append(buf, static_cast<size_t>(n));
+    conn.last_activity_ms = _now_ms();
+    conn.parser.append(buf, static_cast<size_t>(n));
+    _process_pending_requests(fd, conn);
+}
 
-    if (conn.read_buffer.size() > MAX_HEADER_SIZE + MAX_BODY_SIZE) {
-        _send_error(fd, conn, 413, "Payload Too Large", json_error("Request too large"));
-        _close_connection(fd);
-        return;
-    }
-
-    // ---- Parse headers ----
-    if (conn.state == Connection::STATE_READING_HEADERS) {
-        auto hdr_end = conn.read_buffer.find("\r\n\r\n");
-        if (hdr_end == std::string::npos) return; // Wait for more data
-
-        // Parse request
-        std::string hdr_data(conn.read_buffer.begin(),
-                            conn.read_buffer.begin() + static_cast<ptrdiff_t>(hdr_end));
-
-        auto line_end = hdr_data.find("\r\n");
-        if (line_end == std::string::npos) {
-            _send_error(fd, conn, 400, "Bad Request", json_error("Malformed request"));
-            _close_connection(fd);
+void AsyncHttpServer::_process_pending_requests(int fd, Connection & conn) {
+    while (conn.state == Connection::STATE_READING_HEADERS ||
+           conn.state == Connection::STATE_READING_BODY) {
+        auto parsed = conn.parser.next();
+        if (parsed.status == AsyncHttpParseResult::Status::NeedMore) return;
+        if (parsed.status == AsyncHttpParseResult::Status::Error) {
+            conn.keep_alive = false;
+            conn.close_after_write = true;
+            _send_error(fd, conn, parsed.status_code, parsed.status_text,
+                        json_error(parsed.error_message));
             return;
         }
 
-        std::string req_line = hdr_data.substr(0, line_end);
-        std::string method, path, qs;
-        if (!_parse_request_line(req_line, method, path, qs)) {
-            _send_error(fd, conn, 400, "Bad Request", json_error("Malformed request line"));
-            _close_connection(fd);
-            return;
-        }
-
-        // Parse headers
-        std::string hdr_block = hdr_data.substr(line_end + 2);
-        std::istringstream iss(hdr_block);
-        std::string line;
-        while (std::getline(iss, line)) {
-            if (!line.empty() && line.back() == '\r') line.pop_back();
-            if (line.empty()) continue;
-            size_t colon = line.find(':');
-            if (colon == std::string::npos || colon == 0) continue;
-            std::string key = line.substr(0, colon);
-            std::string val = line.substr(colon + 1);
-            while (!val.empty() && (val.front() == ' ' || val.front() == '\t')) val.erase(val.begin());
-            std::transform(key.begin(), key.end(), key.begin(), ::tolower);
-            conn.request.headers[key] = val;
-        }
-
-        conn.request.method = std::move(method);
-        conn.request.path = std::move(path);
-        conn.request.query_string = std::move(qs);
-        conn.request.content_length = -1;
-
-        // Determine body size
-        auto cl_it = conn.request.headers.find("content-length");
-        if (cl_it != conn.request.headers.end()) {
-            try {
-                long long cl = std::stoll(cl_it->second);
-                if (cl < 0 || cl > static_cast<long long>(MAX_BODY_SIZE)) {
-                    _send_error(fd, conn, 413, "Payload Too Large", json_error("Body too large"));
-                    _close_connection(fd);
-                    return;
-                }
-                conn.content_length = static_cast<int>(cl);
-            } catch (...) {
-                _send_error(fd, conn, 400, "Bad Request", json_error("Invalid Content-Length"));
-                _close_connection(fd);
-                return;
-            }
-            conn.request.content_length = conn.content_length;
-        }
-
-        // Check if body is already in the buffer
-        size_t body_start = hdr_end + 4;
-        if (conn.content_length > 0) {
-            size_t avail = conn.read_buffer.size() - body_start;
-            if (avail >= static_cast<size_t>(conn.content_length)) {
-                // Full body available
-                conn.request.body.assign(conn.read_buffer.begin() + static_cast<ptrdiff_t>(body_start),
-                                        conn.read_buffer.begin() + static_cast<ptrdiff_t>(body_start) + conn.content_length);
-                conn.read_buffer.clear();
-                conn.state = Connection::STATE_PROCESSING;
-                _dispatch_request(fd, conn);
-            } else {
-                // Need more body data
-                conn.state = Connection::STATE_READING_BODY;
-                conn.body_bytes_read = avail;
-                // Trim header data from buffer, keep body data
-                if (avail > 0) {
-                    conn.read_buffer.erase(0, static_cast<size_t>(body_start));
-                } else {
-                    conn.read_buffer.clear();
-                }
-            }
-        } else {
-            // No body
-            conn.read_buffer.clear();
-            conn.state = Connection::STATE_PROCESSING;
-            _dispatch_request(fd, conn);
-        }
-    } else if (conn.state == Connection::STATE_READING_BODY) {
-        conn.body_bytes_read += static_cast<size_t>(n);
-        if (conn.body_bytes_read >= static_cast<size_t>(conn.content_length)) {
-            conn.request.body.assign(conn.read_buffer.begin(), conn.read_buffer.end());
-            conn.read_buffer.clear();
-            conn.state = Connection::STATE_PROCESSING;
-            _dispatch_request(fd, conn);
-        }
+        conn.request = std::move(parsed.request);
+        conn.keep_alive = parsed.keep_alive;
+        conn.close_after_write = !parsed.keep_alive;
+        conn.state = Connection::STATE_PROCESSING;
+        _dispatch_request(fd, conn);
+        if (_connections.find(fd) == _connections.end()) return;
+        if (conn.state != Connection::STATE_READING_HEADERS) return;
     }
 }
 
@@ -625,7 +498,11 @@ void AsyncHttpServer::_handle_connection_write(int fd, Connection & conn) {
     if (n > 0) {
         conn.write_buffer.erase(0, static_cast<size_t>(n));
         if (conn.write_buffer.empty() && conn.state != Connection::STATE_STREAMING) {
-            _close_connection(fd);
+            if (conn.close_after_write || !conn.keep_alive) {
+                _close_connection(fd);
+            } else {
+                _prepare_next_request(fd, conn);
+            }
         }
     } else if (n < 0) {
 #ifndef _WIN32
@@ -647,6 +524,13 @@ void AsyncHttpServer::_dispatch_request(int fd, Connection & conn) {
         if (req.method != "POST") {
             _send_error(fd, conn, 405, "Method Not Allowed",
                         json_error("POST required"));
+            return;
+        }
+
+        if (req.headers.find("content-length") == req.headers.end() &&
+            req.headers.find("transfer-encoding") == req.headers.end()) {
+            _send_error(fd, conn, 411, "Length Required",
+                        json_error("Content-Length or Transfer-Encoding: chunked required"));
             return;
         }
 
@@ -722,6 +606,19 @@ void AsyncHttpServer::_dispatch_request(int fd, Connection & conn) {
             std::string fs(fmt_str);
             if (fs == "wav")      fmt = RequestContext::AudioFormat::WAV;
             else if (fs == "ogg") fmt = RequestContext::AudioFormat::OGG_OPUS;
+            else {
+                yyjson_doc_free(doc);
+                _send_error(fd, conn, 400, "Bad Request",
+                            json_error(std::string("Unknown format: ") + fs));
+                return;
+            }
+        }
+
+        if (!http_audio_format_available(fmt)) {
+            yyjson_doc_free(doc);
+            _send_error(fd, conn, 501, "Not Implemented",
+                        json_error("Ogg/Opus output is not available in this build"));
+            return;
         }
 
         if (!voice || std::string(voice).empty()) {
@@ -790,17 +687,24 @@ void AsyncHttpServer::_dispatch_request(int fd, Connection & conn) {
     if (it == _routes.end()) {
         if (_default_handler) {
             HttpResponse res;
-            _default_handler(req, res);
+            bool keep = _default_handler(req, res);
+            if (!keep) {
+                conn.keep_alive = false;
+                conn.close_after_write = true;
+            }
             _send_response(fd, conn, res);
         } else {
             _send_error(fd, conn, 404, "Not Found", json_error("not_found"));
-            _close_connection(fd);
         }
         return;
     }
 
     HttpResponse res;
-    it->second(req, res);
+    bool keep = it->second(req, res);
+    if (!keep) {
+        conn.keep_alive = false;
+        conn.close_after_write = true;
+    }
     _send_response(fd, conn, res);
 }
 
@@ -810,27 +714,16 @@ void AsyncHttpServer::_dispatch_request(int fd, Connection & conn) {
 
 void AsyncHttpServer::_send_response(int fd, Connection & conn,
                                      const HttpResponse & res) {
-    std::ostringstream oss;
-    oss << "HTTP/1.1 " << res.status_code << " " << res.status_text << "\r\n";
-
-    for (auto & [key, val] : res.headers) {
-        oss << key << ": " << val << "\r\n";
+    auto conn_header = res.headers.find("Connection");
+    if (conn_header == res.headers.end()) {
+        conn_header = res.headers.find("connection");
     }
-
-    bool has_cl = false;
-    for (auto & [k, v] : res.headers) {
-        std::string lk = k;
-        std::transform(lk.begin(), lk.end(), lk.begin(), ::tolower);
-        if (lk == "content-length") { has_cl = true; break; }
+    if (conn_header != res.headers.end() &&
+        http_header_value_has_token(conn_header->second, "close")) {
+        conn.keep_alive = false;
+        conn.close_after_write = true;
     }
-    if (!has_cl) {
-        oss << "Content-Length: " << res.body.size() << "\r\n";
-    }
-
-    oss << "Server: kokopop-async/0.1\r\n";
-    oss << "\r\n";
-
-    conn.write_buffer = oss.str();
+    conn.write_buffer = build_http_response_head(res, conn.keep_alive && !conn.close_after_write);
     conn.write_buffer.insert(conn.write_buffer.end(),
                             res.body.begin(), res.body.end());
     conn.state = Connection::STATE_WRITING;
@@ -840,37 +733,22 @@ void AsyncHttpServer::_send_streaming_response(int fd, Connection & conn,
                                                 std::shared_ptr<RequestContext> ctx) {
     conn.req_ctx = std::move(ctx);
     conn.was_streaming = true;
+    conn.close_after_write = true;
+    conn.keep_alive = false;
     _active_streams.fetch_add(1);
     auto fmt = conn.req_ctx->format;
 
-    if (fmt == RequestContext::AudioFormat::PCM) {
-        std::ostringstream oss;
-        oss << "HTTP/1.1 200 OK\r\n";
-        oss << "Transfer-Encoding: chunked\r\n";
-        oss << "Content-Type: application/octet-stream\r\n";
-        oss << "Server: kokopop-async/0.1\r\n";
-        oss << "\r\n";
-        conn.write_buffer = oss.str();
-    } else if (fmt == RequestContext::AudioFormat::OGG_OPUS) {
-#ifdef KOKOPOP_HAS_OPUS
-        conn.req_ctx->opus_encoder =
-            std::make_unique<kokopop::OggOpusEncoder>(conn.req_ctx->sample_rate);
-        conn.req_ctx->opus_encoder->flush_header();
-#endif
-        std::ostringstream oss;
-        oss << "HTTP/1.1 200 OK\r\n";
-        oss << "Transfer-Encoding: chunked\r\n";
-        oss << "Content-Type: audio/ogg\r\n";
-        oss << "Server: kokopop-async/0.1\r\n";
-        oss << "\r\n";
-        conn.write_buffer = oss.str();
-#ifdef KOKOPOP_HAS_OPUS
-        if (conn.req_ctx->opus_encoder->has_pending()) {
-            auto pages = conn.req_ctx->opus_encoder->take_pending();
-            std::vector<char> raw(pages.begin(), pages.end());
-            _send_http_chunk(fd, conn, raw);
+    if (fmt == RequestContext::AudioFormat::PCM ||
+        fmt == RequestContext::AudioFormat::OGG_OPUS) {
+        conn.stream_encoder = make_http_audio_stream_encoder(
+            fmt, conn.req_ctx->sample_rate, conn.req_ctx->ogg_prebuffer_chunks);
+        assert(conn.stream_encoder && "encoder should be available — checked by http_audio_format_available");
+        conn.write_buffer = build_streaming_response_head(conn.stream_encoder->content_type());
+        std::vector<char> initial;
+        conn.stream_encoder->start(initial);
+        if (!initial.empty()) {
+            _send_http_chunk(fd, conn, initial);
         }
-#endif
     }
     // WAV mode: no headers yet — they are sent with the complete file in _send_wav_response
     conn.state = Connection::STATE_STREAMING;
@@ -890,6 +768,7 @@ void AsyncHttpServer::_send_wav_response(int fd, Connection & conn) {
     oss << "Content-Type: audio/wav\r\n";
     oss << "Content-Length: " << wav.size() << "\r\n";
     oss << "Server: kokopop-async/0.1\r\n";
+    oss << "Connection: close\r\n";
     oss << "\r\n";
 
     conn.write_buffer = oss.str();
@@ -901,15 +780,14 @@ void AsyncHttpServer::_send_wav_response(int fd, Connection & conn) {
 
 void AsyncHttpServer::_send_http_chunk(int fd, Connection & conn,
                                        const std::vector<char> & data) {
-    std::ostringstream hdr;
-    hdr << std::hex << data.size() << "\r\n";
-    conn.write_buffer.append(hdr.str());
-    conn.write_buffer.insert(conn.write_buffer.end(), data.begin(), data.end());
-    conn.write_buffer.append("\r\n");
+    (void)fd;
+    append_http_chunk(conn.write_buffer, data);
 }
 
 void AsyncHttpServer::_send_final_chunk(int fd, Connection & conn) {
-    conn.write_buffer.append("0\r\n\r\n");
+    (void)fd;
+    append_final_http_chunk(conn.write_buffer);
+    conn.close_after_write = true;
     conn.state = Connection::STATE_WRITING;
 }
 
@@ -919,7 +797,6 @@ void AsyncHttpServer::_send_error(int fd, Connection & conn,
     HttpResponse res;
     res.status_code = status_code;
     res.status_text = status_text;
-    res.headers["Server"] = "kokopop-async/0.1";
     res.body.insert(res.body.end(), error_json.begin(), error_json.end());
     res.set_content_type("application/json");
     _send_response(fd, conn, res);
@@ -929,7 +806,10 @@ void AsyncHttpServer::_close_connection(int fd) {
     auto it = _connections.find(fd);
     if (it != _connections.end()) {
         if (it->second.was_streaming) {
-            _active_streams.fetch_sub(1);
+            int current = _active_streams.load();
+            while (current > 0 &&
+                   !_active_streams.compare_exchange_weak(current, current - 1)) {
+            }
             _last_activity_ms.store(_now_ms());
         }
         if (it->second.fd >= 0) async_socket::close_fd(it->second.fd);
@@ -937,27 +817,16 @@ void AsyncHttpServer::_close_connection(int fd) {
     }
 }
 
-bool AsyncHttpServer::_parse_request_line(const std::string & request_line,
-                                          std::string & method,
-                                          std::string & path,
-                                          std::string & query_string) {
-    size_t space1 = request_line.find(' ');
-    size_t space2 = request_line.rfind(' ');
-    if (space1 == std::string::npos || space2 == std::string::npos || space1 == space2) {
-        return false;
+void AsyncHttpServer::_prepare_next_request(int fd, Connection & conn) {
+    conn.request = HttpRequest{};
+    conn.req_ctx.reset();
+    conn.stream_encoder.reset();
+    conn.keep_alive = false;
+    conn.close_after_write = false;
+    conn.state = Connection::STATE_READING_HEADERS;
+    if (!conn.parser.empty()) {
+        _process_pending_requests(fd, conn);
     }
-
-    method = request_line.substr(0, space1);
-    std::string path_and_query = request_line.substr(space1 + 1, space2 - space1 - 1);
-    size_t qmark = path_and_query.find('?');
-    if (qmark != std::string::npos) {
-        path = path_and_query.substr(0, qmark);
-        query_string = path_and_query.substr(qmark + 1);
-    } else {
-        path = path_and_query;
-        query_string.clear();
-    }
-    return true;
 }
 
 } // namespace kokopop

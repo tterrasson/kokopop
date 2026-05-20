@@ -346,7 +346,10 @@ if(KOKOPOP_BUILD_TOOLS)
   # Streaming tool (stdio + HTTP server)
   add_executable(kokopop_stream
     tools/kokopop_stream.cpp
+    src/http/async_http_parser.cpp
     src/http/http_server.cpp
+    src/http/http_response_writer.cpp
+    src/http/http_audio_stream_encoder.cpp
     src/http/async_server.cpp
     src/http/synthesis_scheduler.cpp
   )
@@ -415,6 +418,9 @@ if(KOKOPOP_BUILD_TESTS)
   enable_testing()
   add_executable(kokopop_tests
     tests/test_main.cpp
+    src/http/async_http_parser.cpp
+    src/http/http_audio_stream_encoder.cpp
+    src/http/http_response_writer.cpp
     src/http/synthesis_scheduler.cpp
   )
   target_include_directories(kokopop_tests PRIVATE

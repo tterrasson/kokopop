@@ -1,5 +1,7 @@
 #pragma once
 
+#include "http/async_http_parser.h"
+#include "http/http_audio_stream_encoder.h"
 #include "http/request_context.h"
 #include "http/synthesis_scheduler.h"
 #include "http/http_server.h"  // for HttpRequest, HttpResponse, json_error, RequestHandler
@@ -98,14 +100,31 @@ public:
     void set_idle_unload(int idle_seconds, ModelReloadFn reload_fn, ModelUnloadFn unload_fn);
 
 private:
+    // Maximum connections
+    static constexpr int MAX_CONNECTIONS = 64;
+
+    // Maximum header size
+    static constexpr size_t MAX_HEADER_SIZE = 64 * 1024;
+
+    // Maximum body size
+    static constexpr size_t MAX_BODY_SIZE = 16 * 1024 * 1024;
+
+    // Idle connection timeout (headers/body not fully received)
+    static constexpr int64_t CONN_IDLE_TIMEOUT_MS = 30000;
+
+    // write_buffer high-water mark: stop draining audio chunks when exceeded
+    static constexpr size_t WRITE_BUFFER_HIGH_WATER = 256 * 1024;
+
     struct Connection {
         int fd = -1;
-        std::string read_buffer;
+        int64_t last_activity_ms = 0;
+        AsyncHttpRequestParser parser{MAX_HEADER_SIZE, MAX_BODY_SIZE};
         HttpRequest request;
-        bool request_complete{false};
+        bool keep_alive = false;
+        bool close_after_write = false;
         std::shared_ptr<RequestContext> req_ctx{nullptr};
+        std::unique_ptr<HttpAudioStreamEncoder> stream_encoder;
         std::string write_buffer;
-        bool write_in_progress{false};
         bool was_streaming = false; // set on streaming start, used to update _active_streams on close
 
         enum {
@@ -116,10 +135,6 @@ private:
             STATE_WRITING,
             STATE_STREAMING  // Writing chunks as they become available
         } state = STATE_IDLE;
-
-        // For body reading
-        int content_length = -1;
-        size_t body_bytes_read = 0;
     };
 
     void _event_loop();
@@ -127,6 +142,7 @@ private:
     void _handle_server_accept();
     void _handle_connection_read(int fd, Connection & conn);
     void _handle_connection_write(int fd, Connection & conn);
+    void _process_pending_requests(int fd, Connection & conn);
     void _dispatch_request(int fd, Connection & conn);
     void _send_response(int fd, Connection & conn, const HttpResponse & res);
     void _send_http_chunk(int fd, Connection & conn, const std::vector<char> & data);
@@ -138,9 +154,7 @@ private:
                      const std::string & status_text,
                      const std::string & error_json);
     void _close_connection(int fd);
-
-    bool _parse_request_line(const std::string & request_line, std::string & method,
-                             std::string & path, std::string & query_string);
+    void _prepare_next_request(int fd, Connection & conn);
 
     static int64_t _now_ms() {
         return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -178,14 +192,6 @@ private:
     std::condition_variable _idle_cv;
     std::mutex              _idle_cv_mutex;
 
-    // Maximum connections
-    static constexpr int MAX_CONNECTIONS = 64;
-
-    // Maximum header size
-    static constexpr size_t MAX_HEADER_SIZE = 64 * 1024;
-
-    // Maximum body size
-    static constexpr size_t MAX_BODY_SIZE = 16 * 1024 * 1024;
 };
 
 // Inline helpers for platform portability

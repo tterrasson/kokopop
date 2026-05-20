@@ -2,10 +2,6 @@
 
 #include "streaming/streaming.h"
 
-#ifdef KOKOPOP_HAS_OPUS
-#  include "core/ogg_opus_encoder.h"
-#endif
-
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -128,15 +124,8 @@ struct RequestContext {
     // ----------------------------------------------------------------
     std::vector<float> wav_accumulator;
 
-    // ----------------------------------------------------------------
-    // Ogg/Opus encoder (for format=ogg, owned by event loop thread)
-    // ----------------------------------------------------------------
+    // Ogg/Opus prebuffer configuration (encoder is owned by the HTTP loop)
     int ogg_prebuffer_chunks = 0;
-    bool ogg_prebuffer_released = false;
-    std::vector<AudioChunk> ogg_prebuffered_audio;
-#ifdef KOKOPOP_HAS_OPUS
-    std::unique_ptr<kokopop::OggOpusEncoder> opus_encoder;
-#endif
 
     // ----------------------------------------------------------------
     // Error reporting
