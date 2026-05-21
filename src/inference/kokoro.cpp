@@ -236,6 +236,18 @@ bool run_kokoro_frontend_probe(
     ggml_set_input(token_ids);
     ggml_set_input(pos_ids);
 
+    // Snapshot the last leaf tensor before any frontend compute op. After
+    // building the graph, every op created since this snapshot will be pinned
+    // to the CPU sub-backend on GPU backends with fp16 drift (MoltenVK). The
+    // entire frontend (Albert encoder + bert_encoder + duration_encoder +
+    // predictor.lstm) runs on CPU, making the output (probe.hidden,
+    // probe.durations) bit-identical with the pure-CPU path. The
+    // generation/generator graphs remain on GPU.
+    ggml_tensor * pin_snapshot = nullptr;
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        pin_snapshot = t;
+    }
+
     ggml_tensor * cur = ggml_add(ctx, ggml_get_rows(ctx, word, token_ids), ggml_get_rows(ctx, pos, pos_ids));
 
     ggml_tensor * type_zero = ggml_view_2d(ctx, type, type->ne[0], 1, type->nb[1], 0);
@@ -303,6 +315,40 @@ bool run_kokoro_frontend_probe(
     if (dur_hidden == nullptr) {
         ggml_free(ctx);
         return false;
+    }
+
+    // Walk every op created since pin_snapshot (covers the whole frontend:
+    // Albert encoder + bert_encoder + duration_encoder + predictor.lstm) and
+    // pin each compute op to the CPU sub-backend. No-op on backends without
+    // fp16 drift. Skip pure metadata ops (view/reshape/permute/transpose) —
+    // they share storage with view_src and ggml-sched can't relocate them.
+    {
+        ggml_tensor * first_new = pin_snapshot != nullptr
+            ? ggml_get_next_tensor(ctx, pin_snapshot)
+            : ggml_get_first_tensor(ctx);
+        // Pin "amplifier" ops to the CPU sub-backend on GPU backends with fp16
+        // drift (MoltenVK). Layer norm divides by sqrt(variance) and explodes
+        // for near-zero variance, magnifying tiny fp16 noise into audible
+        // deformation in the decoder (observed for af_bella). Softmax can drift
+        // independently but does not amplify, so it stays on GPU by default —
+        // set KOKOPOP_VULKAN_PIN_STRICT=1 to pin it too for bit-identical
+        // outputs across backends (slower, ~10x more ops on CPU).
+        static const bool strict_pin = std::getenv("KOKOPOP_VULKAN_PIN_STRICT") != nullptr;
+        for (ggml_tensor * t = first_new; t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            switch (t->op) {
+                case GGML_OP_NORM:
+                case GGML_OP_RMS_NORM:
+                    model.backend->defer_cpu_assignment(t);
+                    break;
+                case GGML_OP_SOFT_MAX:
+                    if (strict_pin) {
+                        model.backend->defer_cpu_assignment(t);
+                    }
+                    break;
+                default:
+                    break;
+            }
+        }
     }
 
     // Stop the graph at dur_hidden and run the final duration projection +
@@ -418,7 +464,8 @@ bool run_kokoro_frontend_probe(
     if (const char * dump_dir = std::getenv("KOKOPOP_DUMP_DIR")) {
         auto dump = [&](const char * name, const float * data, size_t n) {
             char path[1024];
-            std::snprintf(path, sizeof(path), "%s/front_%s.bin", dump_dir, name);
+            std::snprintf(path, sizeof(path), "%s/front_%s_n%lld.bin",
+                          dump_dir, name, static_cast<long long>(n_tokens));
             if (FILE * f = std::fopen(path, "wb")) {
                 std::fwrite(data, sizeof(float), n, f);
                 std::fclose(f);
@@ -528,6 +575,16 @@ bool run_kokoro_generation_probe(
     ggml_set_input(token_ids);
     ggml_set_input(duration_pred);
     ggml_set_input(duration_mask);
+
+    // Snapshot the last leaf tensor before any generation compute op. After
+    // building the graph, every op created since this snapshot will be pinned
+    // to the CPU sub-backend on backends with fp16 drift (MoltenVK). This
+    // covers the predictor.shared LSTM + F0/N predictors + text_encoder +
+    // decoder chain. The generator (vocoder) graph remains on GPU.
+    ggml_tensor * pin_snapshot = nullptr;
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        pin_snapshot = t;
+    }
 
     if (!build_duration_mask(durations, total_frames, n_tokens, model.tmp_mask_f32, error)) {
         ggml_free(ctx);
@@ -680,6 +737,31 @@ bool run_kokoro_generation_probe(
         std::fprintf(stderr, "[gen-profile] n_nodes=%d build=%.1fms\n", ggml_graph_n_nodes(gf), t_build / 1000.0);
     }
 
+    // Pin every compute op of the generation graph to the CPU sub-backend on
+    // GPU backends with fp16 drift. Skip metadata ops (view/reshape/permute/
+    // transpose) and leaves — sched can't relocate views and these have no
+    // numerical impact. The vocoder/generator graph downstream remains on GPU.
+    {
+        ggml_tensor * first_new = pin_snapshot != nullptr
+            ? ggml_get_next_tensor(ctx, pin_snapshot)
+            : ggml_get_first_tensor(ctx);
+        for (ggml_tensor * t = first_new; t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            // Only pin "amplifier" ops where small fp16 drift in the input
+            // gets magnified — layer norm divides by sqrt(variance) which
+            // explodes for near-zero variance, and softmax can saturate.
+            // Linear ops (MUL_MAT/ADD/MUL) are stable; MUL_MAT already has
+            // fp32 accumulation forced via mul_mat_set_prec. Keep them on GPU.
+            switch (t->op) {
+                case GGML_OP_NORM:
+                case GGML_OP_RMS_NORM:
+                    model.backend->defer_cpu_assignment(t);
+                    break;
+                default:
+                    break;
+            }
+        }
+    }
+
     model.backend->sched_reset();
 
     t0 = gen_profile ? ggml_time_us() : 0;
@@ -766,7 +848,8 @@ bool run_kokoro_generation_probe(
     if (const char * dump_dir = std::getenv("KOKOPOP_DUMP_DIR")) {
         auto dump = [&](const char * name, const std::vector<float> & v) {
             char path[1024];
-            std::snprintf(path, sizeof(path), "%s/gen_%s.bin", dump_dir, name);
+            std::snprintf(path, sizeof(path), "%s/gen_%s_n%lld.bin",
+                          dump_dir, name, static_cast<long long>(n_tokens));
             if (FILE * f = std::fopen(path, "wb")) {
                 std::fwrite(v.data(), sizeof(float), v.size(), f);
                 std::fclose(f);

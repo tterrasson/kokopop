@@ -28,6 +28,7 @@ class VulkanBackend final : public Backend {
     bool env_log_sched_ = false;
     bool env_op_trace_ = false;
     std::vector<PendingInit> pending_inits_;
+    std::vector<ggml_tensor *> cpu_assignments_;
 
     bool ensure_scheduler(ggml_cgraph * graph) {
         GGML_ASSERT(graph != nullptr);
@@ -231,11 +232,39 @@ public:
             ggml_backend_sched_set_eval_callback(sched_, eval_trace_cb, sched_);
         }
 
+        // Pin deferred tensors to the CPU sub-backend BEFORE sched plans its
+        // splits. Used to escape MoltenVK fp16 drift on precision-critical ops
+        // (e.g. duration predictor chain).
+        if (!cpu_assignments_.empty()) {
+            size_t verified_cpu = 0;
+            for (ggml_tensor * t : cpu_assignments_) {
+                if (t != nullptr) {
+                    ggml_backend_sched_set_tensor_backend(sched_, t, cpu_backend_);
+                    ggml_backend_t got = ggml_backend_sched_get_tensor_backend(sched_, t);
+                    if (got == cpu_backend_) {
+                        ++verified_cpu;
+                    }
+                }
+            }
+            if (env_log_sched_) {
+                std::fprintf(stderr, "[vulkan-sched] pinned %zu tensors → %zu confirmed on CPU\n",
+                             cpu_assignments_.size(), verified_cpu);
+                std::fflush(stderr);
+            }
+        }
+        cpu_assignments_.clear();
+
         const bool ok = ggml_backend_sched_alloc_graph(sched_, graph);
         if (ok) {
             log_sched_sizes("alloc");
         }
         return ok;
+    }
+
+    void defer_cpu_assignment(ggml_tensor * tensor) override {
+        if (tensor != nullptr) {
+            cpu_assignments_.push_back(tensor);
+        }
     }
 
     void clear_pending_inits() override {

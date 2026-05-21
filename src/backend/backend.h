@@ -48,6 +48,13 @@ struct Backend {
     // Returns false on error.
     virtual bool apply_pending_inits() = 0;
 
+    // Hint the scheduler that `tensor` should be computed on the CPU sub-
+    // backend. Used to pin precision-critical ops (e.g. the duration predictor
+    // LSTM) to CPU on GPU backends that exhibit fp16 drift (MoltenVK). Default
+    // no-op for backends without a CPU fallback. Must be called between graph
+    // build and sched_alloc_graph(); applied lazily on next alloc.
+    virtual void defer_cpu_assignment(ggml_tensor * tensor) { (void)tensor; }
+
     // ---- Graph execution ----
 
     // Execute the graph.
