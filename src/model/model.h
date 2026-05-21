@@ -156,6 +156,17 @@ struct Model {
     // Key = tensor logical name (e.g. "kokopop.text_encoder.lstm.bias_hh_l0").
     std::unordered_map<std::string, std::vector<float>> lstm_b_hh_f32;
 
+    // Host-side dequantized copies of the duration projection weights. The
+    // final dur_logits = duration_w * dur_hidden + duration_b matmul is run on
+    // CPU so the rounding behaviour of duration_to_frames() is identical
+    // across backends — Vulkan/MoltenVK fp16 drift was flipping token
+    // durations near k+0.5 boundaries and desynchronising the prosody.
+    // Lazily populated on first frontend probe call.
+    std::vector<float> duration_proj_w_f32;
+    std::vector<float> duration_proj_b_f32;
+    int64_t            duration_proj_in  = 0;  // hidden dim (= duration_w->ne[0])
+    int64_t            duration_proj_out = 0;  // n_buckets (= duration_w->ne[1])
+
     // Scratch storage for LstmCustomParams instances built during graph
     // construction.  Reserve 24 slots before building the generation graph
     // (12 LSTM directions × safety margin) so no reallocation occurs and

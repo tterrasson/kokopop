@@ -305,27 +305,35 @@ bool run_kokoro_frontend_probe(
         return false;
     }
 
-    // Stop at dur_logits and finish sigmoid+sum_rows on host. The GPU result of
-    // sum_rows(sigmoid(logits)) is off by ~1e-3 vs CPU on Vulkan/MoltenVK, and
-    // duration_to_frames() rounds via std::lrint — when a token's predicted
-    // duration sits near k+0.5, the two backends round to different ints,
-    // shifting total_frames by a few frames and desynchronising the entire
-    // downstream pipeline (audible as "deformed voice" with timing drift).
-    // Doing the final reduction on host is identical across backends.
-    ggml_tensor * dur_logits = linear(ctx, duration_w, duration_b, dur_hidden);
-    dur_logits = ggml_cont(ctx, dur_logits);
+    // Stop the graph at dur_hidden and run the final duration projection +
+    // sigmoid + sum_rows on host. The GPU matmul + sum_rows(sigmoid(logits))
+    // is off by ~1e-3 vs CPU on Vulkan/MoltenVK, and duration_to_frames()
+    // rounds via std::lrint — when a token's predicted duration sits near
+    // k+0.5, the backends round to different ints, shifting total_frames by
+    // a few frames and desynchronising the entire downstream pipeline
+    // (audible as "deformed voice" with timing drift). Doing the projection
+    // on host (with duration_w/_b dequantized once and cached on Model)
+    // makes the result bit-identical across backends.
 
-    // Make host-read outputs explicit and materialized.
-    d = ggml_cont(ctx, d);
+    // Materialize both host-read outputs:
+    //   d           — duration encoder output, used as conditioning input by
+    //                  the generation graph (KokoroFrontendProbe::hidden)
+    //   dur_hidden  — predictor.lstm output, multiplied by duration_w on host
+    //                  to produce duration logits with bit-identical rounding
+    // dur_hidden must be a graph output (not just an intermediate) so the
+    // predictor.lstm stays anchored in the forward set; the per-LSTM
+    // queue_zero_tensor() in lstm_direction asserts otherwise.
+    d          = ggml_cont(ctx, d);
+    dur_hidden = ggml_cont(ctx, dur_hidden);
 
-    ggml_set_name(d, "kokopop_duration_hidden_probe");
-    ggml_set_name(dur_logits, "kokopop_duration_logits_probe");
+    ggml_set_name(d,          "kokopop_duration_hidden_probe");
+    ggml_set_name(dur_hidden, "kokopop_predictor_lstm_out");
     ggml_set_output(d);
-    ggml_set_output(dur_logits);
+    ggml_set_output(dur_hidden);
 
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, frontend_graph_size(n_tokens), false);
     ggml_build_forward_expand(gf, d);
-    ggml_build_forward_expand(gf, dur_logits);
+    ggml_build_forward_expand(gf, dur_hidden);
 
     model.backend->sched_reset();
     if (!model.backend->sched_alloc_graph(gf)) {
@@ -353,26 +361,53 @@ bool run_kokoro_frontend_probe(
         return false;
     }
 
-    const int64_t n_hidden = ggml_nelements(d);
-    const int64_t n_logits = ggml_nelements(dur_logits);
-    const int64_t n_buckets = dur_logits->ne[0];
+    const int64_t n_hidden    = ggml_nelements(d);
+    const int64_t hidden_dim  = d->ne[0];
+    const int64_t pred_dim    = dur_hidden->ne[0];
+    const int64_t n_dur_hidden = ggml_nelements(dur_hidden);
 
     probe.hidden.resize(static_cast<size_t>(n_hidden));
     probe.durations.resize(static_cast<size_t>(n_tokens));
     probe.n_tokens   = n_tokens;
-    probe.hidden_dim = d->ne[0];
+    probe.hidden_dim = hidden_dim;
 
     model.backend->tensor_get(d, probe.hidden.data(), 0, static_cast<size_t>(n_hidden) * sizeof(float));
 
-    std::vector<float> logits(static_cast<size_t>(n_logits));
-    model.backend->tensor_get(dur_logits, logits.data(), 0, logits.size() * sizeof(float));
+    std::vector<float> dur_hidden_host(static_cast<size_t>(n_dur_hidden));
+    model.backend->tensor_get(dur_hidden, dur_hidden_host.data(), 0, dur_hidden_host.size() * sizeof(float));
 
-    // pred_dur[t] = sum_k sigmoid(logits[k, t])   (k in [0, n_buckets))
+    // Lazily dequantize duration_w / duration_b once. ggml mul_mat convention:
+    // W shape [K, N], X shape [K, M] → output [N, M], with W stored col-major
+    // such that W_f32[k + K*n] is the weight from input k to output n.
+    if (model.duration_proj_w_f32.empty()) {
+        if (!tensor_to_f32(*model.backend, duration_w, model.duration_proj_w_f32) ||
+            !tensor_to_f32(*model.backend, duration_b, model.duration_proj_b_f32)) {
+            ggml_free(ctx);
+            error = "failed to dequantize duration projection weights";
+            return false;
+        }
+        model.duration_proj_in  = duration_w->ne[0];
+        model.duration_proj_out = duration_w->ne[1];
+    }
+    GGML_ASSERT(model.duration_proj_in == pred_dim &&
+                "duration_proj input dim mismatch vs predictor.lstm output");
+
+    const int64_t n_buckets = model.duration_proj_out;
+    const float * W = model.duration_proj_w_f32.data();
+    const float * B = model.duration_proj_b_f32.data();
+
+    // pred_dur[t] = sum_n sigmoid(bias[n] + sum_k W[k + K*n] * dur_hidden[k + K*t])
+    // Computed on host so duration rounding is bit-identical across backends.
     for (int64_t t = 0; t < n_tokens; ++t) {
+        const float * h = dur_hidden_host.data() + t * pred_dim;
         double sum = 0.0;
-        const float * row = logits.data() + t * n_buckets;
-        for (int64_t k = 0; k < n_buckets; ++k) {
-            const float x = row[k];
+        for (int64_t n = 0; n < n_buckets; ++n) {
+            const float * w_row = W + static_cast<size_t>(pred_dim) * static_cast<size_t>(n);
+            double acc = static_cast<double>(B[n]);
+            for (int64_t k = 0; k < pred_dim; ++k) {
+                acc += static_cast<double>(w_row[k]) * static_cast<double>(h[k]);
+            }
+            const float x = static_cast<float>(acc);
             sum += (x >= 0.0f)
                 ? 1.0 / (1.0 + std::exp(-static_cast<double>(x)))
                 : std::exp(static_cast<double>(x)) / (1.0 + std::exp(static_cast<double>(x)));
@@ -390,7 +425,6 @@ bool run_kokoro_frontend_probe(
             }
         };
         dump("hidden",      probe.hidden.data(),    probe.hidden.size());
-        dump("dur_logits",  logits.data(),          logits.size());
         dump("durations",   probe.durations.data(), probe.durations.size());
     }
 
