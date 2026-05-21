@@ -25,6 +25,7 @@ PyTypeObject AudioType = make_type_object();
 PyTypeObject AudioChunkType = make_type_object();
 PyTypeObject SynthesisSessionType = make_type_object();
 PyTypeObject AudioEncoderType = make_type_object();
+PyTypeObject StreamIteratorType = make_type_object();
 
 struct ModelObject {
     PyObject_HEAD
@@ -49,6 +50,16 @@ struct SynthesisSessionObject {
 struct AudioEncoderObject {
     PyObject_HEAD
     kokopop_audio_encoder * handle;
+};
+
+struct StreamIteratorObject {
+    PyObject_HEAD
+    kokopop_synthesis * handle;
+    PyObject * model_owner;
+    size_t max_chunks;
+    PyObject * pending;
+    Py_ssize_t pending_index;
+    int done;
 };
 
 int parse_backend(const char * backend, int32_t & out) {
@@ -276,6 +287,29 @@ PyObject * chunks_to_list(kokopop_audio_chunk * chunks, size_t n_chunks) {
     return list;
 }
 
+int require_synthesis_open(SynthesisSessionObject * self) {
+    if (self->handle != nullptr) return 0;
+    PyErr_SetString(PyExc_ValueError, "SynthesisSession is closed");
+    return -1;
+}
+
+int require_encoder_open(AudioEncoderObject * self) {
+    if (self->handle != nullptr) return 0;
+    PyErr_SetString(PyExc_ValueError, "AudioEncoder is closed");
+    return -1;
+}
+
+void stream_iterator_close(StreamIteratorObject * self) {
+    kokopop_synthesis_free(self->handle);
+    self->handle = nullptr;
+    Py_XDECREF(self->model_owner);
+    self->model_owner = nullptr;
+    Py_XDECREF(self->pending);
+    self->pending = nullptr;
+    self->pending_index = 0;
+    self->done = 1;
+}
+
 void Model_dealloc(ModelObject * self) {
     kokopop_model_free(self->handle);
     Py_TYPE(self)->tp_free(reinterpret_cast<PyObject *>(self));
@@ -391,49 +425,95 @@ PyObject * Model_stream(ModelObject * self, PyObject * args, PyObject * kwargs) 
         return nullptr;
     }
 
-    PyObject * all = PyList_New(0);
-    if (all == nullptr) {
+    auto * iter = PyObject_New(StreamIteratorObject, &StreamIteratorType);
+    if (iter == nullptr) {
         kokopop_synthesis_free(synthesis);
         return nullptr;
     }
-
-    bool done = false;
-    while (!done) {
-        kokopop_audio_chunk * chunks = nullptr;
-        size_t n_chunks = 0;
-        Py_BEGIN_ALLOW_THREADS
-        rc = kokopop_synthesis_next(synthesis, max_chunks, &chunks, &n_chunks);
-        Py_END_ALLOW_THREADS
-        if (rc != KOKOPOP_OK) {
-            Py_DECREF(all);
-            kokopop_synthesis_free(synthesis);
-            raise_kokopop_error(rc);
-            return nullptr;
-        }
-        if (n_chunks == 0) break;
-        for (size_t i = 0; i < n_chunks; ++i) {
-            PyObject * chunk = chunk_from_c(chunks[i]);
-            if (chunk == nullptr || PyList_Append(all, chunk) < 0) {
-                Py_XDECREF(chunk);
-                Py_DECREF(all);
-                kokopop_audio_chunks_free(chunks, n_chunks);
-                kokopop_synthesis_free(synthesis);
-                return nullptr;
-            }
-            done = chunks[i].is_final != 0;
-            Py_DECREF(chunk);
-        }
-        kokopop_audio_chunks_free(chunks, n_chunks);
-    }
-
-    kokopop_synthesis_free(synthesis);
-    PyObject * iter = PyObject_GetIter(all);
-    Py_DECREF(all);
-    return iter;
+    iter->handle = synthesis;
+    iter->model_owner = reinterpret_cast<PyObject *>(self);
+    Py_INCREF(iter->model_owner);
+    iter->max_chunks = max_chunks;
+    iter->pending = nullptr;
+    iter->pending_index = 0;
+    iter->done = 0;
+    return reinterpret_cast<PyObject *>(iter);
 }
 
 PyObject * Model_stream_py(PyObject * self, PyObject * args, PyObject * kwargs) {
     return Model_stream(reinterpret_cast<ModelObject *>(self), args, kwargs);
+}
+
+void StreamIterator_dealloc(StreamIteratorObject * self) {
+    stream_iterator_close(self);
+    Py_TYPE(self)->tp_free(reinterpret_cast<PyObject *>(self));
+}
+
+PyObject * StreamIterator_iternext(StreamIteratorObject * self) {
+    if (self->pending != nullptr) {
+        Py_ssize_t n_pending = PyList_GET_SIZE(self->pending);
+        if (self->pending_index < n_pending) {
+            PyObject * item = PyList_GET_ITEM(self->pending, self->pending_index++);
+            Py_INCREF(item);
+            if (self->pending_index >= n_pending) {
+                Py_CLEAR(self->pending);
+                self->pending_index = 0;
+            }
+            return item;
+        }
+        Py_CLEAR(self->pending);
+        self->pending_index = 0;
+    }
+
+    if (self->done || self->handle == nullptr) {
+        PyErr_SetNone(PyExc_StopIteration);
+        return nullptr;
+    }
+
+    kokopop_audio_chunk * chunks = nullptr;
+    size_t n_chunks = 0;
+    int rc = KOKOPOP_OK;
+    Py_BEGIN_ALLOW_THREADS
+    rc = kokopop_synthesis_next(self->handle, self->max_chunks, &chunks, &n_chunks);
+    Py_END_ALLOW_THREADS
+    if (rc != KOKOPOP_OK) {
+        stream_iterator_close(self);
+        raise_kokopop_error(rc);
+        return nullptr;
+    }
+    if (n_chunks == 0) {
+        stream_iterator_close(self);
+        PyErr_SetNone(PyExc_StopIteration);
+        return nullptr;
+    }
+
+    PyObject * list = chunks_to_list(chunks, n_chunks);
+    if (list == nullptr) {
+        stream_iterator_close(self);
+        return nullptr;
+    }
+    auto * last = reinterpret_cast<AudioObject *>(PyList_GET_ITEM(list, static_cast<Py_ssize_t>(n_chunks - 1)));
+    if (last->is_final) {
+        self->done = 1;
+        kokopop_synthesis_free(self->handle);
+        self->handle = nullptr;
+        Py_CLEAR(self->model_owner);
+    }
+
+    PyObject * item = PyList_GET_ITEM(list, 0);
+    Py_INCREF(item);
+    if (n_chunks > 1) {
+        self->pending = list;
+        self->pending_index = 1;
+    } else {
+        Py_DECREF(list);
+    }
+    return item;
+}
+
+PyObject * StreamIterator_close(StreamIteratorObject * self, PyObject *) {
+    stream_iterator_close(self);
+    Py_RETURN_NONE;
 }
 
 void Audio_dealloc(AudioObject * self) {
@@ -510,7 +590,9 @@ PyObject * Audio_write_wav(AudioObject * self, PyObject * args) {
 
 void SynthesisSession_dealloc(SynthesisSessionObject * self) {
     kokopop_synthesis_free(self->handle);
+    self->handle = nullptr;
     Py_XDECREF(self->model_owner);
+    self->model_owner = nullptr;
     Py_TYPE(self)->tp_free(reinterpret_cast<PyObject *>(self));
 }
 
@@ -543,6 +625,7 @@ int SynthesisSession_init(SynthesisSessionObject * self, PyObject * args, PyObje
 }
 
 PyObject * SynthesisSession_push_text(SynthesisSessionObject * self, PyObject * args) {
+    if (require_synthesis_open(self) < 0) return nullptr;
     const char * text = nullptr;
     if (!PyArg_ParseTuple(args, "s", &text)) return nullptr;
     int rc = KOKOPOP_OK;
@@ -557,6 +640,7 @@ PyObject * SynthesisSession_push_text(SynthesisSessionObject * self, PyObject * 
 }
 
 PyObject * SynthesisSession_finish_input(SynthesisSessionObject * self, PyObject *) {
+    if (require_synthesis_open(self) < 0) return nullptr;
     int rc = KOKOPOP_OK;
     Py_BEGIN_ALLOW_THREADS
     rc = kokopop_synthesis_finish_input(self->handle);
@@ -569,6 +653,7 @@ PyObject * SynthesisSession_finish_input(SynthesisSessionObject * self, PyObject
 }
 
 PyObject * SynthesisSession_next(SynthesisSessionObject * self, PyObject * args, PyObject * kwargs) {
+    if (require_synthesis_open(self) < 0) return nullptr;
     int max_chunks_i = 1;
     static const char * kwlist[] = {"max_chunks", nullptr};
     if (!PyArg_ParseTupleAndKeywords(args, kwargs, "|i", const_cast<char **>(kwlist), &max_chunks_i)) {
@@ -592,8 +677,26 @@ PyObject * SynthesisSession_next_py(PyObject * self, PyObject * args, PyObject *
     return SynthesisSession_next(reinterpret_cast<SynthesisSessionObject *>(self), args, kwargs);
 }
 
+PyObject * SynthesisSession_close(SynthesisSessionObject * self, PyObject *) {
+    kokopop_synthesis_free(self->handle);
+    self->handle = nullptr;
+    Py_CLEAR(self->model_owner);
+    Py_RETURN_NONE;
+}
+
+PyObject * SynthesisSession_enter(SynthesisSessionObject * self, PyObject *) {
+    if (require_synthesis_open(self) < 0) return nullptr;
+    Py_INCREF(self);
+    return reinterpret_cast<PyObject *>(self);
+}
+
+PyObject * SynthesisSession_exit(SynthesisSessionObject * self, PyObject *) {
+    return SynthesisSession_close(self, nullptr);
+}
+
 void AudioEncoder_dealloc(AudioEncoderObject * self) {
     kokopop_audio_encoder_free(self->handle);
+    self->handle = nullptr;
     Py_TYPE(self)->tp_free(reinterpret_cast<PyObject *>(self));
 }
 
@@ -625,6 +728,7 @@ int AudioEncoder_init(AudioEncoderObject * self, PyObject * args, PyObject * kwa
 }
 
 PyObject * AudioEncoder_start(AudioEncoderObject * self, PyObject *) {
+    if (require_encoder_open(self) < 0) return nullptr;
     kokopop_bytes bytes{};
     int rc = KOKOPOP_OK;
     Py_BEGIN_ALLOW_THREADS
@@ -638,6 +742,7 @@ PyObject * AudioEncoder_start(AudioEncoderObject * self, PyObject *) {
 }
 
 PyObject * AudioEncoder_push(AudioEncoderObject * self, PyObject * args, PyObject * kwargs) {
+    if (require_encoder_open(self) < 0) return nullptr;
     PyObject * samples = nullptr;
     int is_final = 0;
     static const char * kwlist[] = {"samples", "is_final", nullptr};
@@ -676,6 +781,7 @@ PyObject * AudioEncoder_push_py(PyObject * self, PyObject * args, PyObject * kwa
 }
 
 PyObject * AudioEncoder_finish(AudioEncoderObject * self, PyObject * args, PyObject * kwargs) {
+    if (require_encoder_open(self) < 0) return nullptr;
     int success = 1;
     static const char * kwlist[] = {"success", nullptr};
     if (!PyArg_ParseTupleAndKeywords(args, kwargs, "|p", const_cast<char **>(kwlist), &success)) {
@@ -695,6 +801,22 @@ PyObject * AudioEncoder_finish(AudioEncoderObject * self, PyObject * args, PyObj
 
 PyObject * AudioEncoder_finish_py(PyObject * self, PyObject * args, PyObject * kwargs) {
     return AudioEncoder_finish(reinterpret_cast<AudioEncoderObject *>(self), args, kwargs);
+}
+
+PyObject * AudioEncoder_close(AudioEncoderObject * self, PyObject *) {
+    kokopop_audio_encoder_free(self->handle);
+    self->handle = nullptr;
+    Py_RETURN_NONE;
+}
+
+PyObject * AudioEncoder_enter(AudioEncoderObject * self, PyObject *) {
+    if (require_encoder_open(self) < 0) return nullptr;
+    Py_INCREF(self);
+    return reinterpret_cast<PyObject *>(self);
+}
+
+PyObject * AudioEncoder_exit(AudioEncoderObject * self, PyObject *) {
+    return AudioEncoder_close(self, nullptr);
 }
 
 PyMethodDef Model_methods[] = {
@@ -738,6 +860,9 @@ PyMethodDef SynthesisSession_methods[] = {
     {"push_text", reinterpret_cast<PyCFunction>(SynthesisSession_push_text), METH_VARARGS, nullptr},
     {"finish_input", reinterpret_cast<PyCFunction>(SynthesisSession_finish_input), METH_NOARGS, nullptr},
     {"next", _PyCFunction_CAST(SynthesisSession_next_py), METH_VARARGS | METH_KEYWORDS, nullptr},
+    {"close", reinterpret_cast<PyCFunction>(SynthesisSession_close), METH_NOARGS, nullptr},
+    {"__enter__", reinterpret_cast<PyCFunction>(SynthesisSession_enter), METH_NOARGS, nullptr},
+    {"__exit__", reinterpret_cast<PyCFunction>(SynthesisSession_exit), METH_VARARGS, nullptr},
     {nullptr, nullptr, 0, nullptr},
 };
 
@@ -745,6 +870,14 @@ PyMethodDef AudioEncoder_methods[] = {
     {"start", reinterpret_cast<PyCFunction>(AudioEncoder_start), METH_NOARGS, nullptr},
     {"push", _PyCFunction_CAST(AudioEncoder_push_py), METH_VARARGS | METH_KEYWORDS, nullptr},
     {"finish", _PyCFunction_CAST(AudioEncoder_finish_py), METH_VARARGS | METH_KEYWORDS, nullptr},
+    {"close", reinterpret_cast<PyCFunction>(AudioEncoder_close), METH_NOARGS, nullptr},
+    {"__enter__", reinterpret_cast<PyCFunction>(AudioEncoder_enter), METH_NOARGS, nullptr},
+    {"__exit__", reinterpret_cast<PyCFunction>(AudioEncoder_exit), METH_VARARGS, nullptr},
+    {nullptr, nullptr, 0, nullptr},
+};
+
+PyMethodDef StreamIterator_methods[] = {
+    {"close", reinterpret_cast<PyCFunction>(StreamIterator_close), METH_NOARGS, nullptr},
     {nullptr, nullptr, 0, nullptr},
 };
 
@@ -774,6 +907,17 @@ int ready_type(PyTypeObject & type, const char * name, Py_ssize_t basicsize,
     return PyType_Ready(&type);
 }
 
+int ready_stream_iterator_type() {
+    StreamIteratorType.tp_name = "kokopop._native.StreamIterator";
+    StreamIteratorType.tp_basicsize = sizeof(StreamIteratorObject);
+    StreamIteratorType.tp_flags = Py_TPFLAGS_DEFAULT;
+    StreamIteratorType.tp_dealloc = reinterpret_cast<destructor>(StreamIterator_dealloc);
+    StreamIteratorType.tp_methods = StreamIterator_methods;
+    StreamIteratorType.tp_iter = PyObject_SelfIter;
+    StreamIteratorType.tp_iternext = reinterpret_cast<iternextfunc>(StreamIterator_iternext);
+    return PyType_Ready(&StreamIteratorType);
+}
+
 } // namespace
 
 PyMODINIT_FUNC PyInit__native(void) {
@@ -800,6 +944,9 @@ PyMODINIT_FUNC PyInit__native(void) {
     if (ready_type(AudioEncoderType, "kokopop._native.AudioEncoder", sizeof(AudioEncoderObject),
                    reinterpret_cast<destructor>(AudioEncoder_dealloc), AudioEncoder_methods,
                    nullptr, reinterpret_cast<initproc>(AudioEncoder_init)) < 0) {
+        return nullptr;
+    }
+    if (ready_stream_iterator_type() < 0) {
         return nullptr;
     }
 

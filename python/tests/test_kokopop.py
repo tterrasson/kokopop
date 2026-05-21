@@ -87,11 +87,17 @@ def test_import_surface():
     assert kokopop.AudioFormat.WAV_PCM16 == "wav"
 
 
-def test_model_and_phoneme_synthesis(mock_gguf):
+def test_model_text_and_phoneme_synthesis(mock_gguf):
     model = kokopop.Model(str(mock_gguf), n_threads=1, backend="cpu")
     assert model.sample_rate == 24000
 
+    text_audio = model.synthesize("Alpha sentence.", voice="af_heart")
+    assert isinstance(text_audio, kokopop.Audio)
+    assert text_audio.sample_rate == 24000
+    assert text_audio.n_samples > 1000
+
     audio = model.synthesize_phonemes("abc", voice="af_heart")
+    assert isinstance(audio, kokopop.Audio)
     assert audio.sample_rate == 24000
     assert audio.n_samples > 1000
 
@@ -127,7 +133,7 @@ def test_errors(mock_gguf, tmp_path):
 
 def test_streaming_session(mock_gguf):
     model = kokopop.Model(str(mock_gguf), backend="cpu")
-    session = kokopop.SynthesisSession(
+    with kokopop.SynthesisSession(
         model,
         voice="af_heart",
         mode="long_form",
@@ -135,28 +141,40 @@ def test_streaming_session(mock_gguf):
         target_max_tokens=12,
         soft_max_tokens=16,
         hard_max_tokens=32,
-    )
-    session.push_text("Alpha sentence. Beta sentence.")
-    session.finish_input()
-    chunks = session.next(max_chunks=4)
+    ) as session:
+        session.push_text("Alpha sentence. Beta sentence.")
+        session.finish_input()
+        chunks = session.next(max_chunks=4)
+        with pytest.raises(ValueError):
+            session.push_text("too late")
+
     assert chunks
     assert chunks[0].sample_rate == 24000
     assert chunks[0].n_samples > 0
 
+    with pytest.raises(ValueError):
+        session.next()
+
 
 def test_model_stream_iterator(mock_gguf):
     model = kokopop.Model(str(mock_gguf), backend="cpu")
-    chunks = list(
-        model.stream(
-            "Alpha sentence. Beta sentence.",
-            voice="af_heart",
-            mode="long_form",
-            target_min_tokens=1,
-            target_max_tokens=12,
-            soft_max_tokens=16,
-            hard_max_tokens=32,
-        )
+    stream = model.stream(
+        "Alpha sentence. Beta sentence.",
+        voice="af_heart",
+        mode="long-form",
+        max_chunks=0,
+        target_min_tokens=1,
+        target_max_tokens=12,
+        soft_max_tokens=16,
+        hard_max_tokens=32,
     )
+    assert iter(stream) is stream
+    assert hasattr(stream, "close")
+
+    first = next(stream)
+    assert isinstance(first, kokopop.AudioChunk)
+
+    chunks = [first, *list(stream)]
     assert chunks
     assert any(chunk.is_final for chunk in chunks)
 
@@ -164,11 +182,14 @@ def test_model_stream_iterator(mock_gguf):
 def test_audio_encoder_pcm_and_wav():
     samples = array.array("f", [0.0, 0.25, -0.25, 1.0])
 
-    pcm = kokopop.AudioEncoder("pcm_f32le", sample_rate=24000)
-    out = pcm.push(samples, is_final=True)
+    with kokopop.AudioEncoder("pcm_f32le", sample_rate=24000) as pcm:
+        out = pcm.push(samples, is_final=True)
     assert len(out) == len(samples) * 4
+    with pytest.raises(ValueError):
+        pcm.push(samples)
 
-    wav = kokopop.AudioEncoder("wav", sample_rate=24000)
-    assert wav.push(samples, is_final=True) == b""
-    encoded = wav.finish()
+    with kokopop.AudioEncoder("wav", sample_rate=24000) as wav:
+        assert wav.start() == b""
+        assert wav.push(samples, is_final=True) == b""
+        encoded = wav.finish()
     assert encoded[:4] == b"RIFF"
