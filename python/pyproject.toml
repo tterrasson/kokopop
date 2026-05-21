@@ -1,0 +1,30 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "setuptools_scm>=8"]
+build-backend = "build_backend"
+backend-path = ["."]
+
+[project]
+name = "kokopop"
+version = "0.1.0"
+description = "Python bindings for the Kokopop Kokoro GGUF runtime"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.scikit-build]
+cmake.version = ">=3.24"
+cmake.build-type = "Release"
+wheel.packages = ["src/kokopop"]
+
+[tool.scikit-build.install]
+components = ["python"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

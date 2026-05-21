@@ -42,9 +42,9 @@ FetchContent_Declare(
   #         patch is retained so older local fetches remain idempotent.
   # Note: Fix 3 (scalar NORM kernel) is now merged upstream in GGML a056a26.
   PATCH_COMMAND
-    ${CMAKE_COMMAND} -DPATCH_FILE=${CMAKE_SOURCE_DIR}/patches/ggml-conv-transpose-1d-simd.patch -P ${CMAKE_SOURCE_DIR}/tools/apply_patch_if_needed.cmake
+    ${CMAKE_COMMAND} -DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/patches/ggml-conv-transpose-1d-simd.patch -P ${CMAKE_CURRENT_SOURCE_DIR}/tools/apply_patch_if_needed.cmake
     COMMAND
-    ${CMAKE_COMMAND} -DPATCH_FILE=${CMAKE_SOURCE_DIR}/patches/ggml-cuda-im2col-griddim.patch -P ${CMAKE_SOURCE_DIR}/tools/apply_patch_if_needed.cmake
+    ${CMAKE_COMMAND} -DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/patches/ggml-cuda-im2col-griddim.patch -P ${CMAKE_CURRENT_SOURCE_DIR}/tools/apply_patch_if_needed.cmake
 )
 if(KOKOPOP_ENABLE_CUDA)
   set(GGML_CUDA ON CACHE BOOL "" FORCE)

@@ -24,6 +24,10 @@ torch = [
   { index = "pytorch-cpu" }
 ]
 
+[tool.pytest.ini_options]
+testpaths = ["python/tests"]
+norecursedirs = ["build", "build-*", ".venv", "_deps"]
+
 [[tool.uv.index]]
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
