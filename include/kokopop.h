@@ -19,6 +19,8 @@ extern "C" {
 #endif
 
 typedef struct kokopop_model kokopop_model;
+typedef struct kokopop_synthesis kokopop_synthesis;
+typedef struct kokopop_audio_encoder kokopop_audio_encoder;
 
 enum {
     KOKOPOP_BACKEND_AUTO = 0,
@@ -38,6 +40,56 @@ typedef struct kokopop_audio {
     size_t n_samples;
     int32_t sample_rate;
 } kokopop_audio;
+
+typedef struct kokopop_audio_chunk {
+    float * samples;
+    size_t n_samples;
+    int32_t sample_rate;
+    int32_t chunk_index;
+    int32_t is_final;
+} kokopop_audio_chunk;
+
+typedef struct kokopop_bytes {
+    uint8_t * data;
+    size_t size;
+} kokopop_bytes;
+
+enum {
+    KOKOPOP_SYNTH_ADAPTATIVE = 0,
+    KOKOPOP_SYNTH_LONG_FORM = 1
+};
+
+enum {
+    KOKOPOP_AUDIO_PCM_F32LE = 0,
+    KOKOPOP_AUDIO_WAV_PCM16 = 1,
+    KOKOPOP_AUDIO_OGG_OPUS = 2
+};
+
+typedef struct kokopop_synthesis_options {
+    const char * voice;
+    float speed;
+    int32_t mode;
+
+    // Optional chunk config overrides. Leave all fields at 0 to use the mode preset.
+    int32_t target_min_tokens;
+    int32_t target_max_tokens;
+    int32_t soft_max_tokens;
+    int32_t hard_max_tokens;
+    int32_t first_chunk_target_tokens;
+    int32_t target_overshoot_tokens;
+    int32_t comma_pause_ms;
+    int32_t sentence_pause_ms;
+    int32_t paragraph_pause_ms;
+    int32_t crossfade_ms;
+    int32_t max_silence_trim_ms;
+    int32_t trim_silence; // 0 = preset, 1 = true, -1 = false
+} kokopop_synthesis_options;
+
+typedef struct kokopop_encoder_options {
+    int32_t format;
+    int32_t sample_rate;
+    int32_t ogg_prebuffer_chunks;
+} kokopop_encoder_options;
 
 enum {
     KOKOPOP_OK = 0,
@@ -68,6 +120,38 @@ KOKOPOP_API int kokopop_synthesize_phonemes(
     kokopop_audio * out_audio);
 
 KOKOPOP_API int kokopop_write_wav(const char * path, const kokopop_audio * audio);
+
+KOKOPOP_API int kokopop_synthesis_create(
+    kokopop_model * model,
+    const kokopop_synthesis_options * options,
+    kokopop_synthesis ** out_synthesis);
+
+KOKOPOP_API int kokopop_synthesis_push_text(kokopop_synthesis * synthesis, const char * text);
+KOKOPOP_API int kokopop_synthesis_finish_input(kokopop_synthesis * synthesis);
+KOKOPOP_API int kokopop_synthesis_next(
+    kokopop_synthesis * synthesis,
+    size_t max_chunks,
+    kokopop_audio_chunk ** out_chunks,
+    size_t * out_n_chunks);
+KOKOPOP_API void kokopop_audio_chunks_free(kokopop_audio_chunk * chunks, size_t n_chunks);
+KOKOPOP_API void kokopop_synthesis_free(kokopop_synthesis * synthesis);
+
+KOKOPOP_API int kokopop_audio_encoder_create(
+    const kokopop_encoder_options * options,
+    kokopop_audio_encoder ** out_encoder);
+KOKOPOP_API int kokopop_audio_encoder_start(kokopop_audio_encoder * encoder, kokopop_bytes * out_bytes);
+KOKOPOP_API int kokopop_audio_encoder_push(
+    kokopop_audio_encoder * encoder,
+    const float * samples,
+    size_t n_samples,
+    int32_t is_final,
+    kokopop_bytes * out_bytes);
+KOKOPOP_API int kokopop_audio_encoder_finish(
+    kokopop_audio_encoder * encoder,
+    int32_t success,
+    kokopop_bytes * out_bytes);
+KOKOPOP_API void kokopop_bytes_free(kokopop_bytes * bytes);
+KOKOPOP_API void kokopop_audio_encoder_free(kokopop_audio_encoder * encoder);
 
 KOKOPOP_API void kokopop_audio_free(kokopop_audio * audio);
 KOKOPOP_API void kokopop_model_free(kokopop_model * model);

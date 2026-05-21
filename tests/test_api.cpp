@@ -238,6 +238,145 @@ TEST_CASE("api_synthesize_phonemes_null_phonemes") {
     kokopop_model_free(model);
 }
 
+TEST_CASE("api_synthesis_session_pull_chunks") {
+    const std::string & gguf = shared_mock_gguf();
+    kokopop_model * model = nullptr;
+    CHECK_EQ(kokopop_model_load(gguf.c_str(), nullptr, &model), KOKOPOP_OK);
+
+    kokopop_synthesis_options opts{};
+    opts.voice = "af_heart";
+    opts.speed = 1.0f;
+    opts.mode = KOKOPOP_SYNTH_ADAPTATIVE;
+
+    kokopop_synthesis * synth = nullptr;
+    CHECK_EQ(kokopop_synthesis_create(model, &opts, &synth), KOKOPOP_OK);
+    REQUIRE(synth != nullptr);
+
+    CHECK_EQ(kokopop_synthesis_push_text(synth, "Hello, "), KOKOPOP_OK);
+    CHECK_EQ(kokopop_synthesis_push_text(synth, "world."), KOKOPOP_OK);
+    CHECK_EQ(kokopop_synthesis_finish_input(synth), KOKOPOP_OK);
+
+    kokopop_audio_chunk * chunks = nullptr;
+    size_t n_chunks = 0;
+    CHECK_EQ(kokopop_synthesis_next(synth, 1, &chunks, &n_chunks), KOKOPOP_OK);
+    REQUIRE_EQ(n_chunks, 1u);
+    CHECK(chunks[0].samples != nullptr);
+    CHECK(chunks[0].n_samples > 0);
+    CHECK_EQ(chunks[0].sample_rate, 24000);
+    kokopop_audio_chunks_free(chunks, n_chunks);
+
+    CHECK_EQ(kokopop_synthesis_push_text(synth, "too late"), KOKOPOP_ERROR_INVALID_ARGUMENT);
+    kokopop_synthesis_free(synth);
+    kokopop_model_free(model);
+}
+
+TEST_CASE("api_synthesis_session_next_multiple_chunks") {
+    const std::string & gguf = shared_mock_gguf();
+    kokopop_model * model = nullptr;
+    CHECK_EQ(kokopop_model_load(gguf.c_str(), nullptr, &model), KOKOPOP_OK);
+
+    kokopop_synthesis_options opts{};
+    opts.voice = "af_heart";
+    opts.speed = 1.0f;
+    opts.mode = KOKOPOP_SYNTH_LONG_FORM;
+    opts.target_min_tokens = 1;
+    opts.target_max_tokens = 12;
+    opts.soft_max_tokens = 16;
+    opts.hard_max_tokens = 32;
+
+    kokopop_synthesis * synth = nullptr;
+    CHECK_EQ(kokopop_synthesis_create(model, &opts, &synth), KOKOPOP_OK);
+    REQUIRE(synth != nullptr);
+    CHECK_EQ(kokopop_synthesis_push_text(
+        synth, "Alpha sentence. Beta sentence. Gamma sentence. Delta sentence."), KOKOPOP_OK);
+    CHECK_EQ(kokopop_synthesis_finish_input(synth), KOKOPOP_OK);
+
+    kokopop_audio_chunk * chunks = nullptr;
+    size_t n_chunks = 0;
+    CHECK_EQ(kokopop_synthesis_next(synth, 4, &chunks, &n_chunks), KOKOPOP_OK);
+    CHECK(n_chunks >= 1u);
+    for (size_t i = 0; i < n_chunks; ++i) {
+        CHECK(chunks[i].n_samples > 0);
+        CHECK_EQ(chunks[i].chunk_index, static_cast<int32_t>(i));
+    }
+    kokopop_audio_chunks_free(chunks, n_chunks);
+
+    kokopop_synthesis_free(synth);
+    kokopop_model_free(model);
+}
+
+TEST_CASE("api_synthesis_session_invalid_args") {
+    kokopop_synthesis * synth = nullptr;
+    kokopop_synthesis_options opts{};
+    opts.mode = 99;
+    CHECK_EQ(kokopop_synthesis_create(nullptr, &opts, &synth), KOKOPOP_ERROR_INVALID_ARGUMENT);
+
+    const std::string & gguf = shared_mock_gguf();
+    kokopop_model * model = nullptr;
+    CHECK_EQ(kokopop_model_load(gguf.c_str(), nullptr, &model), KOKOPOP_OK);
+    CHECK_EQ(kokopop_synthesis_create(model, &opts, &synth), KOKOPOP_ERROR_INVALID_ARGUMENT);
+
+    opts.mode = KOKOPOP_SYNTH_ADAPTATIVE;
+    CHECK_EQ(kokopop_synthesis_create(model, &opts, &synth), KOKOPOP_OK);
+    CHECK_EQ(kokopop_synthesis_push_text(synth, ""), KOKOPOP_ERROR_INVALID_ARGUMENT);
+    CHECK_EQ(kokopop_synthesis_finish_input(synth), KOKOPOP_ERROR_INVALID_ARGUMENT);
+    kokopop_synthesis_free(synth);
+    kokopop_model_free(model);
+}
+
+TEST_CASE("api_audio_encoder_pcm_and_wav") {
+    const float samples[] = {0.0f, 0.25f, -0.25f, 1.0f};
+
+    kokopop_encoder_options pcm_opts{};
+    pcm_opts.format = KOKOPOP_AUDIO_PCM_F32LE;
+    pcm_opts.sample_rate = 24000;
+    kokopop_audio_encoder * enc = nullptr;
+    CHECK_EQ(kokopop_audio_encoder_create(&pcm_opts, &enc), KOKOPOP_OK);
+    REQUIRE(enc != nullptr);
+    kokopop_bytes bytes{};
+    CHECK_EQ(kokopop_audio_encoder_push(enc, samples, 4, 1, &bytes), KOKOPOP_OK);
+    CHECK_EQ(bytes.size, sizeof(samples));
+    kokopop_bytes_free(&bytes);
+    kokopop_audio_encoder_free(enc);
+
+    kokopop_encoder_options wav_opts{};
+    wav_opts.format = KOKOPOP_AUDIO_WAV_PCM16;
+    wav_opts.sample_rate = 24000;
+    enc = nullptr;
+    CHECK_EQ(kokopop_audio_encoder_create(&wav_opts, &enc), KOKOPOP_OK);
+    REQUIRE(enc != nullptr);
+    CHECK_EQ(kokopop_audio_encoder_push(enc, samples, 4, 1, &bytes), KOKOPOP_OK);
+    CHECK_EQ(bytes.size, 0u);
+    kokopop_bytes_free(&bytes);
+    CHECK_EQ(kokopop_audio_encoder_finish(enc, 1, &bytes), KOKOPOP_OK);
+    REQUIRE(bytes.size >= 12u);
+    CHECK(std::memcmp(bytes.data, "RIFF", 4) == 0);
+    CHECK(std::memcmp(bytes.data + 8, "WAVE", 4) == 0);
+    kokopop_bytes_free(&bytes);
+    kokopop_audio_encoder_free(enc);
+}
+
+TEST_CASE("api_audio_encoder_ogg_availability") {
+    kokopop_encoder_options opts{};
+    opts.format = KOKOPOP_AUDIO_OGG_OPUS;
+    opts.sample_rate = 24000;
+    kokopop_audio_encoder * enc = nullptr;
+    const int rc = kokopop_audio_encoder_create(&opts, &enc);
+#ifdef KOKOPOP_HAS_OPUS
+    CHECK_EQ(rc, KOKOPOP_OK);
+    REQUIRE(enc != nullptr);
+    kokopop_bytes bytes{};
+    CHECK_EQ(kokopop_audio_encoder_start(enc, &bytes), KOKOPOP_OK);
+    CHECK(bytes.size > 0);
+    kokopop_bytes_free(&bytes);
+    kokopop_audio_encoder_free(enc);
+#else
+    CHECK_EQ(rc, KOKOPOP_ERROR_IO);
+    CHECK(enc == nullptr);
+    CHECK(std::strlen(kokopop_last_error()) > 0);
+#endif
+}
+
 TEST_CASE("api_synthesize_text_null_voice") {
     const std::string & gguf = shared_mock_gguf();
     kokopop_model * model = nullptr;

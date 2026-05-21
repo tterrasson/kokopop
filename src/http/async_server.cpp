@@ -1,8 +1,8 @@
 #include "http/async_server.h"
 
+#include "audio/audio_encoder.h"
 #include "http/http_response_writer.h"
 #include "http/http_server.h"  // for HttpRequest, HttpResponse, json_error
-#include "core/wav.h"
 #include "yyjson.h"
 
 #include <algorithm>
@@ -756,12 +756,21 @@ void AsyncHttpServer::_send_streaming_response(int fd, Connection & conn,
 
 void AsyncHttpServer::_send_wav_response(int fd, Connection & conn) {
     auto & acc = conn.req_ctx->wav_accumulator;
-    kokopop_audio audio{};
-    audio.samples     = acc.data();
-    audio.n_samples   = static_cast<int>(acc.size());
-    audio.sample_rate = conn.req_ctx->sample_rate;
+    AudioEncoderOptions enc_options;
+    enc_options.format = EncodedAudioFormat::WavPcm16;
+    enc_options.sample_rate = conn.req_ctx->sample_rate;
+    AudioEncoder encoder(enc_options);
 
-    auto wav = wav_bytes(audio);
+    std::vector<uint8_t> ignored;
+    std::vector<uint8_t> wav;
+    std::string error;
+    if (!encoder.start(ignored, error) ||
+        !encoder.push(acc.data(), acc.size(), true, ignored, error) ||
+        !encoder.finish(true, wav, error)) {
+        _send_error(fd, conn, 500, "Internal Server Error",
+                    json_error(error.empty() ? "WAV encoding failed" : error));
+        return;
+    }
 
     std::ostringstream oss;
     oss << "HTTP/1.1 200 OK\r\n";

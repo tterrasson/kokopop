@@ -127,6 +127,9 @@ Synthesize text to a WAV file:
   --out hello.wav
 ```
 
+For embedding, see the [C API guide](docs/c-api.md), including one-shot
+synthesis, pull-based chunked synthesis, and streaming audio encoders.
+
 Generate audio from phonemes:
 
 ```bash

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "streaming/streaming.h"
+#include "synthesis/synthesis_session.h"
 
 #include <atomic>
 #include <cstddef>
@@ -53,6 +54,7 @@ struct RequestContext {
     AudioFormat format = AudioFormat::PCM;
     ChunkConfig chunk_config;      // override fields (defaults = no-op)
     bool has_chunk_config = false;
+    std::unique_ptr<SynthesisSession> synthesis;
 
     bool is_streaming() const {
         return format == AudioFormat::PCM || format == AudioFormat::OGG_OPUS;

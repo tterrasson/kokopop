@@ -99,50 +99,24 @@ void SynthesisScheduler::_worker_loop() {
         // ---- Phase 1: PREPARING (chunking + phonemization) ----
         if (ctx->state.load() == RequestContext::State::PREPARING) {
             std::string error;
-            if (ctx->mode == StreamMode::LongForm) {
-                const ChunkConfig * override_ptr = ctx->has_chunk_config ? &ctx->chunk_config : nullptr;
-                auto plan = prepare_synthesis(
-                    _model, ctx->text, ctx->voice, ctx->speed, ctx->mode, error, override_ptr);
+            SynthesisSessionOptions options;
+            options.voice = ctx->voice;
+            options.speed = ctx->speed;
+            options.mode = ctx->mode;
+            options.chunk_config = ctx->chunk_config;
+            options.has_chunk_config = ctx->has_chunk_config;
 
-                if (plan.chunks.empty()) {
-                    ctx->error = error.empty() ? "no chunks produced" : error;
-                    ctx->state.store(RequestContext::State::ERROR);
-                    std::fprintf(stderr, "[scheduler] request #%u prepare failed: %s\n",
-                                ctx->request_id, ctx->error.c_str());
-                    continue;
-                }
-
-                ctx->plan = std::make_shared<SynthesisPlan>(std::move(plan));
-                ctx->chunks_total = static_cast<int>(ctx->plan->chunks.size());
-            } else {
-                ChunkConfig cfg = make_adaptative_config();
-                if (ctx->has_chunk_config) {
-                    cfg = merge_chunk_config(cfg, ctx->chunk_config);
-                }
-                ctx->chunk_config = cfg;
-                ctx->adaptative_controller.min_tokens = cfg.target_min_tokens;
-                // Hard absolute ceiling = soft_max_tokens (chunks may grow up
-                // to this when lead_ms stays comfortable). The starting cap
-                // matches the historical static behaviour (target_max_tokens).
-                ctx->adaptative_controller.max_tokens = cfg.soft_max_tokens;
-                ctx->adaptative_controller.growth_max_tokens = cfg.target_max_tokens;
-
-                TokenizeFn tokenize_fn = [this](const std::string & phonemes,
-                                                std::vector<uint32_t> & ids,
-                                                std::string & err) -> bool {
-                    return _model.tokenize_phonemes(phonemes, ids, err);
-                };
-                ctx->adaptative_units = prepare_chunk_units(
-                    ctx->text, ctx->voice, cfg, tokenize_fn, error);
-                if (ctx->adaptative_units.empty()) {
-                    ctx->error = error.empty() ? "no chunks produced" : error;
-                    ctx->state.store(RequestContext::State::ERROR);
-                    std::fprintf(stderr, "[scheduler] request #%u adaptative prepare failed: %s\n",
-                                ctx->request_id, ctx->error.c_str());
-                    continue;
-                }
-                ctx->chunks_total = 0;
+            ctx->synthesis.reset(new SynthesisSession(_model, options));
+            if (!ctx->synthesis->push_text(ctx->text, error) ||
+                !ctx->synthesis->finish_input(error) ||
+                !ctx->synthesis->prepare(error)) {
+                ctx->error = error.empty() ? "no chunks produced" : error;
+                ctx->state.store(RequestContext::State::ERROR);
+                std::fprintf(stderr, "[scheduler] request #%u prepare failed: %s\n",
+                            ctx->request_id, ctx->error.c_str());
+                continue;
             }
+            ctx->chunks_total = ctx->synthesis->chunks_total();
 
             // Client may have disconnected during preparation
             if (ctx->cancelled.load()) {
@@ -157,8 +131,8 @@ void SynthesisScheduler::_worker_loop() {
                 std::fprintf(stderr, "[scheduler] request #%u prepared: %d chunks\n",
                             ctx->request_id, ctx->chunks_total);
             } else {
-                std::fprintf(stderr, "[scheduler] request #%u prepared: %zu adaptative units\n",
-                            ctx->request_id, ctx->adaptative_units.size());
+                std::fprintf(stderr, "[scheduler] request #%u prepared: adaptative mode\n",
+                            ctx->request_id);
             }
         }
 
@@ -177,106 +151,44 @@ void SynthesisScheduler::_worker_loop() {
                 continue;
             }
 
-            std::vector<float> out_tail;
             std::string error;
             int idx = ctx->chunks_completed.load();
-            int n_tokens = 0;
-            bool is_last_chunk = false;
-            std::vector<float> audio;
-
-            if (ctx->mode == StreamMode::LongForm) {
-                if (idx >= ctx->chunks_total) {
-                    ctx->state.store(RequestContext::State::DONE);
-                    continue;
-                }
-                n_tokens = ctx->plan->chunks[static_cast<size_t>(idx)].n_tokens;
-                audio = infer_chunk(
-                    _model, *ctx->plan, idx, ctx->prev_tail, out_tail, error);
-                is_last_chunk = idx >= ctx->chunks_total - 1;
-            } else {
-                const int target_tokens =
-                    ctx->adaptative_controller.target_tokens(queued_after_pop);
-                Chunk chunk = build_adaptative_chunk(
-                    ctx->adaptative_units,
-                    ctx->adaptative_next_unit,
-                    ctx->chunk_config,
-                    target_tokens,
-                    idx == 0);
-                if (chunk.tokens.empty()) {
-                    ctx->state.store(RequestContext::State::DONE);
-                    continue;
-                }
-
-                n_tokens = chunk.n_tokens;
-                is_last_chunk = chunk.is_last;
-                SynthesisPlan one_chunk_plan;
-                one_chunk_plan.chunks.push_back(std::move(chunk));
-                one_chunk_plan.voice = ctx->voice;
-                one_chunk_plan.speed = ctx->speed;
-                one_chunk_plan.mode = ctx->mode;
-                one_chunk_plan.config = ctx->chunk_config;
-
-                auto start = std::chrono::steady_clock::now();
-                audio = infer_chunk(
-                    _model, one_chunk_plan, 0, ctx->prev_tail, out_tail, error);
-                const auto end = std::chrono::steady_clock::now();
-                const double generation_ms =
-                    std::chrono::duration<double, std::milli>(end - start).count();
-                const double audio_ms = static_cast<double>(audio.size()) /
-                    static_cast<double>(_model.sample_rate) * 1000.0;
-                // Skip observe() for the first chunk when the client explicitly set a
-                // target size. The oversized first chunk is intentionally out-of-band;
-                // seeding the EWMA and lead from it would depress subsequent targets.
-                // The controller starts cold from chunk 2, giving a higher initial
-                // estimate (700ms / 12ms = 58 tokens) before converging on real RTF.
-                const bool first_chunk_oversized =
-                    (idx == 0 && ctx->chunk_config.first_chunk_target_max_tokens > 0);
-                if (!first_chunk_oversized) {
-                    ctx->adaptative_controller.observe(n_tokens, generation_ms, audio_ms);
-                }
-
-                ctx->chunks_total = is_last_chunk ? idx + 1 : 0;
-                const int next_target = ctx->adaptative_controller.target_tokens(queued_after_pop);
-
-                std::fprintf(stderr,
-                    "[scheduler] request #%u chunk %d: gen=%.0fms audio=%.0fms"
-                    " rtf=%.2f lead=%.0fms cap=%d → next_target=%d tokens\n",
-                    ctx->request_id, idx + 1,
-                    generation_ms, audio_ms,
-                    generation_ms / (audio_ms > 0 ? audio_ms : 1.0),
-                    ctx->adaptative_controller.lead_ms(),
-                    ctx->adaptative_controller.growth_max_tokens,
-                    next_target);
-            }
-
-            if (!audio.empty()) {
-                ctx->prev_tail = std::move(out_tail);
-                ctx->push_audio(std::move(audio), idx);
-                ctx->chunks_completed.fetch_add(1);
-
-                if (ctx->mode == StreamMode::LongForm || is_last_chunk) {
-                    std::fprintf(stderr, "[scheduler] request #%u chunk %d/%d: %d tokens\n",
-                                ctx->request_id, idx + 1, ctx->chunks_total,
-                                n_tokens);
-                } else {
-                    std::fprintf(stderr, "[scheduler] request #%u chunk %d/?: %d tokens\n",
-                                ctx->request_id, idx + 1, n_tokens);
-                }
-
-                // Check if this was the last chunk
-                if (is_last_chunk) {
-                    ctx->state.store(RequestContext::State::DONE);
-                    std::fprintf(stderr, "[scheduler] request #%u DONE\n", ctx->request_id);
-                } else {
-                    // More chunks — re-enqueue at end (round-robin)
-                    std::lock_guard<std::mutex> lock(_queue_mutex);
-                    _pending.push_back(ctx);
-                }
-            } else {
+            std::vector<SynthesisAudioChunk> chunks;
+            if (!ctx->synthesis->next(1, queued_after_pop, chunks, error)) {
                 ctx->error = error.empty() ? "inference failed" : error;
                 ctx->state.store(RequestContext::State::ERROR);
                 std::fprintf(stderr, "[scheduler] request #%u chunk %d failed: %s\n",
                             ctx->request_id, idx + 1, ctx->error.c_str());
+                continue;
+            }
+            if (chunks.empty()) {
+                ctx->state.store(RequestContext::State::DONE);
+                continue;
+            }
+
+            for (auto & chunk : chunks) {
+                const bool is_last_chunk = chunk.is_final;
+                if (is_last_chunk && ctx->chunks_total == 0) {
+                    ctx->chunks_total = chunk.chunk_index + 1;
+                }
+                ctx->push_audio(std::move(chunk.samples), chunk.chunk_index);
+                ctx->chunks_completed.fetch_add(1);
+
+                if (ctx->mode == StreamMode::LongForm || is_last_chunk) {
+                    std::fprintf(stderr, "[scheduler] request #%u chunk %d/%d\n",
+                                ctx->request_id, chunk.chunk_index + 1, ctx->chunks_total);
+                } else {
+                    std::fprintf(stderr, "[scheduler] request #%u chunk %d/?\n",
+                                ctx->request_id, chunk.chunk_index + 1);
+                }
+
+                if (is_last_chunk) {
+                    ctx->state.store(RequestContext::State::DONE);
+                    std::fprintf(stderr, "[scheduler] request #%u DONE\n", ctx->request_id);
+                } else {
+                    std::lock_guard<std::mutex> lock(_queue_mutex);
+                    _pending.push_back(ctx);
+                }
             }
         }
     }

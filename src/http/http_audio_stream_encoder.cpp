@@ -1,114 +1,82 @@
 #include "http/http_audio_stream_encoder.h"
 
-#include "core/ogg_opus_encoder.h"
+#include "audio/audio_encoder.h"
 
-#include <algorithm>
+#include <utility>
 
 namespace kokopop {
 
 namespace {
 
-class PcmStreamEncoder final : public HttpAudioStreamEncoder {
+EncodedAudioFormat to_encoded_format(RequestContext::AudioFormat format) {
+    if (format == RequestContext::AudioFormat::WAV) return EncodedAudioFormat::WavPcm16;
+    if (format == RequestContext::AudioFormat::OGG_OPUS) return EncodedAudioFormat::OggOpus;
+    return EncodedAudioFormat::PcmF32Le;
+}
+
+class GenericHttpAudioStreamEncoder final : public HttpAudioStreamEncoder {
 public:
-    std::string content_type() const override { return "application/octet-stream"; }
-    void start(std::vector<char> & /*out*/) override {}
-    void write(RequestContext::AudioChunk && chunk, bool /*is_terminal*/,
-               std::vector<char> & out) override {
-        const char * p = reinterpret_cast<const char *>(chunk.samples.data());
-        out.insert(out.end(), p, p + chunk.samples.size() * sizeof(float));
+    GenericHttpAudioStreamEncoder(RequestContext::AudioFormat format,
+                                  int sample_rate,
+                                  int ogg_prebuffer_chunks)
+        : _format(to_encoded_format(format)) {
+        AudioEncoderOptions options;
+        options.format = _format;
+        options.sample_rate = sample_rate;
+        options.ogg_prebuffer_chunks = ogg_prebuffer_chunks;
+        _encoder = std::make_unique<AudioEncoder>(options);
     }
-    void finish(bool /*success*/, std::vector<char> & /*out*/) override {}
-};
 
-#ifdef KOKOPOP_HAS_OPUS
-class OggOpusStreamEncoder final : public HttpAudioStreamEncoder {
-public:
-    OggOpusStreamEncoder(int sample_rate, int prebuffer_chunks)
-        : _encoder(sample_rate),
-          _prebuffer_target(std::max(0, prebuffer_chunks)) {}
-
-    std::string content_type() const override { return "audio/ogg"; }
+    std::string content_type() const override {
+        return AudioEncoder::content_type(_format);
+    }
 
     void start(std::vector<char> & out) override {
-        _encoder.flush_header();
-        take_pending(out);
+        std::vector<uint8_t> bytes;
+        std::string error;
+        if (_encoder->start(bytes, error)) append(bytes, out);
     }
 
     void write(RequestContext::AudioChunk && chunk, bool is_terminal,
                std::vector<char> & out) override {
-        if (_prebuffer_target > 0 && !_prebuffer_released) {
-            _prebuffered.push_back(std::move(chunk));
-            const bool ready =
-                static_cast<int>(_prebuffered.size()) >= _prebuffer_target ||
-                is_terminal;
-            if (!ready) return;
-            for (auto & buffered : _prebuffered) {
-                write_samples(buffered);
-            }
-            _prebuffered.clear();
-            _prebuffer_released = true;
-        } else {
-            write_samples(chunk);
+        std::vector<uint8_t> bytes;
+        std::string error;
+        if (_encoder->push(chunk.samples.data(), chunk.samples.size(),
+                           is_terminal, bytes, error)) {
+            append(bytes, out);
         }
-        _encoder.pull_pages(0);
-        take_pending(out);
     }
 
     void finish(bool success, std::vector<char> & out) override {
-        if (success) {
-            _encoder.drain();
-            take_pending(out);
-        }
+        std::vector<uint8_t> bytes;
+        std::string error;
+        if (_encoder->finish(success, bytes, error)) append(bytes, out);
     }
 
 private:
-    void write_samples(const RequestContext::AudioChunk & chunk) {
-        _encoder.write(chunk.samples.data(), static_cast<int>(chunk.samples.size()));
+    static void append(const std::vector<uint8_t> & bytes, std::vector<char> & out) {
+        if (bytes.empty()) return;
+        out.insert(out.end(), reinterpret_cast<const char *>(bytes.data()),
+                   reinterpret_cast<const char *>(bytes.data() + bytes.size()));
     }
 
-    void take_pending(std::vector<char> & out) {
-        if (!_encoder.has_pending()) return;
-        auto pages = _encoder.take_pending();
-        out.insert(out.end(), pages.begin(), pages.end());
-    }
-
-    OggOpusEncoder _encoder;
-    int _prebuffer_target = 0;
-    bool _prebuffer_released = false;
-    std::vector<RequestContext::AudioChunk> _prebuffered;
+    EncodedAudioFormat _format;
+    std::unique_ptr<AudioEncoder> _encoder;
 };
-#endif
 
 } // namespace
 
 bool http_audio_format_available(RequestContext::AudioFormat format) {
-    if (format == RequestContext::AudioFormat::OGG_OPUS) {
-#ifdef KOKOPOP_HAS_OPUS
-        return true;
-#else
-        return false;
-#endif
-    }
-    return true;
+    return AudioEncoder::available(to_encoded_format(format));
 }
 
 std::unique_ptr<HttpAudioStreamEncoder> make_http_audio_stream_encoder(
     RequestContext::AudioFormat format,
     int sample_rate,
     int ogg_prebuffer_chunks) {
-    if (format == RequestContext::AudioFormat::PCM) {
-        return std::make_unique<PcmStreamEncoder>();
-    }
-    if (format == RequestContext::AudioFormat::OGG_OPUS) {
-#ifdef KOKOPOP_HAS_OPUS
-        return std::make_unique<OggOpusStreamEncoder>(sample_rate, ogg_prebuffer_chunks);
-#else
-        (void)sample_rate;
-        (void)ogg_prebuffer_chunks;
-        return nullptr;
-#endif
-    }
-    return nullptr;
+    if (!http_audio_format_available(format)) return nullptr;
+    return std::make_unique<GenericHttpAudioStreamEncoder>(
+        format, sample_rate, ogg_prebuffer_chunks);
 }
 
 } // namespace kokopop

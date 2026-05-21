@@ -189,6 +189,7 @@ set(_kokopop_inference_sources
 set(_kokopop_synthesis_sources
   src/synthesis/phonemizer.cpp
   src/synthesis/synth.cpp
+  src/synthesis/synthesis_session.cpp
   src/synthesis/chunker/chunker.cpp
   src/synthesis/chunker/text_normalizer.cpp
   src/synthesis/chunker/text_splitter.cpp
@@ -198,6 +199,7 @@ set(_kokopop_synthesis_sources
 # Audio post-processing
 set(_kokopop_audio_sources
   src/audio/audio_postprocess.cpp
+  src/audio/audio_encoder.cpp
 )
 
 # Streaming module
