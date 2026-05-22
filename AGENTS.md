@@ -41,8 +41,8 @@ cmake --build build
 
 | Option | Default | Description |
 |---|---|---|
-| `KOKOPOP_BUILD_TESTS` | `ON` | Build unit tests |
-| `KOKOPOP_BUILD_TOOLS` | `ON` | Build CLI tools |
+| `KOKOPOP_BUILD_TESTS` | `OFF` | Build unit tests |
+| `KOKOPOP_BUILD_TOOLS` | `OFF` | Build CLI tools |
 | `KOKOPOP_ENABLE_METAL` | `OFF` | Metal GPU backend (macOS) |
 | `KOKOPOP_ENABLE_CUDA` | `OFF` | CUDA backend (NVIDIA GPUs) |
 | `KOKOPOP_BUILD_BENCH` | `OFF` | Build benchmarks |

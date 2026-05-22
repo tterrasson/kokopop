@@ -13,6 +13,19 @@ set(KOKOPOP_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
 set(KOKOPOP_BUILD_BENCH OFF CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
+# Allow backend selection at `pip install` time via environment variables,
+# e.g. KOKOPOP_ENABLE_CUDA=ON pip install kokopop
+foreach(_opt
+    KOKOPOP_ENABLE_METAL
+    KOKOPOP_ENABLE_CUDA
+    KOKOPOP_ENABLE_VULKAN
+    KOKOPOP_ENABLE_OPUS)
+  if(DEFINED ENV{${_opt}} AND NOT DEFINED ${_opt})
+    set(${_opt} $ENV{${_opt}} CACHE BOOL "" FORCE)
+    message(STATUS "kokopop: ${_opt}=$ENV{${_opt}} (from environment)")
+  endif()
+endforeach()
+
 set(KOKOPOP_CORE_SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}/..)
 if(NOT EXISTS "${KOKOPOP_CORE_SOURCE_DIR}/include/kokopop.h")
   set(KOKOPOP_CORE_SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}/kokopop_core)

@@ -9,7 +9,7 @@ Thumbs.db
 
 # CMake / build directories
 build/
-build*
+build-*/
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake

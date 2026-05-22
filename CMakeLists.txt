@@ -5,8 +5,8 @@ project(kokopop
   DESCRIPTION "Standalone Kokoro GGUF runtime"
   LANGUAGES C CXX)
 
-option(KOKOPOP_BUILD_TESTS "Build kokopop unit tests" ON)
-option(KOKOPOP_BUILD_TOOLS "Build kokopop command line tools" ON)
+option(KOKOPOP_BUILD_TESTS "Build kokopop unit tests" OFF)
+option(KOKOPOP_BUILD_TOOLS "Build kokopop command line tools" OFF)
 option(KOKOPOP_ENABLE_METAL "Enable Metal (GPU) backend" OFF)
 option(KOKOPOP_ENABLE_CUDA "Enable CUDA (GPU) backend" OFF)
 option(KOKOPOP_ENABLE_VULKAN "Enable Vulkan (GPU) backend" OFF)

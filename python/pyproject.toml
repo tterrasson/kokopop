@@ -10,7 +10,33 @@ description = "Python bindings for the Kokopop Kokoro GGUF runtime"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
+authors = [
+    { name = "Thibault Terrasson", email = "thibault.terrasson@gmail.com" },
+]
+keywords = ["tts", "kokoro", "gguf", "speech-synthesis", "audio", "ggml"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/tterrasson/kokopop"
+Repository = "https://github.com/tterrasson/kokopop"
+Issues = "https://github.com/tterrasson/kokopop/issues"
 
 [project.optional-dependencies]
 test = ["pytest>=8"]

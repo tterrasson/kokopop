@@ -2,9 +2,48 @@
 
 Native Python bindings for the Kokopop Kokoro GGUF runtime.
 
+## Installation
+
 ```bash
-uv pip install ./python
+pip install kokopop
 ```
+
+The package is distributed as a source distribution: `pip install` compiles the
+native C++ runtime on your machine. Prerequisites: a C++17 compiler and
+CMake ≥ 3.24.
+
+### Selecting a GPU backend
+
+By default the build is **CPU-only**. No backend is auto-detected — even on
+platforms where the SDK is present — because the chosen backend determines the
+runtime dependencies of the resulting install. Opt in explicitly with an
+environment variable at install time:
+
+```bash
+KOKOPOP_ENABLE_METAL=ON  pip install kokopop   # macOS (requires Xcode CLT)
+KOKOPOP_ENABLE_CUDA=ON   pip install kokopop   # NVIDIA (requires CUDA toolkit)
+KOKOPOP_ENABLE_VULKAN=ON pip install kokopop   # cross-platform (requires Vulkan SDK)
+```
+
+Available environment variables:
+
+| Variable | Default | Notes |
+|---|---|---|
+| `KOKOPOP_ENABLE_METAL` | `OFF` | macOS Metal backend. Apple platforms only. |
+| `KOKOPOP_ENABLE_CUDA` | `OFF` | NVIDIA CUDA backend. Needs CUDA toolkit installed. |
+| `KOKOPOP_ENABLE_VULKAN` | `OFF` | Vulkan backend. Needs Vulkan SDK + SPIR-V headers. |
+| `KOKOPOP_ENABLE_OPUS` | `ON` | Build Ogg/Opus encoder if `opus`, `ogg`, `libopusenc` are found. |
+
+When switching backends, force a clean rebuild:
+
+```bash
+pip install --no-cache-dir --force-reinstall kokopop
+```
+
+For development builds from a local checkout, see
+[BUILDING.md](BUILDING.md).
+
+## Quick start
 
 ```python
 import kokopop
