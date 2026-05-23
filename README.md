@@ -98,7 +98,9 @@ If these libraries are not found, CMake will automatically disable Ogg/Opus outp
 
 ### Export Kokoro model to gguf format
 
-Requires [uv](https://docs.astral.sh/uv/getting-started/installation/).
+A pre-converted GGUF model is available at **[tterrasson/Kokoro-GGUF](https://huggingface.co/tterrasson/Kokoro-GGUF/tree/main)**
+
+Otherwise, to convert the model yourself, requires [uv](https://docs.astral.sh/uv/getting-started/installation/).
 
 ```bash
 uv run python tools/convert_kokoro_to_gguf.py \
