@@ -193,3 +193,57 @@ def test_audio_encoder_pcm_and_wav():
         assert wav.push(samples, is_final=True) == b""
         encoded = wav.finish()
     assert encoded[:4] == b"RIFF"
+
+
+def test_audio_encoder_wav_roundtrip_via_audio_to_wav_bytes(mock_gguf):
+    # The streaming encoder's WAV output should match the one-shot helper
+    # for the same samples (both PCM16, 24kHz, mono).
+    model = kokopop.Model(str(mock_gguf), backend="cpu")
+    audio = model.synthesize_phonemes("abc", voice="af_heart")
+
+    one_shot = audio.to_wav_bytes()
+    assert one_shot[:4] == b"RIFF"
+    assert one_shot[8:12] == b"WAVE"
+
+    samples = array.array("f", memoryview(audio))
+    encoder = kokopop.AudioEncoder("wav", sample_rate=audio.sample_rate)
+    streamed = encoder.start() + encoder.push(samples, is_final=True) + encoder.finish()
+    encoder.close()
+
+    assert streamed[:4] == b"RIFF"
+    assert streamed[8:12] == b"WAVE"
+    # Both encodings should produce identical PCM16 audio of equal length.
+    assert len(streamed) == len(one_shot)
+
+
+def test_audio_encoder_ogg_opus_or_skip():
+    samples = array.array("f", [0.1, -0.1] * 4800)  # 0.4s @ 24kHz
+    try:
+        encoder = kokopop.AudioEncoder("ogg_opus", sample_rate=24000)
+    except kokopop.KokopopError:
+        pytest.skip("build without libopusenc")
+    stream = encoder.start() + encoder.push(samples, is_final=True) + encoder.finish()
+    encoder.close()
+    assert b"OggS" in stream
+
+
+def test_audio_encoder_use_after_close():
+    samples = array.array("f", [0.0, 0.25])
+    enc = kokopop.AudioEncoder("pcm_f32le", sample_rate=24000)
+    enc.close()
+    with pytest.raises(ValueError):
+        enc.push(samples)
+    with pytest.raises(ValueError):
+        enc.finish()
+    # close() is idempotent.
+    enc.close()
+
+
+def test_stream_iterator_use_after_close(mock_gguf):
+    model = kokopop.Model(str(mock_gguf), backend="cpu")
+    stream = model.stream("Alpha sentence.", voice="af_heart")
+    stream.close()
+    with pytest.raises((ValueError, StopIteration)):
+        next(stream)
+    # close() is idempotent.
+    stream.close()

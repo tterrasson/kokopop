@@ -25,3 +25,6 @@
 #include "test_file_mapping.cpp"
 #include "test_streaming_pipeline.cpp"
 #include "test_http_async_parser.cpp"
+#include "test_http_server.cpp"
+#include "test_ogg_opus.cpp"
+#include "test_last_error.cpp"

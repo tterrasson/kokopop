@@ -423,6 +423,7 @@ if(KOKOPOP_BUILD_TESTS)
     src/http/async_http_parser.cpp
     src/http/http_audio_stream_encoder.cpp
     src/http/http_response_writer.cpp
+    src/http/http_server.cpp
     src/http/synthesis_scheduler.cpp
   )
   target_include_directories(kokopop_tests PRIVATE
@@ -436,8 +437,9 @@ if(KOKOPOP_BUILD_TESTS)
     ${CMAKE_CURRENT_SOURCE_DIR}/src/backend
     ${CMAKE_CURRENT_SOURCE_DIR}/src/streaming
     ${CMAKE_CURRENT_SOURCE_DIR}/src/playback
+    $<BUILD_INTERFACE:${yyjson_SOURCE_DIR}/src>
   )
-  target_link_libraries(kokopop_tests PRIVATE kokopop doctest::doctest ggml)
+  target_link_libraries(kokopop_tests PRIVATE kokopop doctest::doctest ggml yyjson)
   include(${doctest_SOURCE_DIR}/scripts/cmake/doctest.cmake)
   doctest_discover_tests(kokopop_tests)
 endif()
