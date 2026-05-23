@@ -19,7 +19,7 @@ from typing import Iterable
 
 import numpy as np
 import torch
-from huggingface_hub import hf_hub_download
+from huggingface_hub import hf_hub_download, list_repo_files
 from kokoro import KModel
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_REPO = "hexgrad/Kokoro-82M"
 DEFAULT_VOICES = "af_heart,ff_siwis"
-MODEL_NAME = "kokoro-v1_0.pth"
+DEFAULT_MODEL_NAME = "kokoro-v1_0.pth"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GGUF type constants
@@ -622,6 +622,17 @@ def _resolve_file(filename: str, args: argparse.Namespace) -> str:
     return hf_hub_download(repo_id=args.repo_id, filename=filename)
 
 
+def _discover_voices(args: argparse.Namespace) -> list[str]:
+    """Return all voice names available in the repo or local directory."""
+    if args.local_dir:
+        return sorted(p.stem for p in (Path(args.local_dir) / "voices").glob("*.pt"))
+    return sorted(
+        Path(f).stem
+        for f in list_repo_files(repo_id=args.repo_id)
+        if f.startswith("voices/") and f.endswith(".pt")
+    )
+
+
 def _normalize_wn_checkpoint(model_path: str) -> str:
     """Remap new-style parametrizations.weight_norm keys to old weight_g/weight_v.
 
@@ -665,7 +676,7 @@ def _normalize_wn_checkpoint(model_path: str) -> str:
 
 def convert(args: argparse.Namespace) -> None:
     config_path = _resolve_file("config.json", args)
-    model_path = _resolve_file(MODEL_NAME, args)
+    model_path = _resolve_file(args.model_name, args)
     config = json.loads(Path(config_path).read_text())
 
     normalized_path = _normalize_wn_checkpoint(model_path)
@@ -679,7 +690,11 @@ def convert(args: argparse.Namespace) -> None:
         if normalized_path != model_path:
             Path(normalized_path).unlink(missing_ok=True)
 
-    voices = [v.strip() for v in args.voices.split(",") if v.strip()]
+    if args.all_voices:
+        voices = _discover_voices(args)
+        print(f"discovered {len(voices)} voices: {', '.join(voices)}")
+    else:
+        voices = [v.strip() for v in args.voices.split(",") if v.strip()]
 
     writer = GGUFWriter(Path(args.output))
 
@@ -728,7 +743,15 @@ def parse_args() -> argparse.Namespace:
         "--local-dir", default=None,
         help="load model files from this local directory instead of HuggingFace",
     )
+    parser.add_argument(
+        "--model-name", default=DEFAULT_MODEL_NAME,
+        help="filename of the PyTorch weights inside the repo (default: %(default)s)",
+    )
     parser.add_argument("--voices", default=DEFAULT_VOICES)
+    parser.add_argument(
+        "--all-voices", action="store_true",
+        help="include all voices found in voices/* (overrides --voices)",
+    )
     return parser.parse_args()
 
 
