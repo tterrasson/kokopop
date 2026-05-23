@@ -472,36 +472,106 @@ target_include_directories(myapp PRIVATE ${CMAKE_SOURCE_DIR}/include)
 
 ### C API example
 
+All functions return `KOKOPOP_OK` (0) on success. On failure, call
+`kokopop_last_error()` for a human-readable description.
+
+**One-shot synthesis**
+
 ```c
 #include "kokopop.h"
+#include <stdio.h>
+
+/* Optional: configure backend and thread count */
+kokopop_model_options model_opts = {0};
+model_opts.backend    = KOKOPOP_BACKEND_AUTO; /* CPU, Metal, CUDA, or Vulkan */
+model_opts.n_threads  = 4;
 
 kokopop_model *model = NULL;
-kokopop_audio audio = {};
+if (kokopop_model_load("models/kokoro.gguf", &model_opts, &model) != KOKOPOP_OK) {
+    fprintf(stderr, "load failed: %s\n", kokopop_last_error());
+    return 1;
+}
 
-kokopop_model_load("models/kokoro.gguf", NULL, &model);
-kokopop_synthesize_text(model, "Hello, world!", "ff_siwis", 1.0f, &audio);
+/* Synthesize text → WAV */
+kokopop_audio audio = {0};
+if (kokopop_synthesize_text(model, "Hello, world!", "af_heart", 1.0f, &audio) != KOKOPOP_OK) {
+    fprintf(stderr, "synthesis failed: %s\n", kokopop_last_error());
+}
 kokopop_write_wav("output.wav", &audio);
+
+/* Query the model sample rate */
+int sample_rate = kokopop_model_sample_rate(model); /* typically 24000 */
 
 kokopop_audio_free(&audio);
 kokopop_model_free(model);
 ```
 
-## Project Structure
+Use `kokopop_synthesize_phonemes()` when your input is already phonemized:
 
+```c
+kokopop_synthesize_phonemes(model, "həˈloʊ wɜrld", "af_heart", 1.0f, &audio);
 ```
-include/     — Public headers (kokopop.h)
-src/         — Source code
-  core/      — Error handling, string utilities, WAV I/O
-  backend/   — CPU, Metal, CUDA, and Vulkan backend implementations
-  inference/ — Kokoro graph operations and audio utilities
-  synthesis/ — Phonemizer, text chunking, G2P (zh_g2p, pinyin), and main synthesis pipeline
-  audio/     — Audio post-processing
-  streaming/ — Streaming generation support
-  playback/  — Audio playback utilities
-tools/       — CLI tools
-  kokopop_say    — Synthesize text/phonemes to WAV, PCM, or Ogg/Opus
-  kokopop_stream — STDIO streaming (stdin → stdout) and async HTTP server
-tests/       — Unit and integration tests
+
+**Chunked pull synthesis**
+
+Use `kokopop_synthesis` when you want progressive audio chunks and
+back-pressure from your own event loop:
+
+```c
+kokopop_synthesis_options opts = {0};
+opts.voice  = "af_heart";
+opts.speed  = 1.0f;
+opts.mode   = KOKOPOP_SYNTH_ADAPTATIVE; /* or KOKOPOP_SYNTH_LONG_FORM */
+opts.first_chunk_target_tokens = 50;   /* optional: reduce TTFB */
+
+kokopop_synthesis *synth = NULL;
+kokopop_synthesis_create(model, &opts, &synth);
+
+kokopop_synthesis_push_text(synth, "First fragment. ");
+kokopop_synthesis_push_text(synth, "Second fragment.");
+kokopop_synthesis_finish_input(synth);
+
+for (;;) {
+    kokopop_audio_chunk *chunks = NULL;
+    size_t n = 0;
+    if (kokopop_synthesis_next(synth, 2, &chunks, &n) != KOKOPOP_OK || n == 0) break;
+
+    for (size_t i = 0; i < n; ++i) {
+        /* chunks[i].samples — float32 PCM at chunks[i].sample_rate */
+        /* chunks[i].chunk_index, chunks[i].is_final */
+    }
+    int done = chunks[n - 1].is_final;
+    kokopop_audio_chunks_free(chunks, n);
+    if (done) break;
+}
+
+kokopop_synthesis_free(synth);
+```
+
+**Streaming audio encoding**
+
+Convert float32 samples to a streamable byte format (PCM, WAV, or Ogg/Opus):
+
+```c
+kokopop_encoder_options enc_opts = {0};
+enc_opts.format      = KOKOPOP_AUDIO_WAV_PCM16; /* PCM_F32LE, WAV_PCM16, OGG_OPUS */
+enc_opts.sample_rate = 24000;
+
+kokopop_audio_encoder *enc = NULL;
+kokopop_audio_encoder_create(&enc_opts, &enc);
+
+kokopop_bytes bytes = {0};
+kokopop_audio_encoder_start(enc, &bytes); /* WAV header / Ogg stream header */
+kokopop_bytes_free(&bytes);
+
+/* Push each chunk — PCM and Ogg emit bytes immediately; WAV buffers until finish */
+kokopop_audio_encoder_push(enc, audio.samples, audio.n_samples, /*is_final=*/1, &bytes);
+kokopop_bytes_free(&bytes);
+
+kokopop_audio_encoder_finish(enc, /*success=*/1, &bytes);
+/* bytes.data is the complete WAV file in WAV mode */
+kokopop_bytes_free(&bytes);
+kokopop_audio_encoder_free(enc);
 ```
 
 ## Available Voices
