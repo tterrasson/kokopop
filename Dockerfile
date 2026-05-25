@@ -18,6 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libopusfile-dev \
     libopusenc-dev \
     pkg-config \
+    libpython3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv
