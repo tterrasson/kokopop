@@ -631,7 +631,7 @@ Kokopop supports the following languages:
 | Option                | Default | Description                      |
 |-----------------------|---------|----------------------------------|
 | `KOKOPOP_BUILD_TESTS` | `OFF`   | Build unit tests                 |
-| `KOKOPOP_BUILD_TOOLS` | `OFF`   | Build CLI tools                  |
+| `KOKOPOP_BUILD_TOOLS` | `ON`    | Build CLI tools                  |
 | `KOKOPOP_ENABLE_METAL`| `OFF`   | Enable Metal GPU backend (macOS) |
 | `KOKOPOP_ENABLE_CUDA` | `OFF`   | Enable CUDA backend (NVIDIA GPUs) |
 | `KOKOPOP_ENABLE_VULKAN` | `OFF` | Enable Vulkan GPU backend |
