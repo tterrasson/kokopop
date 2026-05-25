@@ -1,5 +1,6 @@
 #pragma once
 
+#include "inference/kokoro.h"
 #include "model/model.h"
 #include "synthesis/chunker/chunker.h"
 
@@ -78,6 +79,7 @@ struct SynthesisPlan {
     float speed;
     StreamMode mode;
     ChunkConfig config;
+    KokoroDiffusionOptions diffusion;
 
     /// Estimate total output samples (rough: 0.035s per token / speed)
     size_t estimated_total_samples(int sample_rate) const;

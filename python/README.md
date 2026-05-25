@@ -86,6 +86,7 @@ with kokopop.SynthesisSession(
     speed=1.0,
     mode=kokopop.Mode.ADAPTATIVE,
     first_chunk_target_tokens=64,
+    enable_diffusion=False,
 ) as synth:
     synth.push_text("First fragment. ")
     synth.push_text("Second fragment.")
@@ -116,6 +117,12 @@ for chunk in model.stream(
 ):
     pcm = memoryview(chunk)
 ```
+
+Diffusion style options are accepted by `SynthesisSession` and `Model.stream()`
+using the same names as the C API (`enable_diffusion`, `diffusion_seed`,
+`diffusion_steps`, `diffusion_alpha`, `diffusion_beta`,
+`diffusion_embedding_scale`). Leave `enable_diffusion=False` for the stable
+default voice style path.
 
 ## Streaming audio encoding
 

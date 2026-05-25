@@ -5,6 +5,7 @@
 #include "core/utf8.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <thread>
@@ -35,6 +36,15 @@ bool get_bool(gguf_context * ctx, const char * key, bool & out) {
         return false;
     }
     out = gguf_get_val_bool(ctx, idx);
+    return true;
+}
+
+bool get_f32(gguf_context * ctx, const char * key, float & out) {
+    const int idx = find_key(ctx, key);
+    if (idx < 0) {
+        return false;
+    }
+    out = gguf_get_val_f32(ctx, idx);
     return true;
 }
 
@@ -564,6 +574,12 @@ bool load_model_from_gguf(
     uint32_t sample_rate = 24000;
     if (get_u32(meta, "kokopop.sample_rate", sample_rate)) {
         m->sample_rate = static_cast<int32_t>(sample_rate);
+    }
+
+    float diffusion_sigma_data = 0.2f;
+    if (get_f32(meta, "kokopop.diffusion.sigma_data", diffusion_sigma_data) &&
+        std::isfinite(diffusion_sigma_data) && diffusion_sigma_data > 0.0f) {
+        m->diffusion_sigma_data = diffusion_sigma_data;
     }
 
     if (!get_string_array(meta, "tokenizer.ggml.tokens", m->vocab)) {

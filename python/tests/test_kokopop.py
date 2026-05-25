@@ -156,6 +156,27 @@ def test_streaming_session(mock_gguf):
         session.next()
 
 
+def test_streaming_session_accepts_disabled_diffusion_options(mock_gguf):
+    model = kokopop.Model(str(mock_gguf), backend="cpu")
+    with kokopop.SynthesisSession(
+        model,
+        voice="af_heart",
+        mode="long_form",
+        enable_diffusion=False,
+        diffusion_seed=1234,
+        diffusion_steps=7,
+        diffusion_alpha=0.2,
+        diffusion_beta=0.6,
+        diffusion_embedding_scale=1.5,
+    ) as session:
+        session.push_text("Alpha sentence.")
+        session.finish_input()
+        chunks = session.next()
+
+    assert chunks
+    assert chunks[0].n_samples > 0
+
+
 def test_model_stream_iterator(mock_gguf):
     model = kokopop.Model(str(mock_gguf), backend="cpu")
     stream = model.stream(
@@ -175,6 +196,22 @@ def test_model_stream_iterator(mock_gguf):
     assert isinstance(first, kokopop.AudioChunk)
 
     chunks = [first, *list(stream)]
+    assert chunks
+    assert any(chunk.is_final for chunk in chunks)
+
+
+def test_model_stream_accepts_disabled_diffusion_options(mock_gguf):
+    model = kokopop.Model(str(mock_gguf), backend="cpu")
+    chunks = list(model.stream(
+        "Alpha sentence.",
+        voice="af_heart",
+        enable_diffusion=False,
+        diffusion_seed=1234,
+        diffusion_steps=7,
+        diffusion_alpha=0.2,
+        diffusion_beta=0.6,
+        diffusion_embedding_scale=1.5,
+    ))
     assert chunks
     assert any(chunk.is_final for chunk in chunks)
 

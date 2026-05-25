@@ -117,6 +117,21 @@ acoustic path produces small per-element errors that compound through AdaIN
 layers — both eventually destabilise the duration head or saturate the
 vocoder on some inputs. F16 stays bit-stable across all backends.
 
+#### Diffusion style tensors
+
+The converter records diffusion metadata (`kokopop.diffusion.*`) and exports
+diffusion UNet tensors when the source Kokoro package exposes an available
+diffusion module. Models without that module continue to load and synthesize
+normally; the default runtime path always uses the deterministic voice style
+embedded in `kokopop.voice.*`.
+
+Diffusion style sampling is opt-in through the chunked C API
+(`kokopop_synthesis_options.enable_diffusion`) and the matching Python
+streaming options. Leave it disabled for existing behavior. If diffusion is
+enabled with a model that has no diffusion tensors, or with a build that does
+not include a C++ sampler for them, synthesis fails with an explicit error
+instead of silently changing voice style or perturbing standard generation.
+
 ### Usage
 
 Synthesize text to a WAV file:

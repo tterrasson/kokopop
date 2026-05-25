@@ -56,6 +56,7 @@ bool run_real_synthesis(
     const std::string & phonemes,
     const std::string & voice,
     float speed,
+    const KokoroDiffusionOptions * diffusion,
     std::vector<float> & audio,
     std::string & error) {
     std::vector<uint32_t> ids;
@@ -65,7 +66,7 @@ bool run_real_synthesis(
 
     KokoroFrontendProbe probe;
     const int64_t style_len = utf8_codepoint_count(phonemes);
-    if (!run_kokoro_frontend_probe(model, ids, voice, probe, error, style_len)) {
+    if (!run_kokoro_frontend_probe(model, ids, voice, probe, error, style_len, diffusion)) {
         return false;
     }
     KokoroGenerationProbe gen;
@@ -128,6 +129,15 @@ bool synthesize_phonemes(
     Model & model, const std::string & phonemes,
     const std::string & voice, float speed,
     kokopop_audio & out, std::string & error) {
+    KokoroDiffusionOptions diffusion;
+    return synthesize_phonemes(model, phonemes, voice, speed, diffusion, out, error);
+}
+
+bool synthesize_phonemes(
+    Model & model, const std::string & phonemes,
+    const std::string & voice, float speed,
+    const KokoroDiffusionOptions & diffusion,
+    kokopop_audio & out, std::string & error) {
     if (speed <= 0.0f || speed > 4.0f || !std::isfinite(speed)) {
         error = "speed must be greater than 0 and at most 4";
         return false;
@@ -143,7 +153,7 @@ bool synthesize_phonemes(
 
     if (!model.is_mock) {
         std::vector<float> audio;
-        if (!run_real_synthesis(model, phonemes, voice, speed, audio, error)) {
+        if (!run_real_synthesis(model, phonemes, voice, speed, &diffusion, audio, error)) {
             return false;
         }
 

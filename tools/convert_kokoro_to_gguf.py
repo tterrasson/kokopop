@@ -396,6 +396,9 @@ class GGUFWriter:
     def add_bool(self, key: str, value: bool) -> None:
         self.kv.append((key, GGUF_TYPE_BOOL, bool(value)))
 
+    def add_f32(self, key: str, value: float) -> None:
+        self.kv.append((key, GGUF_TYPE_FLOAT32, float(value)))
+
     def add_string(self, key: str, value: str) -> None:
         self.kv.append((key, GGUF_TYPE_STRING, value))
 
@@ -460,6 +463,8 @@ class GGUFWriter:
             out += struct.pack("<I", typ)
             if typ == GGUF_TYPE_UINT32:
                 out += struct.pack("<I", value)
+            elif typ == GGUF_TYPE_FLOAT32:
+                out += struct.pack("<f", value)
             elif typ == GGUF_TYPE_BOOL:
                 out += b"\x01" if value else b"\x00"
             elif typ == GGUF_TYPE_STRING:
@@ -716,6 +721,22 @@ def convert(args: argparse.Namespace) -> None:
     writer.add_u32("kokopop.max_dur", int(config["max_dur"]))
     writer.add_u32("kokopop.n_mels", int(config["n_mels"]))
 
+    diffusion_available = bool(
+        getattr(model, "diffusion", None) is not None
+        and getattr(model, "diffusion_available", False)
+    )
+    writer.add_bool("kokopop.diffusion.available", diffusion_available)
+
+    if getattr(model, "diffusion", None) is not None:
+        writer.add_u32("kokopop.diffusion.style_dim", int(config["style_dim"]) * 2)
+        writer.add_u32("kokopop.diffusion.embedding_dim", int(config["plbert"]["hidden_size"]))
+        writer.add_u32("kokopop.diffusion.steps_default", 5)
+        writer.add_f32("kokopop.diffusion.sigma_min", 0.0001)
+        writer.add_f32("kokopop.diffusion.sigma_max", 3.0)
+        writer.add_f32("kokopop.diffusion.rho", 9.0)
+        sigma_data = getattr(getattr(model.diffusion, "diffusion", None), "sigma_data", 0.2)
+        writer.add_f32("kokopop.diffusion.sigma_data", float(sigma_data))
+
     # Tensors
     add_state_dict("kokopop.albert", model.bert.state_dict(), writer)
     writer.add_tensor("kokopop.bert_encoder.weight", model.bert_encoder.weight)
@@ -723,6 +744,9 @@ def convert(args: argparse.Namespace) -> None:
     add_regularized_modules("kokopop.predictor", model.predictor, writer)
     add_regularized_modules("kokopop.text_encoder", model.text_encoder, writer)
     add_regularized_modules("kokopop.decoder", model.decoder, writer)
+
+    if diffusion_available:
+        add_state_dict("kokopop.diffusion", model.diffusion.unet.state_dict(), writer)
 
     for voice in voices:
         voice_path = _resolve_file(f"voices/{voice}.pt", args)

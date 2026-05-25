@@ -17,6 +17,7 @@ struct SynthesisSessionOptions {
     ChunkConfig chunk_config{};
     bool has_chunk_config = false;
     bool use_exact_chunk_config = false;
+    KokoroDiffusionOptions diffusion{};
 };
 
 struct SynthesisAudioChunk {

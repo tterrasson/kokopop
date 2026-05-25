@@ -167,6 +167,12 @@ struct Model {
     int64_t            duration_proj_in  = 0;  // hidden dim (= duration_w->ne[0])
     int64_t            duration_proj_out = 0;  // n_buckets (= duration_w->ne[1])
 
+    // Host-side dequantized diffusion transformer weights. The sampler is CPU
+    // only for now and reads these immutable tensors repeatedly across ADPM2
+    // steps, so cache the F32 copies after first use.
+    std::unordered_map<std::string, std::vector<float>> diffusion_f32;
+    float diffusion_sigma_data = 0.2f;
+
     // Scratch storage for LstmCustomParams instances built during graph
     // construction.  Reserve 24 slots before building the generation graph
     // (12 LSTM directions × safety margin) so no reallocation occurs and

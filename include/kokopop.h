@@ -83,6 +83,15 @@ typedef struct kokopop_synthesis_options {
     int32_t crossfade_ms;
     int32_t max_silence_trim_ms;
     int32_t trim_silence; // 0 = preset, 1 = true, -1 = false
+
+    // Optional diffusion style sampling. Disabled by default.
+    // Requires a GGUF converted with kokopop.diffusion.* tensors.
+    int32_t enable_diffusion;
+    uint32_t diffusion_seed;
+    int32_t diffusion_steps;
+    float diffusion_alpha;
+    float diffusion_beta;
+    float diffusion_embedding_scale;
 } kokopop_synthesis_options;
 
 typedef struct kokopop_encoder_options {

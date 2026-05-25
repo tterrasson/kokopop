@@ -11,8 +11,11 @@ namespace kokopop {
 struct KokoroFrontendProbe {
     std::vector<float> hidden;
     std::vector<float> durations;
+    std::vector<float> style;
+    std::vector<float> bert_embedding;
     int64_t n_tokens = 0;
     int64_t hidden_dim = 0;
+    int64_t embedding_dim = 0;
 };
 
 struct KokoroGenerationProbe {
@@ -201,6 +204,15 @@ struct CpuTensor {
     }
 };
 
+struct KokoroDiffusionOptions {
+    bool enabled = false;
+    uint32_t seed = 0;
+    int steps = 5;
+    float alpha = 0.1f;
+    float beta = 0.5f;
+    float embedding_scale = 1.0f;
+};
+
 bool ggml_generator(
     Model & model, const CpuTensor & decoder,
     const std::vector<float> & f0,
@@ -218,7 +230,8 @@ bool run_kokoro_frontend_probe(
     const std::string & voice,
     KokoroFrontendProbe & probe,
     std::string & error,
-    int64_t style_len = -1);
+    int64_t style_len = -1,
+    const KokoroDiffusionOptions * diffusion = nullptr);
 
 bool run_kokoro_generation_probe(
     Model & model,

@@ -270,6 +270,39 @@ TEST_CASE("api_synthesis_session_pull_chunks") {
     kokopop_model_free(model);
 }
 
+TEST_CASE("api_synthesis_session_diffusion_options_disabled_are_noop") {
+    const std::string & gguf = shared_mock_gguf();
+    kokopop_model * model = nullptr;
+    CHECK_EQ(kokopop_model_load(gguf.c_str(), nullptr, &model), KOKOPOP_OK);
+
+    kokopop_synthesis_options opts{};
+    opts.voice = "af_heart";
+    opts.speed = 1.0f;
+    opts.mode = KOKOPOP_SYNTH_LONG_FORM;
+    opts.enable_diffusion = 0;
+    opts.diffusion_seed = 1234;
+    opts.diffusion_steps = 7;
+    opts.diffusion_alpha = 0.2f;
+    opts.diffusion_beta = 0.6f;
+    opts.diffusion_embedding_scale = 1.5f;
+
+    kokopop_synthesis * synth = nullptr;
+    CHECK_EQ(kokopop_synthesis_create(model, &opts, &synth), KOKOPOP_OK);
+    REQUIRE(synth != nullptr);
+    CHECK_EQ(kokopop_synthesis_push_text(synth, "Hello world."), KOKOPOP_OK);
+    CHECK_EQ(kokopop_synthesis_finish_input(synth), KOKOPOP_OK);
+
+    kokopop_audio_chunk * chunks = nullptr;
+    size_t n_chunks = 0;
+    CHECK_EQ(kokopop_synthesis_next(synth, 1, &chunks, &n_chunks), KOKOPOP_OK);
+    REQUIRE_EQ(n_chunks, 1u);
+    CHECK(chunks[0].n_samples > 0);
+    kokopop_audio_chunks_free(chunks, n_chunks);
+
+    kokopop_synthesis_free(synth);
+    kokopop_model_free(model);
+}
+
 TEST_CASE("api_synthesis_session_next_multiple_chunks") {
     const std::string & gguf = shared_mock_gguf();
     kokopop_model * model = nullptr;

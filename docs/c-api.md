@@ -34,6 +34,7 @@ opts.voice = "af_heart";
 opts.speed = 1.0f;
 opts.mode = KOKOPOP_SYNTH_ADAPTATIVE;
 opts.first_chunk_target_tokens = 64; /* optional */
+opts.enable_diffusion = 0;           /* default: stable voice style */
 
 kokopop_synthesis *synth = NULL;
 kokopop_synthesis_create(model, &opts, &synth);
@@ -65,6 +66,34 @@ more stable long-form prosody. The token and pause fields in
 `kokopop_synthesis_options` are optional overrides; leave them as zero to use
 the mode preset. `trim_silence` uses `0` for preset, `1` for enabled, and `-1`
 for disabled.
+
+### Diffusion style sampling
+
+Diffusion style sampling is opt-in through `enable_diffusion` and the
+`diffusion_*` fields on `kokopop_synthesis_options`.
+
+```c
+kokopop_synthesis_options opts = {0};
+opts.voice = "af_heart";
+opts.speed = 1.0f;
+opts.mode = KOKOPOP_SYNTH_ADAPTATIVE;
+
+opts.enable_diffusion = 1;
+opts.diffusion_seed = 1234;
+opts.diffusion_steps = 5;              /* default when <= 0 */
+opts.diffusion_alpha = 0.1f;           /* default when 0 */
+opts.diffusion_beta = 0.5f;            /* default when 0 */
+opts.diffusion_embedding_scale = 1.0f; /* default when 0 */
+```
+
+Leave `enable_diffusion` at `0` for the stable voice style path and source
+compatibility with existing callers. When enabled, the model must contain
+`kokopop.diffusion.*` tensors emitted by `tools/convert_kokoro_to_gguf.py`.
+Builds without a C++ diffusion sampler fail the request with a clear
+`KOKOPOP_ERROR_INFERENCE` error instead of silently changing the generated
+audio. One-shot `kokopop_synthesize_text()` and
+`kokopop_synthesize_phonemes()` intentionally keep the stable path; use
+`kokopop_synthesis` when you need diffusion options.
 
 For v1, push all text before generation. After `kokopop_synthesis_finish_input()`
 and the first `kokopop_synthesis_next()`, further `push_text()` calls fail.

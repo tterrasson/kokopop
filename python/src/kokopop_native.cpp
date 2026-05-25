@@ -198,6 +198,16 @@ int get_optional_int(PyObject * kwargs, const char * key, int32_t & out) {
     return 0;
 }
 
+int get_optional_u32(PyObject * kwargs, const char * key, uint32_t & out) {
+    if (kwargs == nullptr) return 0;
+    PyObject * value = PyDict_GetItemString(kwargs, key);
+    if (value == nullptr || value == Py_None) return 0;
+    unsigned long v = PyLong_AsUnsignedLong(value);
+    if (PyErr_Occurred()) return -1;
+    out = static_cast<uint32_t>(v);
+    return 0;
+}
+
 int get_optional_float(PyObject * kwargs, const char * key, float & out) {
     if (kwargs == nullptr) return 0;
     PyObject * value = PyDict_GetItemString(kwargs, key);
@@ -237,7 +247,9 @@ int fill_synthesis_options(PyObject * kwargs, kokopop_synthesis_options & opts) 
         "soft_max_tokens", "hard_max_tokens", "first_chunk_target_tokens",
         "target_overshoot_tokens", "comma_pause_ms", "sentence_pause_ms",
         "paragraph_pause_ms", "crossfade_ms", "max_silence_trim_ms",
-        "trim_silence", "max_chunks", nullptr,
+        "trim_silence", "enable_diffusion", "diffusion_seed",
+        "diffusion_steps", "diffusion_alpha", "diffusion_beta",
+        "diffusion_embedding_scale", "max_chunks", nullptr,
     };
     if (reject_unknown_kwargs(kwargs, allowed) < 0) return -1;
 
@@ -258,6 +270,12 @@ int fill_synthesis_options(PyObject * kwargs, kokopop_synthesis_options & opts) 
     if (get_optional_int(kwargs, "paragraph_pause_ms", opts.paragraph_pause_ms) < 0) return -1;
     if (get_optional_int(kwargs, "crossfade_ms", opts.crossfade_ms) < 0) return -1;
     if (get_optional_int(kwargs, "max_silence_trim_ms", opts.max_silence_trim_ms) < 0) return -1;
+    if (get_optional_int(kwargs, "enable_diffusion", opts.enable_diffusion) < 0) return -1;
+    if (get_optional_u32(kwargs, "diffusion_seed", opts.diffusion_seed) < 0) return -1;
+    if (get_optional_int(kwargs, "diffusion_steps", opts.diffusion_steps) < 0) return -1;
+    if (get_optional_float(kwargs, "diffusion_alpha", opts.diffusion_alpha) < 0) return -1;
+    if (get_optional_float(kwargs, "diffusion_beta", opts.diffusion_beta) < 0) return -1;
+    if (get_optional_float(kwargs, "diffusion_embedding_scale", opts.diffusion_embedding_scale) < 0) return -1;
 
     PyObject * trim = kwargs ? PyDict_GetItemString(kwargs, "trim_silence") : nullptr;
     if (trim != nullptr && trim != Py_None) {

@@ -1,0 +1,480 @@
+#include "inference/diffusion_sampler.h"
+
+#include "core/constants.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <limits>
+#include <random>
+
+#include <ggml.h>
+
+namespace kokopop {
+namespace {
+
+struct DiffusionTensor {
+    const float * data = nullptr;
+    int64_t ne0 = 0;
+    int64_t ne1 = 1;
+};
+
+bool diffusion_tensor(
+    Model & model,
+    const std::string & name,
+    DiffusionTensor & out,
+    std::string & error) {
+    ggml_tensor * t = model.cached_tensor(name);
+    if (t == nullptr) {
+        error = "missing Kokoro diffusion tensor: " + name;
+        return false;
+    }
+
+    auto it = model.diffusion_f32.find(name);
+    if (it == model.diffusion_f32.end()) {
+        std::vector<float> data;
+        if (!tensor_to_f32(*model.backend, t, data)) {
+            error = "failed to read Kokoro diffusion tensor: " + name;
+            return false;
+        }
+        it = model.diffusion_f32.emplace(name, std::move(data)).first;
+    }
+
+    out.data = it->second.data();
+    out.ne0 = t->ne[0];
+    out.ne1 = t->ne[1];
+    return true;
+}
+
+float gelu_exact(float x) {
+    constexpr float inv_sqrt2 = 0.7071067811865475244f;
+    return 0.5f * x * (1.0f + std::erf(x * inv_sqrt2));
+}
+
+bool diffusion_linear_rows(
+    Model & model,
+    const std::string & prefix,
+    const std::vector<float> & input,
+    int64_t rows,
+    int64_t in_dim,
+    std::vector<float> & out,
+    int64_t & out_dim,
+    std::string & error,
+    bool bias_required = true) {
+    DiffusionTensor w;
+    if (!diffusion_tensor(model, prefix + ".weight", w, error)) return false;
+    if (w.ne0 != in_dim) {
+        error = "Kokoro diffusion tensor shape mismatch: " + prefix + ".weight";
+        return false;
+    }
+    out_dim = w.ne1;
+    out.assign(static_cast<size_t>(rows * out_dim), 0.0f);
+
+    DiffusionTensor b;
+    const bool has_bias = model.cached_tensor(prefix + ".bias") != nullptr;
+    if (bias_required && !has_bias) {
+        error = "missing Kokoro diffusion tensor: " + prefix + ".bias";
+        return false;
+    }
+    if (has_bias && !diffusion_tensor(model, prefix + ".bias", b, error)) return false;
+
+    for (int64_t r = 0; r < rows; ++r) {
+        const float * x = input.data() + static_cast<size_t>(r * in_dim);
+        float * y = out.data() + static_cast<size_t>(r * out_dim);
+        for (int64_t oc = 0; oc < out_dim; ++oc) {
+            double acc = has_bias ? static_cast<double>(b.data[oc]) : 0.0;
+            const float * wr = w.data + static_cast<size_t>(oc * in_dim);
+            for (int64_t ic = 0; ic < in_dim; ++ic) {
+                acc += static_cast<double>(wr[ic]) * static_cast<double>(x[ic]);
+            }
+            y[oc] = static_cast<float>(acc);
+        }
+    }
+    return true;
+}
+
+bool diffusion_layer_norm_rows(
+    Model & model,
+    const std::string & prefix,
+    const std::vector<float> & input,
+    int64_t rows,
+    int64_t dim,
+    std::vector<float> & out,
+    std::string & error) {
+    DiffusionTensor gamma;
+    DiffusionTensor beta;
+    if (!diffusion_tensor(model, prefix + ".weight", gamma, error) ||
+        !diffusion_tensor(model, prefix + ".bias", beta, error)) {
+        return false;
+    }
+    if (gamma.ne0 != dim || beta.ne0 != dim) {
+        error = "Kokoro diffusion layer norm shape mismatch: " + prefix;
+        return false;
+    }
+
+    out.resize(input.size());
+    for (int64_t r = 0; r < rows; ++r) {
+        const float * x = input.data() + static_cast<size_t>(r * dim);
+        float * y = out.data() + static_cast<size_t>(r * dim);
+        double mean = 0.0;
+        for (int64_t i = 0; i < dim; ++i) mean += x[i];
+        mean /= static_cast<double>(dim);
+        double var = 0.0;
+        for (int64_t i = 0; i < dim; ++i) {
+            const double d = static_cast<double>(x[i]) - mean;
+            var += d * d;
+        }
+        const double inv_std = 1.0 / std::sqrt(var / static_cast<double>(dim) + 1e-5);
+        for (int64_t i = 0; i < dim; ++i) {
+            y[i] = static_cast<float>(
+                ((static_cast<double>(x[i]) - mean) * inv_std) *
+                static_cast<double>(gamma.data[i]) +
+                static_cast<double>(beta.data[i]));
+        }
+    }
+    return true;
+}
+
+bool diffusion_attention_block(
+    Model & model,
+    const std::string & prefix,
+    std::vector<float> & x,
+    int64_t rows,
+    int64_t features,
+    std::string & error) {
+    if (model.cached_tensor(prefix + ".attention.norm.fc.weight") != nullptr) {
+        error = "diffusion StyleTransformer1d is not implemented; convert a non-multispeaker Kokoro diffusion model";
+        return false;
+    }
+
+    std::vector<float> normed;
+    if (!diffusion_layer_norm_rows(model, prefix + ".attention.norm", x, rows, features, normed, error)) {
+        return false;
+    }
+
+    std::vector<float> q;
+    std::vector<float> kv;
+    int64_t q_dim = 0;
+    int64_t kv_dim = 0;
+    if (!diffusion_linear_rows(model, prefix + ".attention.to_q", normed, rows, features, q, q_dim, error, false) ||
+        !diffusion_linear_rows(model, prefix + ".attention.to_kv", normed, rows, features, kv, kv_dim, error, false)) {
+        return false;
+    }
+    if ((kv_dim % 2) != 0 || q_dim * 2 != kv_dim || (q_dim % 8) != 0) {
+        error = "unsupported Kokoro diffusion attention dimensions";
+        return false;
+    }
+
+    constexpr int64_t num_heads = 8;
+    const int64_t head_dim = q_dim / num_heads;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    std::vector<float> mid(static_cast<size_t>(rows * q_dim), 0.0f);
+    std::vector<float> logits(static_cast<size_t>(rows));
+    std::vector<float> probs(static_cast<size_t>(rows));
+
+    for (int64_t h = 0; h < num_heads; ++h) {
+        for (int64_t i = 0; i < rows; ++i) {
+            float max_logit = -std::numeric_limits<float>::infinity();
+            const float * qi = q.data() + static_cast<size_t>(i * q_dim + h * head_dim);
+            for (int64_t j = 0; j < rows; ++j) {
+                const float * kj = kv.data() + static_cast<size_t>(j * kv_dim + h * head_dim);
+                double dot = 0.0;
+                for (int64_t d = 0; d < head_dim; ++d) {
+                    dot += static_cast<double>(qi[d]) * static_cast<double>(kj[d]);
+                }
+                const float v = static_cast<float>(dot) * scale;
+                logits[static_cast<size_t>(j)] = v;
+                max_logit = std::max(max_logit, v);
+            }
+            double denom = 0.0;
+            for (int64_t j = 0; j < rows; ++j) {
+                const double e = std::exp(static_cast<double>(logits[static_cast<size_t>(j)] - max_logit));
+                probs[static_cast<size_t>(j)] = static_cast<float>(e);
+                denom += e;
+            }
+            float * out = mid.data() + static_cast<size_t>(i * q_dim + h * head_dim);
+            for (int64_t d = 0; d < head_dim; ++d) out[d] = 0.0f;
+            for (int64_t j = 0; j < rows; ++j) {
+                const float p = static_cast<float>(static_cast<double>(probs[static_cast<size_t>(j)]) / denom);
+                const float * vj = kv.data() + static_cast<size_t>(j * kv_dim + q_dim + h * head_dim);
+                for (int64_t d = 0; d < head_dim; ++d) {
+                    out[d] += p * vj[d];
+                }
+            }
+        }
+    }
+
+    std::vector<float> attn_out;
+    int64_t attn_out_dim = 0;
+    if (!diffusion_linear_rows(model, prefix + ".attention.attention.to_out", mid, rows, q_dim, attn_out, attn_out_dim, error)) {
+        return false;
+    }
+    if (attn_out_dim != features) {
+        error = "Kokoro diffusion attention output shape mismatch";
+        return false;
+    }
+    for (size_t i = 0; i < x.size(); ++i) x[i] += attn_out[i];
+
+    std::vector<float> ff1;
+    std::vector<float> ff2;
+    int64_t ff_dim = 0;
+    int64_t ff_out_dim = 0;
+    if (!diffusion_linear_rows(model, prefix + ".feed_forward.0", x, rows, features, ff1, ff_dim, error)) {
+        return false;
+    }
+    for (float & v : ff1) v = gelu_exact(v);
+    if (!diffusion_linear_rows(model, prefix + ".feed_forward.2", ff1, rows, ff_dim, ff2, ff_out_dim, error)) {
+        return false;
+    }
+    if (ff_out_dim != features) {
+        error = "Kokoro diffusion feed-forward output shape mismatch";
+        return false;
+    }
+    for (size_t i = 0; i < x.size(); ++i) x[i] += ff2[i];
+    return true;
+}
+
+bool diffusion_transformer_run(
+    Model & model,
+    const std::vector<float> & x_style,
+    float c_noise,
+    const std::vector<float> & embedding,
+    int64_t n_tokens,
+    int64_t embedding_dim,
+    std::vector<float> & out,
+    std::string & error,
+    bool use_fixed_embedding) {
+    constexpr int64_t style_dim = 256;
+    const int64_t features = style_dim + embedding_dim;
+    if (static_cast<int64_t>(x_style.size()) != style_dim ||
+        static_cast<int64_t>(embedding.size()) != n_tokens * embedding_dim) {
+        error = "invalid Kokoro diffusion transformer inputs";
+        return false;
+    }
+
+    std::vector<float> fixed;
+    const float * embedding_data = embedding.data();
+    if (use_fixed_embedding) {
+        DiffusionTensor fixed_w;
+        if (!diffusion_tensor(model, "kokopop.diffusion.fixed_embedding.embedding.weight", fixed_w, error)) {
+            return false;
+        }
+        if (fixed_w.ne0 != embedding_dim || fixed_w.ne1 < n_tokens) {
+            error = "Kokoro diffusion fixed embedding shape mismatch";
+            return false;
+        }
+        fixed.assign(fixed_w.data, fixed_w.data + static_cast<size_t>(n_tokens * embedding_dim));
+        embedding_data = fixed.data();
+    }
+
+    std::vector<float> time_emb(257);
+    time_emb[0] = c_noise;
+    DiffusionTensor time_weights;
+    if (!diffusion_tensor(model, "kokopop.diffusion.to_time.0.weights", time_weights, error)) {
+        return false;
+    }
+    if (time_weights.ne0 * 2 + 1 != 257) {
+        error = "Kokoro diffusion time embedding shape mismatch";
+        return false;
+    }
+    constexpr float two_pi = 6.2831853071795864769f;
+    for (int64_t i = 0; i < time_weights.ne0; ++i) {
+        const float phase = c_noise * time_weights.data[i] * two_pi;
+        time_emb[static_cast<size_t>(1 + i)] = std::sin(phase);
+        time_emb[static_cast<size_t>(1 + time_weights.ne0 + i)] = std::cos(phase);
+    }
+
+    std::vector<float> mapping;
+    int64_t mapping_dim = 0;
+    if (!diffusion_linear_rows(model, "kokopop.diffusion.to_time.1", time_emb, 1, 257, mapping, mapping_dim, error)) {
+        return false;
+    }
+    for (float & v : mapping) v = gelu_exact(v);
+
+    if (model.cached_tensor("kokopop.diffusion.to_mapping.0.weight") != nullptr) {
+        std::vector<float> tmp;
+        int64_t tmp_dim = 0;
+        if (!diffusion_linear_rows(model, "kokopop.diffusion.to_mapping.0", mapping, 1, mapping_dim, tmp, tmp_dim, error)) {
+            return false;
+        }
+        for (float & v : tmp) v = gelu_exact(v);
+        if (!diffusion_linear_rows(model, "kokopop.diffusion.to_mapping.2", tmp, 1, tmp_dim, mapping, mapping_dim, error)) {
+            return false;
+        }
+        for (float & v : mapping) v = gelu_exact(v);
+    }
+
+    if (mapping_dim != features) {
+        error = "Kokoro diffusion mapping dimension mismatch";
+        return false;
+    }
+
+    std::vector<float> x(static_cast<size_t>(n_tokens * features));
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        float * row = x.data() + static_cast<size_t>(t * features);
+        for (int64_t i = 0; i < style_dim; ++i) row[i] = x_style[static_cast<size_t>(i)];
+        std::memcpy(row + style_dim,
+                    embedding_data + static_cast<size_t>(t * embedding_dim),
+                    static_cast<size_t>(embedding_dim) * sizeof(float));
+        for (int64_t i = 0; i < features; ++i) row[i] += mapping[static_cast<size_t>(i)];
+    }
+
+    for (int block = 0; block < 3; ++block) {
+        if (!diffusion_attention_block(model, "kokopop.diffusion.blocks." + std::to_string(block),
+                                       x, n_tokens, features, error)) {
+            return false;
+        }
+    }
+
+    std::vector<float> mean(static_cast<size_t>(features), 0.0f);
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        const float * row = x.data() + static_cast<size_t>(t * features);
+        for (int64_t i = 0; i < features; ++i) mean[static_cast<size_t>(i)] += row[i];
+    }
+    for (float & v : mean) v /= static_cast<float>(n_tokens);
+
+    int64_t out_dim = 0;
+    if (!diffusion_linear_rows(model, "kokopop.diffusion.to_out.1", mean, 1, features, out, out_dim, error)) {
+        return false;
+    }
+    if (out_dim != style_dim) {
+        error = "Kokoro diffusion output dimension mismatch";
+        return false;
+    }
+    return true;
+}
+
+std::vector<float> karras_sigmas(int steps) {
+    constexpr float sigma_min = 0.0001f;
+    constexpr float sigma_max = 3.0f;
+    constexpr float rho = 9.0f;
+    const float inv_rho = 1.0f / rho;
+    std::vector<float> sigmas(static_cast<size_t>(steps + 1), 0.0f);
+    for (int i = 0; i < steps; ++i) {
+        const float ramp = steps > 1 ? static_cast<float>(i) / static_cast<float>(steps - 1) : 1.0f;
+        sigmas[static_cast<size_t>(i)] = std::pow(
+            std::pow(sigma_max, inv_rho) +
+            ramp * (std::pow(sigma_min, inv_rho) - std::pow(sigma_max, inv_rho)),
+            rho);
+    }
+    return sigmas;
+}
+
+bool diffusion_denoise(
+    Model & model,
+    const std::vector<float> & x_noisy,
+    float sigma,
+    const std::vector<float> & embedding,
+    int64_t n_tokens,
+    int64_t embedding_dim,
+    float embedding_scale,
+    std::vector<float> & out,
+    std::string & error) {
+    const float sigma_data = model.diffusion_sigma_data;
+    const float denom = std::sqrt(sigma * sigma + sigma_data * sigma_data);
+    const float c_skip = (sigma_data * sigma_data) / (sigma * sigma + sigma_data * sigma_data);
+    const float c_out = sigma * sigma_data / denom;
+    const float c_in = 1.0f / denom;
+    const float c_noise = std::log(sigma) * 0.25f;
+
+    std::vector<float> x_in(x_noisy.size());
+    for (size_t i = 0; i < x_noisy.size(); ++i) x_in[i] = x_noisy[i] * c_in;
+
+    std::vector<float> pred;
+    if (!diffusion_transformer_run(model, x_in, c_noise, embedding, n_tokens,
+                                   embedding_dim, pred, error, false)) {
+        return false;
+    }
+    if (embedding_scale != 1.0f) {
+        std::vector<float> masked;
+        if (!diffusion_transformer_run(model, x_in, c_noise, embedding, n_tokens,
+                                       embedding_dim, masked, error, true)) {
+            return false;
+        }
+        for (size_t i = 0; i < pred.size(); ++i) {
+            pred[i] = masked[i] + (pred[i] - masked[i]) * embedding_scale;
+        }
+    }
+
+    out.resize(x_noisy.size());
+    for (size_t i = 0; i < x_noisy.size(); ++i) {
+        out[i] = c_skip * x_noisy[i] + c_out * pred[i];
+    }
+    return true;
+}
+
+} // namespace
+
+bool apply_diffusion_style_options(
+    Model & model,
+    const KokoroDiffusionOptions * options,
+    std::vector<float> & style,
+    const std::vector<float> & embedding,
+    int64_t n_tokens,
+    int64_t embedding_dim,
+    std::string & error) {
+    if (options == nullptr || !options->enabled) {
+        return true;
+    }
+    const float alpha = std::clamp(options->alpha, 0.0f, 1.0f);
+    const float beta = std::clamp(options->beta, 0.0f, 1.0f);
+    if (options->steps <= 0 || (alpha == 0.0f && beta == 0.0f)) {
+        return true;
+    }
+    if (model.cached_tensor("kokopop.diffusion.to_out.1.weight") == nullptr) {
+        error = "diffusion style sampling requested, but this GGUF has no diffusion tensors";
+        return false;
+    }
+    if (style.size() < 256 || embedding.empty() || n_tokens <= 0 || embedding_dim <= 0) {
+        error = "invalid Kokoro diffusion style inputs";
+        return false;
+    }
+
+    const int steps = std::clamp(options->steps, 2, 50);
+    std::mt19937 rng(options->seed);
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    std::vector<float> x(256);
+    for (float & v : x) v = normal(rng);
+
+    const std::vector<float> sigmas = karras_sigmas(steps);
+    for (float & v : x) v *= sigmas.front();
+
+    for (int i = 0; i < steps - 1; ++i) {
+        const float sigma = sigmas[static_cast<size_t>(i)];
+        const float sigma_next = sigmas[static_cast<size_t>(i + 1)];
+        const float sigma_up = sigma_next == 0.0f ? 0.0f :
+            std::sqrt(std::max(0.0f, sigma_next * sigma_next * (sigma * sigma - sigma_next * sigma_next) / (sigma * sigma)));
+        const float sigma_down = std::sqrt(std::max(0.0f, sigma_next * sigma_next - sigma_up * sigma_up));
+        const float sigma_mid = 0.5f * (sigma + sigma_down);
+
+        std::vector<float> denoised;
+        if (!diffusion_denoise(model, x, sigma, embedding, n_tokens, embedding_dim,
+                               options->embedding_scale, denoised, error)) {
+            return false;
+        }
+        std::vector<float> x_mid(x.size());
+        for (size_t j = 0; j < x.size(); ++j) {
+            const float d = (x[j] - denoised[j]) / sigma;
+            x_mid[j] = x[j] + d * (sigma_mid - sigma);
+        }
+
+        std::vector<float> denoised_mid;
+        if (!diffusion_denoise(model, x_mid, sigma_mid, embedding, n_tokens, embedding_dim,
+                               options->embedding_scale, denoised_mid, error)) {
+            return false;
+        }
+        for (size_t j = 0; j < x.size(); ++j) {
+            const float d_mid = (x_mid[j] - denoised_mid[j]) / sigma_mid;
+            x[j] = x[j] + d_mid * (sigma_down - sigma) + normal(rng) * sigma_up;
+        }
+    }
+
+    for (float & v : x) v = std::clamp(v, -1.0f, 1.0f);
+    for (size_t i = 0; i < 128; ++i) {
+        style[i] = (1.0f - alpha) * style[i] + alpha * x[i];
+        style[i + 128] = (1.0f - beta) * style[i + 128] + beta * x[i + 128];
+    }
+    return true;
+}
+
+} // namespace kokopop

@@ -180,6 +180,7 @@ set(_kokopop_model_sources
 # Inference module (Kokoro graph operations + audio utilities)
 set(_kokopop_inference_sources
   src/inference/kokoro.cpp
+  src/inference/diffusion_sampler.cpp
   src/inference/graph_ops.cpp
   src/inference/audio_utils.cpp
   src/inference/lstm_fused.cpp

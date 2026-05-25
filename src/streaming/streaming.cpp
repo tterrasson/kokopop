@@ -119,7 +119,7 @@ std::vector<float> infer_chunk(
     }
 
     kokopop_audio raw{};
-    if (!synthesize_phonemes(model, chunk_phonemes, plan.voice, plan.speed, raw, error)) {
+    if (!synthesize_phonemes(model, chunk_phonemes, plan.voice, plan.speed, plan.diffusion, raw, error)) {
         return {};
     }
 
@@ -246,7 +246,7 @@ StreamHandle stream_synthesize(
 
                 kokopop_audio raw{};
                 if (!synthesize_phonemes(*model, chunk_phonemes,
-                                          plan.voice, plan.speed, raw, r.error)) {
+                                          plan.voice, plan.speed, plan.diffusion, raw, r.error)) {
                     return r;
                 }
                 if (raw.n_samples > 0 && raw.samples != nullptr) {

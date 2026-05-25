@@ -1,6 +1,7 @@
 #include "kokoro.h"
 
 #include "constants.h"
+#include "inference/diffusion_sampler.h"
 
 #include <algorithm>
 #include <cmath>
@@ -150,6 +151,31 @@ bool build_duration_mask(
     return true;
 }
 
+bool copy_voice_style_row(
+    const Model & model,
+    const std::string & voice_name,
+    ggml_tensor * voice,
+    int64_t n_tokens,
+    int64_t style_len,
+    std::vector<float> & out,
+    std::string & error) {
+    const auto it = model.voices.find(voice_name);
+    if (it == model.voices.end()) {
+        error = "missing Kokoro voice data for style sampling";
+        return false;
+    }
+    const VoiceInfo & info = it->second;
+    if (info.cols < 256 || info.rows <= 0 || info.data.size() < static_cast<size_t>(info.rows * info.cols)) {
+        error = "invalid Kokoro voice tensor shape";
+        return false;
+    }
+    const int64_t row = std::min<int64_t>(voice_style_row(voice, n_tokens, style_len), info.rows - 1);
+    out.assign(
+        info.data.begin() + static_cast<ptrdiff_t>(row * info.cols),
+        info.data.begin() + static_cast<ptrdiff_t>(row * info.cols + 256));
+    return true;
+}
+
 } // anonymous namespace
 
 int duration_to_frames(float value) {
@@ -176,7 +202,8 @@ bool run_kokoro_frontend_probe(
     const std::string & requested_voice,
     KokoroFrontendProbe & probe,
     std::string & error,
-    int64_t style_len) {
+    int64_t style_len,
+    const KokoroDiffusionOptions * diffusion) {
 
     if (ids.empty()) {
         error = "cannot run Kokoro frontend on empty token sequence";
@@ -218,6 +245,9 @@ bool run_kokoro_frontend_probe(
         error = "missing Kokoro voice tensor for duration graph";
         return false;
     }
+    if (!copy_voice_style_row(model, voice_name, voice, static_cast<int64_t>(ids.size()), style_len, probe.style, error)) {
+        return false;
+    }
 
     const size_t mem_size = model.backend->frontend_context_bytes();
     model.backend->clear_pending_inits();
@@ -233,8 +263,10 @@ bool run_kokoro_frontend_probe(
 
     ggml_tensor * token_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
     ggml_tensor * pos_ids   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+    ggml_tensor * style_in  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 128);
     ggml_set_input(token_ids);
     ggml_set_input(pos_ids);
+    ggml_set_input(style_in);
 
     // Snapshot the last leaf tensor before any frontend compute op. After
     // building the graph, every op created since this snapshot will be pinned
@@ -294,13 +326,17 @@ bool run_kokoro_frontend_probe(
         cur = layer_norm(ctx, ggml_add(ctx, cur, residual), layer.out_norm_w, layer.out_norm_b, 1e-12f);
     }
 
+    ggml_tensor * bert_embedding = nullptr;
+    const bool diffusion_requested =
+        diffusion != nullptr && diffusion->enabled && diffusion->steps > 0 &&
+        (diffusion->alpha != 0.0f || diffusion->beta != 0.0f);
+    if (diffusion_requested) {
+        bert_embedding = ggml_cont(ctx, cur);
+    }
+
     cur = linear(ctx, enc_w, enc_b, cur);
 
-    const int64_t voice_row = voice_style_row(voice, n_tokens, style_len);
-    ggml_tensor * style = ggml_cast(
-        ctx,
-        ggml_view_1d(ctx, voice, 128, 128 * voice->nb[0] + voice_row * voice->nb[1]),
-        GGML_TYPE_F32);
+    ggml_tensor * style = style_in;
 
     model.lstm_custom_params.clear();
     model.lstm_custom_params.reserve(24);
@@ -376,8 +412,15 @@ bool run_kokoro_frontend_probe(
     ggml_set_name(dur_hidden, "kokopop_predictor_lstm_out");
     ggml_set_output(d);
     ggml_set_output(dur_hidden);
+    if (bert_embedding != nullptr) {
+        ggml_set_name(bert_embedding, "kokopop_diffusion_bert_embedding");
+        ggml_set_output(bert_embedding);
+    }
 
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, frontend_graph_size(n_tokens), false);
+    if (bert_embedding != nullptr) {
+        ggml_build_forward_expand(gf, bert_embedding);
+    }
     ggml_build_forward_expand(gf, d);
     ggml_build_forward_expand(gf, dur_hidden);
 
@@ -399,6 +442,7 @@ bool run_kokoro_frontend_probe(
 
     model.backend->tensor_set(token_ids, model.tmp_ids_i32.data(), 0, ggml_nbytes(token_ids));
     model.backend->tensor_set(pos_ids,   model.tmp_pos_i32.data(), 0, ggml_nbytes(pos_ids));
+    model.backend->tensor_set(style_in,  probe.style.data() + 128, 0, ggml_nbytes(style_in));
 
     const ggml_status status = model.backend->compute(ctx, gf);
     if (status != GGML_STATUS_SUCCESS) {
@@ -416,6 +460,13 @@ bool run_kokoro_frontend_probe(
     probe.durations.resize(static_cast<size_t>(n_tokens));
     probe.n_tokens   = n_tokens;
     probe.hidden_dim = hidden_dim;
+    if (bert_embedding != nullptr) {
+        probe.embedding_dim = bert_embedding->ne[0];
+        probe.bert_embedding.resize(static_cast<size_t>(ggml_nelements(bert_embedding)));
+        model.backend->tensor_get(
+            bert_embedding, probe.bert_embedding.data(), 0,
+            probe.bert_embedding.size() * sizeof(float));
+    }
 
     model.backend->tensor_get(d, probe.hidden.data(), 0, static_cast<size_t>(n_hidden) * sizeof(float));
 
@@ -459,6 +510,13 @@ bool run_kokoro_frontend_probe(
                 : std::exp(static_cast<double>(x)) / (1.0 + std::exp(static_cast<double>(x)));
         }
         probe.durations[static_cast<size_t>(t)] = static_cast<float>(sum);
+    }
+
+    if (!apply_diffusion_style_options(model, diffusion, probe.style,
+                                       probe.bert_embedding, probe.n_tokens,
+                                       probe.embedding_dim, error)) {
+        ggml_free(ctx);
+        return false;
     }
 
     if (const char * dump_dir = std::getenv("KOKOPOP_DUMP_DIR")) {
@@ -552,6 +610,14 @@ bool run_kokoro_generation_probe(
         error = "missing Kokoro voice tensor for generation graph";
         return false;
     }
+    std::vector<float> fallback_style;
+    const std::vector<float> * style_data = &frontend.style;
+    if (style_data->size() < 256) {
+        if (!copy_voice_style_row(model, voice_name, voice, frontend.n_tokens, style_len, fallback_style, error)) {
+            return false;
+        }
+        style_data = &fallback_style;
+    }
 
     const size_t mem_size = model.backend->generation_context_bytes(total_frames, frontend.n_tokens);
     model.backend->clear_pending_inits();
@@ -571,10 +637,14 @@ bool run_kokoro_generation_probe(
     ggml_tensor * token_ids     = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
     ggml_tensor * duration_pred = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, frontend.hidden_dim, n_tokens);
     ggml_tensor * duration_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, total_frames, n_tokens);
+    ggml_tensor * prosody_style_in = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 128);
+    ggml_tensor * decoder_style_in = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 128);
 
     ggml_set_input(token_ids);
     ggml_set_input(duration_pred);
     ggml_set_input(duration_mask);
+    ggml_set_input(prosody_style_in);
+    ggml_set_input(decoder_style_in);
 
     // Snapshot the last leaf tensor before any generation compute op. After
     // building the graph, every op created since this snapshot will be pinned
@@ -591,11 +661,7 @@ bool run_kokoro_generation_probe(
         return false;
     }
 
-    const int64_t voice_row = voice_style_row(voice, n_tokens, style_len);
-    ggml_tensor * prosody_style = ggml_cast(
-        ctx,
-        ggml_view_1d(ctx, voice, 128, 128 * voice->nb[0] + voice_row * voice->nb[1]),
-        GGML_TYPE_F32);
+    ggml_tensor * prosody_style = prosody_style_in;
 
     ggml_tensor * cur = ggml_mul_mat(
         ctx,
@@ -644,10 +710,7 @@ bool run_kokoro_generation_probe(
         return false;
     }
 
-    ggml_tensor * decoder_style = ggml_cast(
-        ctx,
-        ggml_view_1d(ctx, voice, 128, voice_row * voice->nb[1]),
-        GGML_TYPE_F32);
+    ggml_tensor * decoder_style = decoder_style_in;
 
     ggml_tensor * f0_conv_w = require_tensor(model, "kokopop.decoder.F0_conv.weight", error);
     ggml_tensor * f0_conv_b = require_tensor(model, "kokopop.decoder.F0_conv.bias", error);
@@ -787,6 +850,8 @@ bool run_kokoro_generation_probe(
     model.backend->tensor_set(token_ids,     model.tmp_ids_i32.data(), 0, ggml_nbytes(token_ids));
     model.backend->tensor_set(duration_pred, frontend.hidden.data(),   0, ggml_nbytes(duration_pred));
     model.backend->tensor_set(duration_mask, model.tmp_mask_f32.data(), 0, ggml_nbytes(duration_mask));
+    model.backend->tensor_set(decoder_style_in, style_data->data(),       0, ggml_nbytes(decoder_style_in));
+    model.backend->tensor_set(prosody_style_in, style_data->data() + 128, 0, ggml_nbytes(prosody_style_in));
 
     t0 = gen_profile ? ggml_time_us() : 0;
     const ggml_status status = model.backend->compute(ctx, gf);

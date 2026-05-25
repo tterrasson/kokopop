@@ -109,6 +109,22 @@ bool fill_chunk_config_override(const kokopop_synthesis_options * options,
     return has;
 }
 
+kokopop::KokoroDiffusionOptions make_diffusion_options(const kokopop_synthesis_options * options) {
+    kokopop::KokoroDiffusionOptions out;
+    if (options == nullptr || options->enable_diffusion == 0) {
+        return out;
+    }
+    out.enabled = true;
+    out.seed = options->diffusion_seed;
+    out.steps = options->diffusion_steps > 0 ? options->diffusion_steps : 5;
+    out.alpha = options->diffusion_alpha != 0.0f ? options->diffusion_alpha : 0.1f;
+    out.beta = options->diffusion_beta != 0.0f ? options->diffusion_beta : 0.5f;
+    out.embedding_scale = options->diffusion_embedding_scale != 0.0f
+        ? options->diffusion_embedding_scale
+        : 1.0f;
+    return out;
+}
+
 kokopop::SynthesisSessionOptions make_session_options(
     const kokopop_synthesis_options * options,
     kokopop::StreamMode default_mode = kokopop::StreamMode::Adaptative) {
@@ -118,6 +134,7 @@ kokopop::SynthesisSessionOptions make_session_options(
     bool mode_ok = true;
     out.mode = options ? c_synthesis_mode(options->mode, mode_ok) : default_mode;
     out.has_chunk_config = fill_chunk_config_override(options, out.chunk_config);
+    out.diffusion = make_diffusion_options(options);
     return out;
 }
 
