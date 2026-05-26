@@ -724,11 +724,16 @@ def _extract_diffusion_state_dict(model_path: str) -> dict | None:
     if not raw or not isinstance(raw, dict):
         return None
     prefix = _DIFFUSION_NET_PREFIX
-    unet_sd = {
-        _remap_diffusion_key(k[len(prefix):]): v
-        for k, v in raw.items()
-        if k.startswith(prefix)
-    }
+    unet_sd = {}
+    for k, v in raw.items():
+        if not k.startswith(prefix):
+            continue
+        name = _remap_diffusion_key(k[len(prefix):])
+        # to_out is a Conv1d(kernel_size=1) → stored as [out, in, 1]. The runtime
+        # reads it as a plain linear weight, so drop the trailing kernel axis.
+        if name == "to_out.1.weight" and getattr(v, "ndim", 0) == 3 and v.shape[-1] == 1:
+            v = v.squeeze(-1)
+        unet_sd[name] = v
     if not unet_sd:
         logger.warning("'diffusion' key found in checkpoint but no 'module.diffusion.net.*' tensors")
         return None

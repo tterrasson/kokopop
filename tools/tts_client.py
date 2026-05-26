@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import struct
 import sys
 import urllib.request
@@ -61,6 +62,11 @@ def _build_payload(
     prebuffer_chunks: int,
     first_chunk_tokens: int | None,
     diffusion: bool,
+    diffusion_seed: int | None,
+    diffusion_steps: int | None,
+    diffusion_alpha: float | None,
+    diffusion_beta: float | None,
+    diffusion_embedding_scale: float | None,
 ) -> dict:
     payload = {"text": text, "speed": speed, "mode": mode, "format": fmt}
     if voice:
@@ -71,6 +77,16 @@ def _build_payload(
         payload["first_chunk_target_tokens"] = first_chunk_tokens
     if diffusion:
         payload["diffusion"] = True
+        if diffusion_seed is not None:
+            payload["diffusion_seed"] = diffusion_seed
+        if diffusion_steps is not None:
+            payload["diffusion_steps"] = diffusion_steps
+        if diffusion_alpha is not None:
+            payload["diffusion_alpha"] = diffusion_alpha
+        if diffusion_beta is not None:
+            payload["diffusion_beta"] = diffusion_beta
+        if diffusion_embedding_scale is not None:
+            payload["diffusion_embedding_scale"] = diffusion_embedding_scale
 
     return payload
 
@@ -98,9 +114,16 @@ def fetch_tts(
     prebuffer_chunks: int,
     first_chunk_tokens: int | None = None,
     diffusion: bool = False,
+    diffusion_seed: int | None = None,
+    diffusion_steps: int | None = None,
+    diffusion_alpha: float | None = None,
+    diffusion_beta: float | None = None,
+    diffusion_embedding_scale: float | None = None,
 ) -> bytes:
     payload = _build_payload(text, voice, speed, mode, fmt, prebuffer_chunks,
-                             first_chunk_tokens, diffusion)
+                             first_chunk_tokens, diffusion, diffusion_seed,
+                             diffusion_steps, diffusion_alpha, diffusion_beta,
+                             diffusion_embedding_scale)
     return _send_tts(url, payload, lambda resp: _read_stream(resp, emit_stdout))
 
 
@@ -123,6 +146,21 @@ def main() -> None:
                         help="Target max tokens for the first audio chunk (adaptive mode only)")
     parser.add_argument("--diffusion", action="store_true",
                         help="Enable diffusion style sampling (requires a GGUF with diffusion tensors)")
+    parser.add_argument("--diffusion-seed", type=int, default=None,
+                        help="Seed for diffusion sampling. Default: a random seed per call "
+                             "(so successive calls vary). Pass a fixed value to reproduce output.")
+    parser.add_argument("--diffusion-steps", type=int, default=None,
+                        help="Diffusion sampler steps (server default: 5). Controls sampling "
+                             "accuracy, not effect strength.")
+    parser.add_argument("--diffusion-alpha", type=float, default=None,
+                        help="Mix of the diffused style into the predictor style / prosody "
+                             "(server default: 0.1). Raise (~0.3-0.7) for more prosody variation.")
+    parser.add_argument("--diffusion-beta", type=float, default=None,
+                        help="Mix of the diffused style into the decoder style / timbre "
+                             "(server default: 0.5).")
+    parser.add_argument("--diffusion-embedding-scale", type=float, default=None,
+                        help="Classifier-free guidance scale (server default: 1.0). Above 1.0 "
+                             "amplifies text-conditioned expressiveness (try 1.5-2.0).")
     parser.add_argument("--out", default=None,
                         help="Output file. If omitted, streaming formats write to stdout.")
     args = parser.parse_args()
@@ -134,11 +172,18 @@ def main() -> None:
     else:
         parser.error("the following arguments are required: text or --file")
 
+    # Default to a random seed per call so diffusion output varies; a fixed
+    # --diffusion-seed reproduces a given sample.
+    diffusion_seed = args.diffusion_seed
+    if args.diffusion and diffusion_seed is None:
+        diffusion_seed = random.randrange(2 ** 32)
+
     emit_stdout = args.out is None and not sys.stdout.buffer.isatty()
     data = fetch_tts(
         text, args.voice, args.speed, args.mode, args.fmt, args.url,
         emit_stdout, max(0, args.prebuffer_chunks), args.first_chunk_tokens,
-        args.diffusion)
+        args.diffusion, diffusion_seed, args.diffusion_steps,
+        args.diffusion_alpha, args.diffusion_beta, args.diffusion_embedding_scale)
 
     if args.out:
         output = _pcm_to_wav(data) if args.fmt == "pcm" else data

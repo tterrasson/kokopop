@@ -135,20 +135,77 @@ bool diffusion_layer_norm_rows(
     return true;
 }
 
+// AdaLayerNorm (StyleTransformer1d): layer-norm without affine, then modulate
+// with gamma/beta produced from the style vector s via a learned fc:
+//   h = fc(s); gamma, beta = chunk(h); out = (1 + gamma) * layernorm(x) + beta
+// fc lives at `prefix + ".fc"` (weight [2*dim, style_dim], bias [2*dim]).
+bool diffusion_ada_layer_norm_rows(
+    Model & model,
+    const std::string & prefix,
+    const std::vector<float> & input,
+    int64_t rows,
+    int64_t dim,
+    const std::vector<float> & style,
+    std::vector<float> & out,
+    std::string & error) {
+    std::vector<float> h;
+    int64_t h_dim = 0;
+    if (!diffusion_linear_rows(model, prefix + ".fc", style, 1,
+                               static_cast<int64_t>(style.size()), h, h_dim, error)) {
+        return false;
+    }
+    if (h_dim != 2 * dim) {
+        error = "Kokoro diffusion AdaLayerNorm shape mismatch: " + prefix;
+        return false;
+    }
+    const float * gamma = h.data();
+    const float * beta = h.data() + dim;
+
+    out.resize(input.size());
+    for (int64_t r = 0; r < rows; ++r) {
+        const float * x = input.data() + static_cast<size_t>(r * dim);
+        float * y = out.data() + static_cast<size_t>(r * dim);
+        double mean = 0.0;
+        for (int64_t i = 0; i < dim; ++i) mean += x[i];
+        mean /= static_cast<double>(dim);
+        double var = 0.0;
+        for (int64_t i = 0; i < dim; ++i) {
+            const double d = static_cast<double>(x[i]) - mean;
+            var += d * d;
+        }
+        const double inv_std = 1.0 / std::sqrt(var / static_cast<double>(dim) + 1e-5);
+        for (int64_t i = 0; i < dim; ++i) {
+            const float xn = static_cast<float>((static_cast<double>(x[i]) - mean) * inv_std);
+            y[static_cast<size_t>(i)] = (1.0f + gamma[i]) * xn + beta[i];
+        }
+    }
+    return true;
+}
+
+// One transformer block. When *style* is non-null the block is a
+// StyleTransformerBlock (AdaLayerNorm conditioned on the style vector);
+// otherwise it is a plain TransformerBlock with a static LayerNorm.
 bool diffusion_attention_block(
     Model & model,
     const std::string & prefix,
     std::vector<float> & x,
     int64_t rows,
     int64_t features,
+    const std::vector<float> * style,
     std::string & error) {
-    if (model.cached_tensor(prefix + ".attention.norm.fc.weight") != nullptr) {
-        error = "diffusion StyleTransformer1d is not implemented; convert a non-multispeaker Kokoro diffusion model";
-        return false;
-    }
-
-    std::vector<float> normed;
-    if (!diffusion_layer_norm_rows(model, prefix + ".attention.norm", x, rows, features, normed, error)) {
+    std::vector<float> normed_q;
+    std::vector<float> normed_kv_storage;
+    const std::vector<float> * normed_kv = &normed_q;
+    if (style != nullptr) {
+        if (!diffusion_ada_layer_norm_rows(model, prefix + ".attention.norm",
+                                           x, rows, features, *style, normed_q, error) ||
+            !diffusion_ada_layer_norm_rows(model, prefix + ".attention.norm_context",
+                                           x, rows, features, *style, normed_kv_storage, error)) {
+            return false;
+        }
+        normed_kv = &normed_kv_storage;
+    } else if (!diffusion_layer_norm_rows(model, prefix + ".attention.norm",
+                                          x, rows, features, normed_q, error)) {
         return false;
     }
 
@@ -156,8 +213,8 @@ bool diffusion_attention_block(
     std::vector<float> kv;
     int64_t q_dim = 0;
     int64_t kv_dim = 0;
-    if (!diffusion_linear_rows(model, prefix + ".attention.to_q", normed, rows, features, q, q_dim, error, false) ||
-        !diffusion_linear_rows(model, prefix + ".attention.to_kv", normed, rows, features, kv, kv_dim, error, false)) {
+    if (!diffusion_linear_rows(model, prefix + ".attention.to_q", normed_q, rows, features, q, q_dim, error, false) ||
+        !diffusion_linear_rows(model, prefix + ".attention.to_kv", *normed_kv, rows, features, kv, kv_dim, error, false)) {
         return false;
     }
     if ((kv_dim % 2) != 0 || q_dim * 2 != kv_dim || (q_dim % 8) != 0) {
@@ -241,11 +298,19 @@ bool diffusion_transformer_run(
     const std::vector<float> & embedding,
     int64_t n_tokens,
     int64_t embedding_dim,
+    const std::vector<float> & style,
     std::vector<float> & out,
     std::string & error,
     bool use_fixed_embedding) {
     constexpr int64_t style_dim = 256;
     const int64_t features = style_dim + embedding_dim;
+
+    // StyleTransformer1d (multispeaker): AdaLayerNorm blocks conditioned on the
+    // style vector + a to_features branch folded into the mapping. Detected by
+    // the presence of the per-block AdaLayerNorm fc weights.
+    const bool is_style =
+        model.cached_tensor("kokopop.diffusion.blocks.0.attention.norm.fc.weight") != nullptr;
+    const std::vector<float> * block_style = is_style ? &style : nullptr;
     if (static_cast<int64_t>(x_style.size()) != style_dim ||
         static_cast<int64_t>(embedding.size()) != n_tokens * embedding_dim) {
         error = "invalid Kokoro diffusion transformer inputs";
@@ -291,6 +356,24 @@ bool diffusion_transformer_run(
     }
     for (float & v : mapping) v = gelu_exact(v);
 
+    // StyleTransformer1d folds the style vector into the mapping via to_features:
+    //   mapping = to_mapping( to_time(time) + gelu(to_features(s)) )
+    if (is_style) {
+        std::vector<float> feat;
+        int64_t feat_dim = 0;
+        if (!diffusion_linear_rows(model, "kokopop.diffusion.to_features.0",
+                                   style, 1, static_cast<int64_t>(style.size()),
+                                   feat, feat_dim, error)) {
+            return false;
+        }
+        if (feat_dim != mapping_dim) {
+            error = "Kokoro diffusion to_features dimension mismatch";
+            return false;
+        }
+        for (float & v : feat) v = gelu_exact(v);
+        for (size_t i = 0; i < mapping.size(); ++i) mapping[i] += feat[i];
+    }
+
     if (model.cached_tensor("kokopop.diffusion.to_mapping.0.weight") != nullptr) {
         std::vector<float> tmp;
         int64_t tmp_dim = 0;
@@ -316,12 +399,22 @@ bool diffusion_transformer_run(
         std::memcpy(row + style_dim,
                     embedding_data + static_cast<size_t>(t * embedding_dim),
                     static_cast<size_t>(embedding_dim) * sizeof(float));
-        for (int64_t i = 0; i < features; ++i) row[i] += mapping[static_cast<size_t>(i)];
+        // Plain Transformer1d adds the mapping once up front; StyleTransformer1d
+        // re-adds it before every block (see run() in Modules/diffusion).
+        if (!is_style) {
+            for (int64_t i = 0; i < features; ++i) row[i] += mapping[static_cast<size_t>(i)];
+        }
     }
 
     for (int block = 0; block < 3; ++block) {
+        if (is_style) {
+            for (int64_t t = 0; t < n_tokens; ++t) {
+                float * row = x.data() + static_cast<size_t>(t * features);
+                for (int64_t i = 0; i < features; ++i) row[i] += mapping[static_cast<size_t>(i)];
+            }
+        }
         if (!diffusion_attention_block(model, "kokopop.diffusion.blocks." + std::to_string(block),
-                                       x, n_tokens, features, error)) {
+                                       x, n_tokens, features, block_style, error)) {
             return false;
         }
     }
@@ -367,6 +460,7 @@ bool diffusion_denoise(
     const std::vector<float> & embedding,
     int64_t n_tokens,
     int64_t embedding_dim,
+    const std::vector<float> & style,
     float embedding_scale,
     std::vector<float> & out,
     std::string & error) {
@@ -382,13 +476,13 @@ bool diffusion_denoise(
 
     std::vector<float> pred;
     if (!diffusion_transformer_run(model, x_in, c_noise, embedding, n_tokens,
-                                   embedding_dim, pred, error, false)) {
+                                   embedding_dim, style, pred, error, false)) {
         return false;
     }
     if (embedding_scale != 1.0f) {
         std::vector<float> masked;
         if (!diffusion_transformer_run(model, x_in, c_noise, embedding, n_tokens,
-                                       embedding_dim, masked, error, true)) {
+                                       embedding_dim, style, masked, error, true)) {
             return false;
         }
         for (size_t i = 0; i < pred.size(); ++i) {
@@ -430,6 +524,11 @@ bool apply_diffusion_style_options(
         return false;
     }
 
+    // Reference speaker style conditioning the StyleTransformer1d. Snapshot it
+    // before the style gets blended with the sampled vector below. Ignored by
+    // the plain Transformer1d path.
+    const std::vector<float> ref_style(style.begin(), style.begin() + 256);
+
     const int steps = std::clamp(options->steps, 2, 50);
     std::mt19937 rng(options->seed);
     std::normal_distribution<float> normal(0.0f, 1.0f);
@@ -449,7 +548,7 @@ bool apply_diffusion_style_options(
 
         std::vector<float> denoised;
         if (!diffusion_denoise(model, x, sigma, embedding, n_tokens, embedding_dim,
-                               options->embedding_scale, denoised, error)) {
+                               ref_style, options->embedding_scale, denoised, error)) {
             return false;
         }
         std::vector<float> x_mid(x.size());
@@ -460,7 +559,7 @@ bool apply_diffusion_style_options(
 
         std::vector<float> denoised_mid;
         if (!diffusion_denoise(model, x_mid, sigma_mid, embedding, n_tokens, embedding_dim,
-                               options->embedding_scale, denoised_mid, error)) {
+                               ref_style, options->embedding_scale, denoised_mid, error)) {
             return false;
         }
         for (size_t j = 0; j < x.size(); ++j) {
