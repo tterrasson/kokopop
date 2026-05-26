@@ -1,6 +1,7 @@
 #include "inference/diffusion_sampler.h"
 
 #include "core/constants.h"
+#include "inference/diffusion_kernels.h"
 
 #include <algorithm>
 #include <cmath>
@@ -82,12 +83,9 @@ bool diffusion_linear_rows(
         const float * x = input.data() + static_cast<size_t>(r * in_dim);
         float * y = out.data() + static_cast<size_t>(r * out_dim);
         for (int64_t oc = 0; oc < out_dim; ++oc) {
-            double acc = has_bias ? static_cast<double>(b.data[oc]) : 0.0;
             const float * wr = w.data + static_cast<size_t>(oc * in_dim);
-            for (int64_t ic = 0; ic < in_dim; ++ic) {
-                acc += static_cast<double>(wr[ic]) * static_cast<double>(x[ic]);
-            }
-            y[oc] = static_cast<float>(acc);
+            const float bias = has_bias ? b.data[oc] : 0.0f;
+            y[oc] = bias + diffusion_kernel::dot(wr, x, in_dim);
         }
     }
     return true;
@@ -116,21 +114,10 @@ bool diffusion_layer_norm_rows(
     for (int64_t r = 0; r < rows; ++r) {
         const float * x = input.data() + static_cast<size_t>(r * dim);
         float * y = out.data() + static_cast<size_t>(r * dim);
-        double mean = 0.0;
-        for (int64_t i = 0; i < dim; ++i) mean += x[i];
-        mean /= static_cast<double>(dim);
-        double var = 0.0;
-        for (int64_t i = 0; i < dim; ++i) {
-            const double d = static_cast<double>(x[i]) - mean;
-            var += d * d;
-        }
-        const double inv_std = 1.0 / std::sqrt(var / static_cast<double>(dim) + 1e-5);
-        for (int64_t i = 0; i < dim; ++i) {
-            y[i] = static_cast<float>(
-                ((static_cast<double>(x[i]) - mean) * inv_std) *
-                static_cast<double>(gamma.data[i]) +
-                static_cast<double>(beta.data[i]));
-        }
+        const float mean = diffusion_kernel::sum(x, dim) / static_cast<float>(dim);
+        const float var = diffusion_kernel::squared_diff_sum(x, dim, mean) / static_cast<float>(dim);
+        const float inv_std = 1.0f / std::sqrt(var + 1e-5f);
+        diffusion_kernel::layer_norm_affine(y, x, gamma.data, beta.data, dim, mean, inv_std);
     }
     return true;
 }
@@ -165,19 +152,10 @@ bool diffusion_ada_layer_norm_rows(
     for (int64_t r = 0; r < rows; ++r) {
         const float * x = input.data() + static_cast<size_t>(r * dim);
         float * y = out.data() + static_cast<size_t>(r * dim);
-        double mean = 0.0;
-        for (int64_t i = 0; i < dim; ++i) mean += x[i];
-        mean /= static_cast<double>(dim);
-        double var = 0.0;
-        for (int64_t i = 0; i < dim; ++i) {
-            const double d = static_cast<double>(x[i]) - mean;
-            var += d * d;
-        }
-        const double inv_std = 1.0 / std::sqrt(var / static_cast<double>(dim) + 1e-5);
-        for (int64_t i = 0; i < dim; ++i) {
-            const float xn = static_cast<float>((static_cast<double>(x[i]) - mean) * inv_std);
-            y[static_cast<size_t>(i)] = (1.0f + gamma[i]) * xn + beta[i];
-        }
+        const float mean = diffusion_kernel::sum(x, dim) / static_cast<float>(dim);
+        const float var = diffusion_kernel::squared_diff_sum(x, dim, mean) / static_cast<float>(dim);
+        const float inv_std = 1.0f / std::sqrt(var + 1e-5f);
+        diffusion_kernel::ada_layer_norm(y, x, gamma, beta, dim, mean, inv_std);
     }
     return true;
 }
@@ -235,11 +213,7 @@ bool diffusion_attention_block(
             const float * qi = q.data() + static_cast<size_t>(i * q_dim + h * head_dim);
             for (int64_t j = 0; j < rows; ++j) {
                 const float * kj = kv.data() + static_cast<size_t>(j * kv_dim + h * head_dim);
-                double dot = 0.0;
-                for (int64_t d = 0; d < head_dim; ++d) {
-                    dot += static_cast<double>(qi[d]) * static_cast<double>(kj[d]);
-                }
-                const float v = static_cast<float>(dot) * scale;
+                const float v = diffusion_kernel::dot(qi, kj, head_dim) * scale;
                 logits[static_cast<size_t>(j)] = v;
                 max_logit = std::max(max_logit, v);
             }
@@ -250,14 +224,14 @@ bool diffusion_attention_block(
                 denom += e;
             }
             float * out = mid.data() + static_cast<size_t>(i * q_dim + h * head_dim);
-            for (int64_t d = 0; d < head_dim; ++d) out[d] = 0.0f;
-            for (int64_t j = 0; j < rows; ++j) {
-                const float p = static_cast<float>(static_cast<double>(probs[static_cast<size_t>(j)]) / denom);
-                const float * vj = kv.data() + static_cast<size_t>(j * kv_dim + q_dim + h * head_dim);
-                for (int64_t d = 0; d < head_dim; ++d) {
-                    out[d] += p * vj[d];
-                }
-            }
+            diffusion_kernel::attention_weighted_sum(
+                out,
+                kv.data() + static_cast<size_t>(q_dim + h * head_dim),
+                probs.data(),
+                static_cast<float>(1.0 / denom),
+                rows,
+                kv_dim,
+                head_dim);
         }
     }
 
@@ -270,7 +244,7 @@ bool diffusion_attention_block(
         error = "Kokoro diffusion attention output shape mismatch";
         return false;
     }
-    for (size_t i = 0; i < x.size(); ++i) x[i] += attn_out[i];
+    diffusion_kernel::add_inplace(x.data(), attn_out.data(), x.size());
 
     std::vector<float> ff1;
     std::vector<float> ff2;
@@ -287,7 +261,7 @@ bool diffusion_attention_block(
         error = "Kokoro diffusion feed-forward output shape mismatch";
         return false;
     }
-    for (size_t i = 0; i < x.size(); ++i) x[i] += ff2[i];
+    diffusion_kernel::add_inplace(x.data(), ff2.data(), x.size());
     return true;
 }
 
@@ -402,7 +376,7 @@ bool diffusion_transformer_run(
         // Plain Transformer1d adds the mapping once up front; StyleTransformer1d
         // re-adds it before every block (see run() in Modules/diffusion).
         if (!is_style) {
-            for (int64_t i = 0; i < features; ++i) row[i] += mapping[static_cast<size_t>(i)];
+            diffusion_kernel::add_inplace(row, mapping.data(), static_cast<size_t>(features));
         }
     }
 
@@ -410,7 +384,7 @@ bool diffusion_transformer_run(
         if (is_style) {
             for (int64_t t = 0; t < n_tokens; ++t) {
                 float * row = x.data() + static_cast<size_t>(t * features);
-                for (int64_t i = 0; i < features; ++i) row[i] += mapping[static_cast<size_t>(i)];
+                diffusion_kernel::add_inplace(row, mapping.data(), static_cast<size_t>(features));
             }
         }
         if (!diffusion_attention_block(model, "kokopop.diffusion.blocks." + std::to_string(block),
@@ -422,7 +396,7 @@ bool diffusion_transformer_run(
     std::vector<float> mean(static_cast<size_t>(features), 0.0f);
     for (int64_t t = 0; t < n_tokens; ++t) {
         const float * row = x.data() + static_cast<size_t>(t * features);
-        for (int64_t i = 0; i < features; ++i) mean[static_cast<size_t>(i)] += row[i];
+        diffusion_kernel::add_inplace(mean.data(), row, mean.size());
     }
     for (float & v : mean) v /= static_cast<float>(n_tokens);
 
@@ -472,7 +446,7 @@ bool diffusion_denoise(
     const float c_noise = std::log(sigma) * 0.25f;
 
     std::vector<float> x_in(x_noisy.size());
-    for (size_t i = 0; i < x_noisy.size(); ++i) x_in[i] = x_noisy[i] * c_in;
+    diffusion_kernel::scale(x_in.data(), x_noisy.data(), c_in, x_noisy.size());
 
     std::vector<float> pred;
     if (!diffusion_transformer_run(model, x_in, c_noise, embedding, n_tokens,
@@ -485,15 +459,11 @@ bool diffusion_denoise(
                                        embedding_dim, style, masked, error, true)) {
             return false;
         }
-        for (size_t i = 0; i < pred.size(); ++i) {
-            pred[i] = masked[i] + (pred[i] - masked[i]) * embedding_scale;
-        }
+        diffusion_kernel::classifier_free_guidance(pred.data(), masked.data(), embedding_scale, pred.size());
     }
 
     out.resize(x_noisy.size());
-    for (size_t i = 0; i < x_noisy.size(); ++i) {
-        out[i] = c_skip * x_noisy[i] + c_out * pred[i];
-    }
+    diffusion_kernel::denoise_combine(out.data(), x_noisy.data(), pred.data(), c_skip, c_out, x_noisy.size());
     return true;
 }
 
@@ -536,7 +506,7 @@ bool apply_diffusion_style_options(
     for (float & v : x) v = normal(rng);
 
     const std::vector<float> sigmas = karras_sigmas(steps);
-    for (float & v : x) v *= sigmas.front();
+    diffusion_kernel::scale(x.data(), x.data(), sigmas.front(), x.size());
 
     for (int i = 0; i < steps - 1; ++i) {
         const float sigma = sigmas[static_cast<size_t>(i)];
@@ -552,27 +522,22 @@ bool apply_diffusion_style_options(
             return false;
         }
         std::vector<float> x_mid(x.size());
-        for (size_t j = 0; j < x.size(); ++j) {
-            const float d = (x[j] - denoised[j]) / sigma;
-            x_mid[j] = x[j] + d * (sigma_mid - sigma);
-        }
+        diffusion_kernel::euler_midpoint(x_mid.data(), x.data(), denoised.data(), sigma, sigma_mid, x.size());
 
         std::vector<float> denoised_mid;
         if (!diffusion_denoise(model, x_mid, sigma_mid, embedding, n_tokens, embedding_dim,
                                ref_style, options->embedding_scale, denoised_mid, error)) {
             return false;
         }
-        for (size_t j = 0; j < x.size(); ++j) {
-            const float d_mid = (x_mid[j] - denoised_mid[j]) / sigma_mid;
-            x[j] = x[j] + d_mid * (sigma_down - sigma) + normal(rng) * sigma_up;
-        }
+        std::vector<float> noise(x.size());
+        for (float & v : noise) v = normal(rng);
+        diffusion_kernel::euler_update_with_noise(
+            x.data(), x_mid.data(), denoised_mid.data(), noise.data(),
+            sigma_mid, sigma_down, sigma, sigma_up, x.size());
     }
 
     for (float & v : x) v = std::clamp(v, -1.0f, 1.0f);
-    for (size_t i = 0; i < 128; ++i) {
-        style[i] = (1.0f - alpha) * style[i] + alpha * x[i];
-        style[i + 128] = (1.0f - beta) * style[i + 128] + beta * x[i + 128];
-    }
+    diffusion_kernel::blend_style(style.data(), x.data(), alpha, beta, 128);
     return true;
 }
 

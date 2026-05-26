@@ -18,6 +18,7 @@
 #include "test_model_internal.cpp"
 #include "test_audio_utils.cpp"
 #include "test_lstm_fused.cpp"
+#include "test_diffusion_kernels.cpp"
 #include "test_text_splitter.cpp"
 #include "test_zh_g2p.cpp"
 #include "test_unicode_inputs.cpp"
