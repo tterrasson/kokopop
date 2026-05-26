@@ -60,6 +60,7 @@ def _build_payload(
     fmt: str,
     prebuffer_chunks: int,
     first_chunk_tokens: int | None,
+    diffusion: bool,
 ) -> dict:
     payload = {"text": text, "speed": speed, "mode": mode, "format": fmt}
     if voice:
@@ -68,6 +69,8 @@ def _build_payload(
         payload["prebuffer_chunks"] = prebuffer_chunks
     if first_chunk_tokens is not None:
         payload["first_chunk_target_tokens"] = first_chunk_tokens
+    if diffusion:
+        payload["diffusion"] = True
 
     return payload
 
@@ -94,8 +97,10 @@ def fetch_tts(
     emit_stdout: bool,
     prebuffer_chunks: int,
     first_chunk_tokens: int | None = None,
+    diffusion: bool = False,
 ) -> bytes:
-    payload = _build_payload(text, voice, speed, mode, fmt, prebuffer_chunks, first_chunk_tokens)
+    payload = _build_payload(text, voice, speed, mode, fmt, prebuffer_chunks,
+                             first_chunk_tokens, diffusion)
     return _send_tts(url, payload, lambda resp: _read_stream(resp, emit_stdout))
 
 
@@ -116,6 +121,8 @@ def main() -> None:
                         help="Server-side Ogg synthesis chunks to buffer before playback")
     parser.add_argument("--first-chunk-tokens", type=int, default=None,
                         help="Target max tokens for the first audio chunk (adaptive mode only)")
+    parser.add_argument("--diffusion", action="store_true",
+                        help="Enable diffusion style sampling (requires a GGUF with diffusion tensors)")
     parser.add_argument("--out", default=None,
                         help="Output file. If omitted, streaming formats write to stdout.")
     args = parser.parse_args()
@@ -130,7 +137,8 @@ def main() -> None:
     emit_stdout = args.out is None and not sys.stdout.buffer.isatty()
     data = fetch_tts(
         text, args.voice, args.speed, args.mode, args.fmt, args.url,
-        emit_stdout, max(0, args.prebuffer_chunks), args.first_chunk_tokens)
+        emit_stdout, max(0, args.prebuffer_chunks), args.first_chunk_tokens,
+        args.diffusion)
 
     if args.out:
         output = _pcm_to_wav(data) if args.fmt == "pcm" else data

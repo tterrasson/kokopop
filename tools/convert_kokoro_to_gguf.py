@@ -638,6 +638,9 @@ def _discover_voices(args: argparse.Namespace) -> list[str]:
     )
 
 
+_KMODEL_KEYS = frozenset({"bert", "bert_encoder", "predictor", "text_encoder", "decoder"})
+
+
 def _normalize_wn_checkpoint(model_path: str) -> str:
     """Remap new-style parametrizations.weight_norm keys to old weight_g/weight_v.
 
@@ -647,18 +650,27 @@ def _normalize_wn_checkpoint(model_path: str) -> str:
     which expects ``*.weight_g`` / ``*.weight_v``.  Without remapping, KModel
     silently skips all weight-normed layers via strict=False, leaving them at
     their random initial values and producing noise in the GGUF output.
+
+    Also strips any top-level keys unknown to KModel (e.g. 'diffusion' from
+    StyleTTS2 fine-tuned checkpoints) which would otherwise trigger an assert.
     """
     checkpoint = torch.load(model_path, map_location="cpu", weights_only=True)
-    needs_fix = any(
+
+    unknown_keys = set(checkpoint.keys()) - _KMODEL_KEYS
+    if unknown_keys:
+        logger.info(f"stripping unknown checkpoint keys not used by KModel: {unknown_keys}")
+
+    needs_wn_fix = any(
         ".parametrizations.weight." in k
-        for sd in checkpoint.values()
-        if isinstance(sd, dict)
+        for key, sd in checkpoint.items()
+        if key in _KMODEL_KEYS and isinstance(sd, dict)
         for k in sd
     )
-    if not needs_fix:
+    if not unknown_keys and not needs_wn_fix:
         return model_path
 
-    logger.info("checkpoint uses new parametrizations weight_norm API — remapping keys")
+    if needs_wn_fix:
+        logger.info("checkpoint uses new parametrizations weight_norm API — remapping keys")
 
     def _remap(sd: dict) -> dict:
         out = {}
@@ -671,7 +683,11 @@ def _normalize_wn_checkpoint(model_path: str) -> str:
                 out[k] = v
         return out
 
-    normalized = {section: _remap(sd) for section, sd in checkpoint.items()}
+    normalized = {
+        key: (_remap(sd) if needs_wn_fix and isinstance(sd, dict) else sd)
+        for key, sd in checkpoint.items()
+        if key in _KMODEL_KEYS
+    }
     tmp = tempfile.NamedTemporaryFile(suffix=".pth", delete=False)
     torch.save(normalized, tmp.name)
     tmp.close()
@@ -679,10 +695,54 @@ def _normalize_wn_checkpoint(model_path: str) -> str:
     return tmp.name
 
 
+_DIFFUSION_NET_PREFIX = "module.diffusion.net."
+
+
+def _remap_diffusion_key(key: str) -> str:
+    """Map a checkpoint diffusion key onto the name the runtime reads.
+
+    In the StyleTTS2 checkpoint ``to_time`` is an extra-nested Sequential, so
+    the positional embedding lands at ``to_time.0.0.weights`` and the linear at
+    ``to_time.0.1.{weight,bias}``. The runtime (diffusion_sampler.cpp) reads a
+    flattened ``to_time.0.weights`` / ``to_time.1`` — collapse the extra level.
+    """
+    if key.startswith("to_time.0."):
+        return "to_time." + key[len("to_time.0."):]
+    return key
+
+
+def _extract_diffusion_state_dict(model_path: str) -> dict | None:
+    """Extract the diffusion UNet state dict from a raw checkpoint, if present.
+
+    StyleTTS2 fine-tuned checkpoints store diffusion weights under
+    ``module.diffusion.net.*``.  KModel (pip-installed kokoro) does not expose
+    this sub-module, so we read the weights here before handing the checkpoint
+    off to KModel. Keys are remapped to the layout the runtime expects.
+    """
+    checkpoint = torch.load(model_path, map_location="cpu", weights_only=True)
+    raw = checkpoint.get("diffusion")
+    if not raw or not isinstance(raw, dict):
+        return None
+    prefix = _DIFFUSION_NET_PREFIX
+    unet_sd = {
+        _remap_diffusion_key(k[len(prefix):]): v
+        for k, v in raw.items()
+        if k.startswith(prefix)
+    }
+    if not unet_sd:
+        logger.warning("'diffusion' key found in checkpoint but no 'module.diffusion.net.*' tensors")
+        return None
+    return unet_sd
+
+
 def convert(args: argparse.Namespace) -> None:
     config_path = _resolve_file("config.json", args)
     model_path = _resolve_file(args.model_name, args)
     config = json.loads(Path(config_path).read_text())
+
+    diffusion_unet_sd = _extract_diffusion_state_dict(model_path)
+    if diffusion_unet_sd:
+        logger.info(f"found diffusion UNet with {len(diffusion_unet_sd)} tensors")
 
     normalized_path = _normalize_wn_checkpoint(model_path)
     try:
@@ -721,21 +781,27 @@ def convert(args: argparse.Namespace) -> None:
     writer.add_u32("kokopop.max_dur", int(config["max_dur"]))
     writer.add_u32("kokopop.n_mels", int(config["n_mels"]))
 
+    # Prefer weights loaded directly from the checkpoint (StyleTTS2 fine-tunes).
+    # Fall back to model.diffusion for KModel versions that natively support it.
+    _model_diffusion = getattr(model, "diffusion", None)
     diffusion_available = bool(
-        getattr(model, "diffusion", None) is not None
-        and getattr(model, "diffusion_available", False)
+        diffusion_unet_sd is not None
+        or (_model_diffusion is not None and getattr(model, "diffusion_available", False))
     )
     writer.add_bool("kokopop.diffusion.available", diffusion_available)
 
-    if getattr(model, "diffusion", None) is not None:
+    if diffusion_available:
         writer.add_u32("kokopop.diffusion.style_dim", int(config["style_dim"]) * 2)
         writer.add_u32("kokopop.diffusion.embedding_dim", int(config["plbert"]["hidden_size"]))
         writer.add_u32("kokopop.diffusion.steps_default", 5)
         writer.add_f32("kokopop.diffusion.sigma_min", 0.0001)
         writer.add_f32("kokopop.diffusion.sigma_max", 3.0)
         writer.add_f32("kokopop.diffusion.rho", 9.0)
-        sigma_data = getattr(getattr(model.diffusion, "diffusion", None), "sigma_data", 0.2)
-        writer.add_f32("kokopop.diffusion.sigma_data", float(sigma_data))
+        # sigma_data is a scalar estimated during training (not stored in the
+        # .pth — it lives in the StyleTTS2 training config YAML under
+        # model_params.diffusion.dist.sigma_data). Pass it via --diffusion-sigma-data.
+        writer.add_f32("kokopop.diffusion.sigma_data", float(args.diffusion_sigma_data))
+        logger.info(f"diffusion sigma_data = {args.diffusion_sigma_data}")
 
     # Tensors
     add_state_dict("kokopop.albert", model.bert.state_dict(), writer)
@@ -746,7 +812,8 @@ def convert(args: argparse.Namespace) -> None:
     add_regularized_modules("kokopop.decoder", model.decoder, writer)
 
     if diffusion_available:
-        add_state_dict("kokopop.diffusion", model.diffusion.unet.state_dict(), writer)
+        unet_sd = diffusion_unet_sd or _model_diffusion.unet.state_dict()
+        add_state_dict("kokopop.diffusion", unet_sd, writer)
 
     for voice in voices:
         voice_path = _resolve_file(f"voices/{voice}.pt", args)
@@ -775,6 +842,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--all-voices", action="store_true",
         help="include all voices found in voices/* (overrides --voices)",
+    )
+    parser.add_argument(
+        "--diffusion-sigma-data", type=float, default=0.2,
+        help="diffusion sigma_data estimated during training (found in the "
+             "StyleTTS2 config YAML at model_params.diffusion.dist.sigma_data; "
+             "default: %(default)s)",
     )
     return parser.parse_args()
 

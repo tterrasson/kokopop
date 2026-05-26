@@ -46,7 +46,8 @@ public:
         RequestContext::AudioFormat format,
         int ogg_prebuffer_chunks = 0,
         const ChunkConfig & chunk_config_override = ChunkConfig{},
-        bool has_chunk_config_override = false);
+        bool has_chunk_config_override = false,
+        const KokoroDiffusionOptions & diffusion = KokoroDiffusionOptions{});
 
     /// Stop the worker thread. Does not wait — call join() for that.
     void stop();

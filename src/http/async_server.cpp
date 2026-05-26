@@ -598,6 +598,41 @@ void AsyncHttpServer::_dispatch_request(int fd, Connection & conn) {
             first_chunk_target_tokens = std::max(1, static_cast<int>(yyjson_get_int(fct_val)));
         }
 
+        // Optional diffusion style sampling. Disabled by default; only the
+        // "diffusion" boolean turns it on, the rest are optional tuning knobs.
+        KokoroDiffusionOptions diffusion;  // defaults: disabled, steps=5, alpha=0.1, beta=0.5
+        yyjson_val * diff_val = yyjson_obj_get(root, "diffusion");
+        if (diff_val && yyjson_is_bool(diff_val)) {
+            diffusion.enabled = yyjson_get_bool(diff_val);
+        } else if (diff_val && !yyjson_is_null(diff_val)) {
+            yyjson_doc_free(doc);
+            _send_error(fd, conn, 400, "Bad Request",
+                        json_error("'diffusion' must be a boolean"));
+            return;
+        }
+        if (diffusion.enabled) {
+            yyjson_val * seed_val = yyjson_obj_get(root, "diffusion_seed");
+            if (seed_val && yyjson_is_num(seed_val)) {
+                diffusion.seed = static_cast<uint32_t>(std::max<int64_t>(0, yyjson_get_sint(seed_val)));
+            }
+            yyjson_val * steps_val = yyjson_obj_get(root, "diffusion_steps");
+            if (steps_val && yyjson_is_num(steps_val)) {
+                diffusion.steps = static_cast<int>(yyjson_get_int(steps_val));
+            }
+            yyjson_val * alpha_val = yyjson_obj_get(root, "diffusion_alpha");
+            if (alpha_val && yyjson_is_num(alpha_val)) {
+                diffusion.alpha = static_cast<float>(yyjson_get_num(alpha_val));
+            }
+            yyjson_val * beta_val = yyjson_obj_get(root, "diffusion_beta");
+            if (beta_val && yyjson_is_num(beta_val)) {
+                diffusion.beta = static_cast<float>(yyjson_get_num(beta_val));
+            }
+            yyjson_val * escale_val = yyjson_obj_get(root, "diffusion_embedding_scale");
+            if (escale_val && yyjson_is_num(escale_val)) {
+                diffusion.embedding_scale = static_cast<float>(yyjson_get_num(escale_val));
+            }
+        }
+
         // "format": "pcm"     → stream raw float32 PCM (default)
         // "format": "wav"     → accumulate and return a complete WAV file
         // "format": "ogg"     → stream Ogg/Opus with Transfer-Encoding: chunked
@@ -659,6 +694,15 @@ void AsyncHttpServer::_dispatch_request(int fd, Connection & conn) {
             return;
         }
 
+        // Validate diffusion support up front so we can fail with a clean 4xx
+        // instead of aborting mid-stream after headers are already sent.
+        if (diffusion.enabled &&
+            (!_model || _model->cached_tensor("kokopop.diffusion.to_out.1.weight") == nullptr)) {
+            _send_error(fd, conn, 400, "Bad Request",
+                        json_error("diffusion requested, but this model has no diffusion tensors"));
+            return;
+        }
+
         const char * fmt_name =
             fmt == RequestContext::AudioFormat::WAV      ? "wav"
           : fmt == RequestContext::AudioFormat::OGG_OPUS ? "ogg"
@@ -676,7 +720,7 @@ void AsyncHttpServer::_dispatch_request(int fd, Connection & conn) {
         auto ctx = _scheduler->submit(
             text_str, current_voice, spd, current_mode, fmt,
             ogg_prebuffer_chunks,
-            chunk_cfg_override, has_chunk_cfg_override);
+            chunk_cfg_override, has_chunk_cfg_override, diffusion);
 
         _send_streaming_response(fd, conn, ctx);
         return;
