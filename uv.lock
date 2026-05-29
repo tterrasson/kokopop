@@ -189,14 +189,14 @@ wheels = [
 
 [[package]]
 name = "click"
-version = "8.3.3"
+version = "8.4.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "colorama", marker = "sys_platform == 'win32'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/bb/63/f9e1ea081ce35720d8b92acde70daaedace594dc93b693c869e0d5910718/click-8.3.3.tar.gz", hash = "sha256:398329ad4837b2ff7cbe1dd166a4c0f8900c3ca3a218de04466f38f6497f18a2", size = 328061, upload-time = "2026-04-22T15:11:27.506Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/9b/98/518d8e5081007684232226f475082b30087d0f585e8457db087298259f49/click-8.4.1.tar.gz", hash = "sha256:918b5633eddf6b41c32d4f454bf0de810065c74e3f7dbf8ee5452f8be88d3e96", size = 353007, upload-time = "2026-05-22T04:08:37.769Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ae/44/c1221527f6a71a01ec6fbad7fa78f1d50dfa02217385cf0fa3eec7087d59/click-8.3.3-py3-none-any.whl", hash = "sha256:a2bf429bb3033c89fa4936ffb35d5cb471e3719e1f3c8a7c3fff0b8314305613", size = 110502, upload-time = "2026-04-22T15:11:25.044Z" },
+    { url = "https://files.pythonhosted.org/packages/c7/0d/67e5b4109ea4a837e80daa87c2c696711955e40449a97e8926672534def2/click-8.4.1-py3-none-any.whl", hash = "sha256:482be17c6991b8c19c5429a1e995d9b0efdbb63172824c41f99965dc0ade8ec2", size = 116639, upload-time = "2026-05-22T04:08:35.26Z" },
 ]
 
 [[package]]
@@ -442,9 +442,10 @@ wheels = [
 
 [[package]]
 name = "huggingface-hub"
-version = "1.13.0"
+version = "1.17.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
+    { name = "click" },
     { name = "filelock" },
     { name = "fsspec" },
     { name = "hf-xet", marker = "platform_machine == 'AMD64' or platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'arm64' or platform_machine == 'x86_64'" },
@@ -455,9 +456,9 @@ dependencies = [
     { name = "typer" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/89/ff/ec7ed2eb43bd7ce8bb2233d109cc235c3e807ffe5e469dc09db261fac05e/huggingface_hub-1.13.0.tar.gz", hash = "sha256:f6df2dac5abe82ce2fe05873d10d5ff47bc677d616a2f521f4ee26db9415d9d0", size = 781788, upload-time = "2026-04-30T11:57:33.858Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/bd/65/9826515abb600b5722bcf53f8b4a2fb58340b1f8bfcaee19f83561c13a44/huggingface_hub-1.17.0.tar.gz", hash = "sha256:fad842b6763ef70ebc3919665b1b9273645203185400a7d6c5eddc2323cc3435", size = 797082, upload-time = "2026-05-28T15:12:13.347Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/93/db/4b1cdae9460ae1f3ca020cd767f013430ce23eb1d9c890ae3a0609b38d26/huggingface_hub-1.13.0-py3-none-any.whl", hash = "sha256:e942cb50d6a08dd5306688b1ac05bda157fd2fcc88b63dae405f7bd0d3234005", size = 660643, upload-time = "2026-04-30T11:57:31.802Z" },
+    { url = "https://files.pythonhosted.org/packages/02/28/d7cef5e477b855c25d415b8f57e5bc7347c7a90cad3acf1725d0c92ca294/huggingface_hub-1.17.0-py3-none-any.whl", hash = "sha256:3b8156d23118e87f6a587648bfbc04f04a12a757ccb4ed298b35c4ae638bf24c", size = 671546, upload-time = "2026-05-28T15:12:11.441Z" },
 ]
 
 [[package]]
@@ -539,25 +540,25 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "numpy" },
     { name = "openai-whisper" },
     { name = "opencc" },
     { name = "pypinyin" },
-    { name = "whisper" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "huggingface-hub", specifier = ">=1.13.0" },
+    { name = "huggingface-hub", specifier = ">=1.17.0" },
     { name = "kokoro", specifier = ">=0.9.4" },
-    { name = "torch", specifier = ">=2.11.0", index = "https://download.pytorch.org/whl/cpu" },
+    { name = "torch", specifier = ">=2.12.0", index = "https://download.pytorch.org/whl/cpu" },
 ]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "numpy", specifier = ">=2.4.4" },
     { name = "openai-whisper", specifier = ">=20250625" },
-    { name = "opencc", specifier = ">=1.3.0" },
+    { name = "opencc", specifier = ">=1.3.1" },
     { name = "pypinyin", specifier = ">=0.55.0" },
-    { name = "whisper", specifier = ">=1.1.10" },
 ]
 
 [[package]]
@@ -924,16 +925,25 @@ sdist = { url = "https://files.pythonhosted.org/packages/35/8e/d36f8880bcf18ec02
 
 [[package]]
 name = "opencc"
-version = "1.3.0"
+version = "1.3.1"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/e7/5a/1ce3ff524f4e1735129b9b585af2fb9278eeb5880631e7c7c82dcf0fc089/opencc-1.3.0.tar.gz", hash = "sha256:bb7105c10ee90c9ba7493a099ac5e611ceab464b895c0584bd9ef304c10950fd", size = 11679501, upload-time = "2026-04-18T16:01:24.226Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/d8/2c/f967c613659fbe885f31b95d67aca3c68dd3e79204586e6aee1fa8240806/opencc-1.3.1.tar.gz", hash = "sha256:6892ee3f8fcc5992f0e9f90dbf177c8da566620f83c3f2040257293f16141b33", size = 11755312, upload-time = "2026-05-09T21:33:16.701Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/89/c2/b4037bf4d2f1d70998265951afde4b79f5b7cb0f9a8ed5a2f4fc7f182176/opencc-1.3.0-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:053fecbfee897fcbb767bed6803885641301cbd3b38c364eebf98f38659aa380", size = 1435982, upload-time = "2026-04-18T15:59:54.608Z" },
-    { url = "https://files.pythonhosted.org/packages/73/d7/0a6bd4be95eddb4d55c6d16aeb9ef0f2d30d62324a9eaea0ad9017c2dd0b/opencc-1.3.0-cp312-cp312-manylinux2014_x86_64.whl", hash = "sha256:c53aba8f850e40dba07bafe94c81306fcdd43b33e3d84bf22690b28e308102c9", size = 1699258, upload-time = "2026-04-18T16:01:19.843Z" },
-    { url = "https://files.pythonhosted.org/packages/99/79/aee359497424dc1f59fd40fa8cc8b0a077c36501bb20e4ca0f8df1cdc7dd/opencc-1.3.0-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:7b77e2738d21250f7a87ca9b07c6e91f4af837f8c10d78303165856c982f57f0", size = 1436134, upload-time = "2026-04-18T15:59:56.499Z" },
-    { url = "https://files.pythonhosted.org/packages/5c/31/76588f650e3d8e4dbb145a2a2508e3d7b1c7c5d6003a0ba33c91a06d9e1c/opencc-1.3.0-cp313-cp313-manylinux2014_x86_64.whl", hash = "sha256:b9f9d459d101888919b70e50a5dc8ad404cfee8c937e51011d618a380105899f", size = 1699183, upload-time = "2026-04-18T16:01:21.253Z" },
-    { url = "https://files.pythonhosted.org/packages/02/5d/c9dacdf739d41f8b1ea95d5abdb165d2590b05819eddb231778bdc8e4314/opencc-1.3.0-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:10f369b744bb0cbcb9ff61f9f8aaaca82ecf368a860ddeae94416811d6dde144", size = 1436267, upload-time = "2026-04-18T15:59:57.486Z" },
-    { url = "https://files.pythonhosted.org/packages/cb/90/afb6ae7583284db2516f0bf58a5ae5382f56804b27db34009ff0dbff4377/opencc-1.3.0-cp314-cp314-manylinux2014_x86_64.whl", hash = "sha256:ae0b3c884b20ad3bfaf912b2e8d2aa5e2e29f0dc6916b1d3d86962064bc9db97", size = 1699107, upload-time = "2026-04-18T16:01:22.908Z" },
+    { url = "https://files.pythonhosted.org/packages/4b/82/5018f0d7b3e72cb4cc5551ecb594528b4355135c743e597161c2ff898cb4/opencc-1.3.1-cp312-cp312-macosx_10_13_x86_64.whl", hash = "sha256:145e699ea379f83e1231d8e55a6be82e58b84c90f52e8b112cd3aadbfd5de771", size = 1637919, upload-time = "2026-05-09T21:36:07.418Z" },
+    { url = "https://files.pythonhosted.org/packages/ec/f1/7d8abcaa16bd3d87ca114cba2e2086063862c277e1e3d39cea10b71171c9/opencc-1.3.1-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:61da7ee02fed5792953d55fd1c003cb9e352027944e01cf0c5ec716fb1da83ca", size = 1556498, upload-time = "2026-05-09T21:31:32.07Z" },
+    { url = "https://files.pythonhosted.org/packages/c2/9d/31b7ca4250e33a0319d282463335a33e486f51271635bcc80872fba798bc/opencc-1.3.1-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:49ffa6d5a0a92ffbd62f86e531d51125649736c131a38b77359ce92f65ec1041", size = 1825582, upload-time = "2026-05-09T21:33:20.372Z" },
+    { url = "https://files.pythonhosted.org/packages/2c/21/61abb6ad4c00d0bc278a1332aacaf169e40cb420bc21557005786c756d29/opencc-1.3.1-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:278314fb5283d3ab2bef3c9c055efb864801d1c6f2578db79bd021bebb40f095", size = 1854318, upload-time = "2026-05-09T21:33:11.634Z" },
+    { url = "https://files.pythonhosted.org/packages/00/d6/32d0ba00a6fdb5c3021a75b5adf7480ae015ceb6330c7c4644a66ddabafd/opencc-1.3.1-cp312-cp312-win_amd64.whl", hash = "sha256:aae898734d6f93b01c5c005ea2d15fac1be2dafd81c7a51fd0afca7eac1824d2", size = 2067495, upload-time = "2026-05-09T21:37:20.661Z" },
+    { url = "https://files.pythonhosted.org/packages/aa/70/b3e5d429c14a9679501ce341ebffd42032569be4626690fa644a7e805747/opencc-1.3.1-cp313-cp313-macosx_10_13_x86_64.whl", hash = "sha256:2555e509078e15657beeee5ac99b08f519ed5f189cdeafe03cb82ebb4d205e9c", size = 1637956, upload-time = "2026-05-09T21:36:08.75Z" },
+    { url = "https://files.pythonhosted.org/packages/e3/98/86960640556b600ee1dc44d84e431647bf82e5a9f4f91b6bc3fdaf4d0ac5/opencc-1.3.1-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:70103865e2232d8e20a09ccbe4fcdf3b2d414a274e0ea7628e1bafbc7095e1da", size = 1556605, upload-time = "2026-05-09T21:31:33.621Z" },
+    { url = "https://files.pythonhosted.org/packages/49/ce/2f59715e5bd5d878cfa970882109a3585f670d4d17d62c0f4a1da9823abf/opencc-1.3.1-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:e1470ad743486ed4b22de7f6d67327828e8251202985f0381d642f5835c5ff1b", size = 1825666, upload-time = "2026-05-09T21:33:21.972Z" },
+    { url = "https://files.pythonhosted.org/packages/15/8a/b9d785e2610bca0f55d0e33ecc57f35403f6a7b9727bf3846593b8ea8a2b/opencc-1.3.1-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:ba1a3f5780070cbb4350697e289a323366d8b43c4441b741523e67c1759b08ac", size = 1854413, upload-time = "2026-05-09T21:33:13.107Z" },
+    { url = "https://files.pythonhosted.org/packages/57/7a/99ac06e36e09861bc4acaebf083b2de4189ccbb8438c033cd118fc1d8f4c/opencc-1.3.1-cp313-cp313-win_amd64.whl", hash = "sha256:9c7ba9e30b59bc1158caffdb467896ad3311bce18d198faf086993bb2bac6fbf", size = 2067657, upload-time = "2026-05-09T21:37:22.144Z" },
+    { url = "https://files.pythonhosted.org/packages/9d/bb/4846f041712a7c88ab076417a335bc75ee65ba54c2ec5621fc66024faf22/opencc-1.3.1-cp314-cp314-macosx_10_15_x86_64.whl", hash = "sha256:54e896ec35e1af6401bf08a22a8703417a21dcf58decea3091bee0224a03d30f", size = 1638041, upload-time = "2026-05-09T21:36:10.111Z" },
+    { url = "https://files.pythonhosted.org/packages/18/b4/ea63c4428c86866ce6b1fefd352389ee86cae16d47f90216de0389aa3287/opencc-1.3.1-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:33a8cd6c80406cb3cc9d1c75abd22a902b6740131fe3596ad5a8b9e9233a6780", size = 1556807, upload-time = "2026-05-09T21:31:34.981Z" },
+    { url = "https://files.pythonhosted.org/packages/d4/d2/cfd2309f0a9e290aaaaaee1d5adc393e14917161d3d9d7fd73181a2e6a0f/opencc-1.3.1-cp314-cp314-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:a80d20bfe04cfbdfa8b51281a4a1158357fd29fb0f33ecb3e600e4fda3093d9a", size = 1825900, upload-time = "2026-05-09T21:33:23.27Z" },
+    { url = "https://files.pythonhosted.org/packages/45/ff/31002618451ae4dfc0b1acd2912cdcf779d733920f8cfc519cdf27cd1838/opencc-1.3.1-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:ca227c09f1f785b17bdc7146533d3fe8ade1a6afe9ce3486c7f63197f1bec5dc", size = 1854362, upload-time = "2026-05-09T21:33:14.564Z" },
+    { url = "https://files.pythonhosted.org/packages/8e/44/27f9bbeccf9ba0533d5b109f2cb6f54620523b0d120b6ea143614e872831/opencc-1.3.1-cp314-cp314-win_amd64.whl", hash = "sha256:27e55422b46b651701a4d794fb05f3f4e04a4688f11f22117c370911811a204c", size = 2109232, upload-time = "2026-05-09T21:37:23.532Z" },
 ]
 
 [[package]]
@@ -1939,15 +1949,6 @@ sdist = { url = "https://files.pythonhosted.org/packages/ce/e5/e272bb9a045105a1f
 wheels = [
     { url = "https://files.pythonhosted.org/packages/0a/07/57ebf7a6798b016c064bd0ca81b4c6a99daa4dc377b898bc7b41eb6b5af0/weasel-1.0.0-py3-none-any.whl", hash = "sha256:89518acee027f49d743126c3502d35e6dd14f5768be5c37c9af47c171b6005cc", size = 50713, upload-time = "2026-03-20T08:10:23.637Z" },
 ]
-
-[[package]]
-name = "whisper"
-version = "1.1.10"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "six" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/b4/c3/913cdd13ef3d882fa483981378a08cd0f018fd8dd95b6bf006b9bf1cfbc9/whisper-1.1.10.tar.gz", hash = "sha256:435b4fb843c4c752719bdf0511a652d5be710e9bb35ad9ebe3b133268ee31c44", size = 42835, upload-time = "2022-05-22T18:19:54.839Z" }
 
 [[package]]
 name = "win32-setctime"
