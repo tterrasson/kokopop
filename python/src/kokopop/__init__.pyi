@@ -20,9 +20,15 @@ class AudioChunk(Audio):
 
 class Model:
     sample_rate: int
-    def __init__(self, path: str, *, n_threads: int = 0, backend: str = "auto") -> None: ...
-    def synthesize(self, text: str, *, voice: str = "", speed: float = 1.0) -> Audio: ...
-    def synthesize_phonemes(self, phonemes: str, *, voice: str = "", speed: float = 1.0) -> Audio: ...
+    def __init__(
+        self, path: str, *, n_threads: int = 0, backend: str = "auto"
+    ) -> None: ...
+    def synthesize(
+        self, text: str, *, voice: str = "", speed: float = 1.0
+    ) -> Audio: ...
+    def synthesize_phonemes(
+        self, phonemes: str, *, voice: str = "", speed: float = 1.0
+    ) -> Audio: ...
     def stream(
         self,
         text: str,
@@ -35,7 +41,15 @@ class Model:
     ) -> Iterator[AudioChunk]: ...
 
 class SynthesisSession:
-    def __init__(self, model: Model, *, voice: str = "", speed: float = 1.0, mode: str = "adaptative", **chunk_options: Any) -> None: ...
+    def __init__(
+        self,
+        model: Model,
+        *,
+        voice: str = "",
+        speed: float = 1.0,
+        mode: str = "adaptative",
+        **chunk_options: Any,
+    ) -> None: ...
     def __enter__(self: _SynthesisSessionT) -> _SynthesisSessionT: ...
     def __exit__(
         self,
@@ -49,7 +63,13 @@ class SynthesisSession:
     def close(self) -> None: ...
 
 class AudioEncoder:
-    def __init__(self, format: str = "pcm_f32le", *, sample_rate: int = 24000, ogg_prebuffer_chunks: int = 0) -> None: ...
+    def __init__(
+        self,
+        format: str = "pcm_f32le",
+        *,
+        sample_rate: int = 24000,
+        ogg_prebuffer_chunks: int = 0,
+    ) -> None: ...
     def __enter__(self: _AudioEncoderT) -> _AudioEncoderT: ...
     def __exit__(
         self,

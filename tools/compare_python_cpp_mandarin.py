@@ -20,8 +20,6 @@ Examples:
       "团队合作是项目成功的关键，每一位成员的贡献都不可或缺。"
 """
 
-from __future__ import annotations
-
 import argparse
 import subprocess
 import sys
@@ -79,7 +77,9 @@ def synth_python(text: str, voice: str) -> tuple[str, np.ndarray]:
     return last_ps, np.concatenate(parts)
 
 
-def synth_python_with_durations(text: str, voice: str) -> tuple[str, np.ndarray, list[int]]:
+def synth_python_with_durations(
+    text: str, voice: str
+) -> tuple[str, np.ndarray, list[int]]:
     pipeline = KPipeline(lang_code="z")
     pack = pipeline.load_voice(voice).to(pipeline.model.device)
     parts: list[np.ndarray] = []
@@ -97,57 +97,86 @@ def synth_python_with_durations(text: str, voice: str) -> tuple[str, np.ndarray,
     return last_ps, np.concatenate(parts), all_durations
 
 
-def probe_python_from_phonemes(phonemes: str, voice: str) -> dict[str, Any]:
-    pipeline = KPipeline(lang_code="z")
-    model = pipeline.model
-    assert model is not None
-    pack = pipeline.load_voice(voice).to(model.device)
-
+def _prepare_phoneme_inputs(model, phonemes: str, pack):
+    """Build (input_tensor, ref_s, input_lengths, text_mask) for the forward pass."""
     input_ids = [x for x in (model.vocab.get(ch) for ch in phonemes) if x is not None]
     input_tensor = torch.LongTensor([[0, *input_ids, 0]]).to(model.device)
     ref_s = pack[len(phonemes) - 1].to(model.device)
     if ref_s.ndim == 1:
         ref_s = ref_s.unsqueeze(0)
 
-    input_lengths = torch.full((1,), input_tensor.shape[-1], device=input_tensor.device, dtype=torch.long)
-    text_mask = torch.arange(input_lengths.max(), device=input_tensor.device).unsqueeze(0).expand(1, -1)
+    input_lengths = torch.full(
+        (1,), input_tensor.shape[-1], device=input_tensor.device, dtype=torch.long
+    )
+    text_mask = (
+        torch.arange(input_lengths.max(), device=input_tensor.device)
+        .unsqueeze(0)
+        .expand(1, -1)
+    )
     text_mask = torch.gt(text_mask + 1, input_lengths.unsqueeze(1)).to(model.device)
+    return input_tensor, ref_s, input_lengths, text_mask
 
+
+def _synthesize_from_inputs(model, input_tensor, ref_s, input_lengths, text_mask):
+    """Run the StyleTTS2 forward pass; returns intermediate tensors of interest."""
+    bert_dur = model.bert(input_tensor, attention_mask=(~text_mask).int())
+    d_en = model.bert_encoder(bert_dur).transpose(-1, -2)
+    prosody_style = ref_s[:, 128:]
+    decoder_style = ref_s[:, :128]
+
+    d = model.predictor.text_encoder(d_en, prosody_style, input_lengths, text_mask)
+    x, _ = model.predictor.lstm(d)
+    duration = model.predictor.duration_proj(x)
+    duration = torch.sigmoid(duration).sum(axis=-1)
+    pred_dur = torch.round(duration).clamp(min=1).long().squeeze(0)
+
+    indices = torch.repeat_interleave(
+        torch.arange(input_tensor.shape[1], device=model.device), pred_dur
+    )
+    pred_aln_trg = torch.zeros(
+        (input_tensor.shape[1], indices.shape[0]), device=model.device
+    )
+    pred_aln_trg[indices, torch.arange(indices.shape[0], device=model.device)] = 1
+    pred_aln_trg = pred_aln_trg.unsqueeze(0)
+
+    en = d.transpose(-1, -2) @ pred_aln_trg
+    f0_pred, n_pred = model.predictor.F0Ntrain(en, prosody_style)
+    t_en = model.text_encoder(input_tensor, input_lengths, text_mask)
+    asr = t_en @ pred_aln_trg
+
+    f0_conv = model.decoder.F0_conv(f0_pred.unsqueeze(1))
+    n_conv = model.decoder.N_conv(n_pred.unsqueeze(1))
+    decoder_cur = torch.cat([asr, f0_conv, n_conv], axis=1)
+    decoder_cur = model.decoder.encode(decoder_cur, decoder_style)
+    asr_res = model.decoder.asr_res(asr)
+    use_residual = True
+    for block in model.decoder.decode:
+        if use_residual:
+            decoder_cur = torch.cat([decoder_cur, asr_res, f0_conv, n_conv], axis=1)
+        decoder_cur = block(decoder_cur, decoder_style)
+        if block.upsample_type != "none":
+            use_residual = False
+    audio = (
+        model.decoder.generator(decoder_cur, decoder_style, f0_pred)
+        .squeeze()
+        .cpu()
+        .numpy()
+        .astype(np.float32)
+    )
+    return pred_dur, f0_pred, n_pred, asr, decoder_cur, audio
+
+
+def probe_python_from_phonemes(phonemes: str, voice: str) -> dict[str, Any]:
+    pipeline = KPipeline(lang_code="z")
+    model = pipeline.model
+    assert model is not None
+    pack = pipeline.load_voice(voice).to(model.device)
+
+    inputs = _prepare_phoneme_inputs(model, phonemes, pack)
     with torch.no_grad():
-        bert_dur = model.bert(input_tensor, attention_mask=(~text_mask).int())
-        d_en = model.bert_encoder(bert_dur).transpose(-1, -2)
-        prosody_style = ref_s[:, 128:]
-        decoder_style = ref_s[:, :128]
-
-        d = model.predictor.text_encoder(d_en, prosody_style, input_lengths, text_mask)
-        x, _ = model.predictor.lstm(d)
-        duration = model.predictor.duration_proj(x)
-        duration = torch.sigmoid(duration).sum(axis=-1)
-        pred_dur = torch.round(duration).clamp(min=1).long().squeeze(0)
-
-        indices = torch.repeat_interleave(torch.arange(input_tensor.shape[1], device=model.device), pred_dur)
-        pred_aln_trg = torch.zeros((input_tensor.shape[1], indices.shape[0]), device=model.device)
-        pred_aln_trg[indices, torch.arange(indices.shape[0], device=model.device)] = 1
-        pred_aln_trg = pred_aln_trg.unsqueeze(0)
-
-        en = d.transpose(-1, -2) @ pred_aln_trg
-        f0_pred, n_pred = model.predictor.F0Ntrain(en, prosody_style)
-        t_en = model.text_encoder(input_tensor, input_lengths, text_mask)
-        asr = t_en @ pred_aln_trg
-
-        f0_conv = model.decoder.F0_conv(f0_pred.unsqueeze(1))
-        n_conv = model.decoder.N_conv(n_pred.unsqueeze(1))
-        decoder_cur = torch.cat([asr, f0_conv, n_conv], axis=1)
-        decoder_cur = model.decoder.encode(decoder_cur, decoder_style)
-        asr_res = model.decoder.asr_res(asr)
-        use_residual = True
-        for block in model.decoder.decode:
-            if use_residual:
-                decoder_cur = torch.cat([decoder_cur, asr_res, f0_conv, n_conv], axis=1)
-            decoder_cur = block(decoder_cur, decoder_style)
-            if block.upsample_type != "none":
-                use_residual = False
-        audio = model.decoder.generator(decoder_cur, decoder_style, f0_pred).squeeze().cpu().numpy().astype(np.float32)
+        pred_dur, f0_pred, n_pred, asr, decoder_cur, audio = _synthesize_from_inputs(
+            model, *inputs
+        )
 
     def tstats(tensor: torch.Tensor) -> tuple[float, float]:
         arr = tensor.detach().float().cpu().numpy()
@@ -178,10 +207,14 @@ def synth_cpp_from_text(text: str, voice: str, model: str) -> np.ndarray:
     try:
         cmd = [
             "./build/kokopop_say",
-            "--model", model,
-            "--voice", voice,
-            "--text", text,
-            "--out", str(wav),
+            "--model",
+            model,
+            "--voice",
+            voice,
+            "--text",
+            text,
+            "--out",
+            str(wav),
         ]
         subprocess.run(cmd, check=True)
         with wave.open(str(wav), "rb") as f:
@@ -198,10 +231,14 @@ def synth_cpp_from_phonemes(phonemes: str, voice: str, model: str) -> np.ndarray
     try:
         cmd = [
             "./build/kokopop_say",
-            "--model", model,
-            "--voice", voice,
-            "--phonemes", phonemes,
-            "--out", str(wav),
+            "--model",
+            model,
+            "--voice",
+            voice,
+            "--phonemes",
+            phonemes,
+            "--out",
+            str(wav),
         ]
         subprocess.run(cmd, check=True)
         with wave.open(str(wav), "rb") as f:
@@ -223,11 +260,15 @@ def transcribe_audio(audio: np.ndarray) -> str:
         wav.unlink(missing_ok=True)
 
 
-def run_cpp_probe(text: str | None, phonemes: str | None, voice: str, model: str) -> dict[str, Any]:
+def run_cpp_probe(
+    text: str | None, phonemes: str | None, voice: str, model: str
+) -> dict[str, Any]:
     cmd = [
         "./build/kokopop_probe",
-        "--model", model,
-        "--voice", voice,
+        "--model",
+        model,
+        "--voice",
+        voice,
     ]
     if text is not None:
         cmd.extend(["--text", text])
@@ -244,14 +285,26 @@ def run_cpp_probe(text: str | None, phonemes: str | None, voice: str, model: str
             data[key] = [float(x) for x in value.split(",") if x]
         elif key in {"rounded_durations"}:
             data[key] = [int(x) for x in value.split(",") if x]
-        elif key in {"token_count", "frontend_hidden_dim", "generation_frames", "rounded_frames", "audio_samples"}:
+        elif key in {
+            "token_count",
+            "frontend_hidden_dim",
+            "generation_frames",
+            "rounded_frames",
+            "audio_samples",
+        }:
             data[key] = int(value)
         elif key in {
-            "f0_mean", "f0_rms",
-            "noise_mean", "noise_rms",
-            "asr_mean", "asr_rms",
-            "decoder_mean", "decoder_rms",
-            "audio_mean", "audio_rms", "audio_peak",
+            "f0_mean",
+            "f0_rms",
+            "noise_mean",
+            "noise_rms",
+            "asr_mean",
+            "asr_rms",
+            "decoder_mean",
+            "decoder_rms",
+            "audio_mean",
+            "audio_rms",
+            "audio_peak",
         }:
             data[key] = float(value)
         else:
@@ -267,7 +320,9 @@ def print_duration_report(label: str, durations: list[int]) -> None:
         print(f"  first10: {durations[:10]}")
 
 
-def compare_duration_lists(reference: list[int], candidate: list[int], label: str) -> None:
+def compare_duration_lists(
+    reference: list[int], candidate: list[int], label: str
+) -> None:
     same_len = len(reference) == len(candidate)
     compared = min(len(reference), len(candidate))
     mismatches = 0
@@ -292,13 +347,33 @@ def compare_duration_lists(reference: list[int], candidate: list[int], label: st
 
 def print_probe_stats(label: str, probe: dict[str, Any]) -> None:
     print(f"{label}_probe_stats:")
-    for key in ("f0_mean", "f0_rms", "noise_mean", "noise_rms", "asr_mean", "asr_rms", "decoder_mean", "decoder_rms"):
+    for key in (
+        "f0_mean",
+        "f0_rms",
+        "noise_mean",
+        "noise_rms",
+        "asr_mean",
+        "asr_rms",
+        "decoder_mean",
+        "decoder_rms",
+    ):
         print(f"  {key}: {probe[key]:.6f}")
 
 
-def compare_probe_stats(reference: dict[str, Any], candidate: dict[str, Any], label: str) -> None:
+def compare_probe_stats(
+    reference: dict[str, Any], candidate: dict[str, Any], label: str
+) -> None:
     print(f"{label}_vs_python_probe_stats:")
-    for key in ("f0_mean", "f0_rms", "noise_mean", "noise_rms", "asr_mean", "asr_rms", "decoder_mean", "decoder_rms"):
+    for key in (
+        "f0_mean",
+        "f0_rms",
+        "noise_mean",
+        "noise_rms",
+        "asr_mean",
+        "asr_rms",
+        "decoder_mean",
+        "decoder_rms",
+    ):
         delta = candidate[key] - reference[key]
         print(f"  {key}_delta: {delta:.6f}")
 
@@ -335,7 +410,9 @@ def main() -> int:
 
     print(f"text: {args.text}")
     if args.include_probes:
-        py_phonemes, py_audio, py_durations = synth_python_with_durations(args.text, args.voice)
+        py_phonemes, py_audio, py_durations = synth_python_with_durations(
+            args.text, args.voice
+        )
         py_probe = probe_python_from_phonemes(py_phonemes, args.voice)
     else:
         py_phonemes, py_audio = synth_python(args.text, args.voice)
@@ -355,7 +432,9 @@ def main() -> int:
         if args.include_probes:
             cpp_text_probe = run_cpp_probe(args.text, None, args.voice, args.model)
             print_duration_report("cpp_text", cpp_text_probe["rounded_durations"])
-            compare_duration_lists(py_durations, cpp_text_probe["rounded_durations"], "cpp_text")
+            compare_duration_lists(
+                py_durations, cpp_text_probe["rounded_durations"], "cpp_text"
+            )
             print_probe_stats("cpp_text", cpp_text_probe)
             compare_probe_stats(py_probe, cpp_text_probe, "cpp_text")
 
@@ -365,8 +444,12 @@ def main() -> int:
         print_report("cpp_python_phonemes", args.text, cpp_py_audio, cpp_py_tr)
         if args.include_probes:
             cpp_ps_probe = run_cpp_probe(None, py_phonemes, args.voice, args.model)
-            print_duration_report("cpp_python_phonemes", cpp_ps_probe["rounded_durations"])
-            compare_duration_lists(py_durations, cpp_ps_probe["rounded_durations"], "cpp_python_phonemes")
+            print_duration_report(
+                "cpp_python_phonemes", cpp_ps_probe["rounded_durations"]
+            )
+            compare_duration_lists(
+                py_durations, cpp_ps_probe["rounded_durations"], "cpp_python_phonemes"
+            )
             print_probe_stats("cpp_python_phonemes", cpp_ps_probe)
             compare_probe_stats(py_probe, cpp_ps_probe, "cpp_python_phonemes")
 

@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import os
 import tarfile
 from pathlib import Path
@@ -43,7 +41,11 @@ def build_sdist(sdist_directory: str, config_settings=None) -> str:
     with tarfile.open(output, "w:gz", format=tarfile.PAX_FORMAT) as tar:
         _add_tree(tar, here, root_name)
         for rel in ("CMakeLists.txt", "include", "src", "patches"):
-            _add_tree(tar, repo / rel, f"{root_name}/kokopop_core/{rel}") if (repo / rel).is_dir() else tar.add(repo / rel, arcname=f"{root_name}/kokopop_core/{rel}")
+            _add_tree(tar, repo / rel, f"{root_name}/kokopop_core/{rel}") if (
+                repo / rel
+            ).is_dir() else tar.add(
+                repo / rel, arcname=f"{root_name}/kokopop_core/{rel}"
+            )
         tar.add(
             repo / "tools" / "apply_patch_if_needed.cmake",
             arcname=f"{root_name}/kokopop_core/tools/apply_patch_if_needed.cmake",
@@ -54,16 +56,28 @@ def build_sdist(sdist_directory: str, config_settings=None) -> str:
     return output.name
 
 
-def build_wheel(wheel_directory: str, config_settings=None, metadata_directory=None) -> str:
-    return _scikit_build.build_wheel(wheel_directory, config_settings, metadata_directory)
+def build_wheel(
+    wheel_directory: str, config_settings=None, metadata_directory=None
+) -> str:
+    return _scikit_build.build_wheel(
+        wheel_directory, config_settings, metadata_directory
+    )
 
 
-def build_editable(wheel_directory: str, config_settings=None, metadata_directory=None) -> str:
-    return _scikit_build.build_editable(wheel_directory, config_settings, metadata_directory)
+def build_editable(
+    wheel_directory: str, config_settings=None, metadata_directory=None
+) -> str:
+    return _scikit_build.build_editable(
+        wheel_directory, config_settings, metadata_directory
+    )
 
 
-def prepare_metadata_for_build_wheel(metadata_directory: str, config_settings=None) -> str:
-    return _scikit_build.prepare_metadata_for_build_wheel(metadata_directory, config_settings)
+def prepare_metadata_for_build_wheel(
+    metadata_directory: str, config_settings=None
+) -> str:
+    return _scikit_build.prepare_metadata_for_build_wheel(
+        metadata_directory, config_settings
+    )
 
 
 def get_requires_for_build_wheel(config_settings=None):

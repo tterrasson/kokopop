@@ -8,22 +8,20 @@ Usage:
     uv run python tools/validate_mandarin.py --model models/kokoro-big.gguf "我喜欢编程"
 """
 
-from __future__ import annotations
-
 import argparse
-import json
-import shutil
 import subprocess
 import sys
 import tempfile
+import unicodedata
+from functools import partial
 from pathlib import Path
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Colours (ANSI)
-# ─────────────────────────────────────────────────────────────────────────────
+from opencc import OpenCC
+
 
 class C:
     """ANSI colour helpers."""
+
     RED = "\033[91m"
     GREEN = "\033[92m"
     YELLOW = "\033[93m"
@@ -39,39 +37,21 @@ def colour(text: str, fg: str, bold: bool = False) -> str:
     return f"{prefix}{text}{C.RESET}"
 
 
-def green(text: str) -> str:
-    return colour(text, C.GREEN, bold=True)
+green = partial(colour, fg=C.GREEN, bold=True)
+red = partial(colour, fg=C.RED, bold=True)
+yellow = partial(colour, fg=C.YELLOW)
+cyan = partial(colour, fg=C.CYAN, bold=True)
+dim = partial(colour, fg=C.DIM)
 
-
-def red(text: str) -> str:
-    return colour(text, C.RED, bold=True)
-
-
-def yellow(text: str) -> str:
-    return colour(text, C.YELLOW)
-
-
-def cyan(text: str) -> str:
-    return colour(text, C.CYAN, bold=True)
-
-
-def dim(text: str) -> str:
-    return colour(text, C.DIM)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Text normalisation (strip punctuation / whitespace for fuzzy comparison)
-# ─────────────────────────────────────────────────────────────────────────────
-
-import unicodedata
-from opencc import OpenCC
 
 # Force traditional → simplified conversion so comparisons are consistent
 # regardless of which character variant Whisper happens to emit.
 CC_TW2SP = OpenCC("tw2sp")
 
 MANDARIN_PUNCTUATION = set(
-    "，。！？、；：" + '\"' * 2 + "''（）【】《》〈〉〔〕｛｝＃＄％＆＊＋，－．／：；＜＝＞＠［＼］＾＿｀｛｜｝～"
+    "，。！？、；："
+    + '"' * 2
+    + "''（）【】《》〈〉〔〕｛｝＃＄％＆＊＋，－．／：；＜＝＞＠［＼］＾＿｀｛｜｝～"
     + ".,;:!?()[]{}<>"  # ASCII punctuation also stripped
 )
 
@@ -80,7 +60,9 @@ def normalise(text: str) -> str:
     """Normalise Mandarin text for comparison: convert to simplified Chinese, strip punctuation, whitespace, full-width chars."""
     text = unicodedata.normalize("NFC", text)
     text = CC_TW2SP.convert(text)  # guarantee simplified Chinese
-    return "".join(ch for ch in text if ch not in MANDARIN_PUNCTUATION and not ch.isspace())
+    return "".join(
+        ch for ch in text if ch not in MANDARIN_PUNCTUATION and not ch.isspace()
+    )
 
 
 def levenshtein(a: str, b: str) -> int:
@@ -99,10 +81,6 @@ def levenshtein(a: str, b: str) -> int:
     return prev[-1]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TTS generation
-# ─────────────────────────────────────────────────────────────────────────────
-
 DEFAULT_MODEL = str(Path(__file__).resolve().parent.parent / "models" / "kokoro.gguf")
 DEFAULT_VOICE = "zf_xiaobei"
 
@@ -118,12 +96,16 @@ def generate_audio(
     """Run kokopop_say to synthesise *text* into a WAV file at *output*."""
     cmd = [
         kokopop_say_bin,
-        "--model", model,
-        "--voice", voice,
-        "--text", text,
-        "--out", str(output),
+        "--model",
+        model,
+        "--voice",
+        voice,
+        "--text",
+        text,
+        "--out",
+        str(output),
     ]
-    print(cyan(f"  cmd: "), " ".join(cmd))
+    print(cyan("  cmd: "), " ".join(cmd))
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         print(red(f"\n  kokopop_say failed (exit {result.returncode})"))
@@ -133,26 +115,18 @@ def generate_audio(
     print(green(f"  ✓ Audio written → {output}"))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Whisper transcription
-# ─────────────────────────────────────────────────────────────────────────────
-
 def transcribe(audio_path: Path, *, model_name: str = "medium") -> dict:
     """Load Whisper and transcribe *audio_path* in Mandarin."""
     print(cyan(f"\n🎙  Loading Whisper ({model_name}) …"))
     import whisper
 
     model = whisper.load_model(model_name)
-    print(green(f"  ✓ Model loaded"))
+    print(green("  ✓ Model loaded"))
 
     print(cyan(f"  Transcribing → {audio_path}"))
     result = model.transcribe(str(audio_path), language="zh", verbose=False)
     return result
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Debug report
-# ─────────────────────────────────────────────────────────────────────────────
 
 def report(original: str, transcription: dict) -> bool:
     """Print a colourful comparison report. Returns True on match."""
@@ -164,27 +138,22 @@ def report(original: str, transcription: dict) -> bool:
     distance = levenshtein(orig_norm, text_norm)
     similarity = 1.0 - (distance / max(len(orig_norm), len(text_norm), 1))
 
-    # Separator
     width = 64
     print()
     print("=" * width)
     print(cyan("  📊 Mandarin Pronunciation Validation Report"))
     print("=" * width)
 
-    # Original
     print(f"\n  {colour('Original text:', C.BOLD)}")
     print(f"    {original}")
 
-    # Transcription
     print(f"\n  {colour('Whisper transcription:', C.BOLD)}")
     print(f"    {text}")
 
-    # Normalised comparison
     print(f"\n  {colour('Normalised comparison:', C.BOLD)}")
     print(f"    Original:      {orig_norm}")
     print(f"    Transcribed:   {text_norm}")
 
-    # Metrics
     print(f"\n  {colour('Metrics:', C.BOLD)}")
     print(f"    Characters (original):    {len(orig_norm)}")
     print(f"    Characters (transcribed): {len(text_norm)}")
@@ -198,10 +167,9 @@ def report(original: str, transcription: dict) -> bool:
         for i, seg in enumerate(segments):
             start = f"{seg['start']:.2f}s"
             end = f"{seg['end']:.2f}s"
-            seg_text = seg.get('text', '').strip()
+            seg_text = seg.get("text", "").strip()
             print(f"    [{i}] {dim(start)} → {dim(end)}  {seg_text}")
 
-    # Verdict
     print()
     print("-" * width)
     if exact:
@@ -209,13 +177,18 @@ def report(original: str, transcription: dict) -> bool:
         print("-" * width)
         return True
     elif similarity >= 0.8:
-        print(yellow(f"  ⚠️  CLOSE MATCH ({similarity:.0%}) — minor differences detected"))
+        print(
+            yellow(f"  ⚠️  CLOSE MATCH ({similarity:.0%}) — minor differences detected")
+        )
         print("-" * width)
-        # Show diff
         show_diff(orig_norm, text_norm)
         return False
     else:
-        print(red(f"  ❌ MISMATCH ({similarity:.0%}) — pronunciation differs significantly"))
+        print(
+            red(
+                f"  ❌ MISMATCH ({similarity:.0%}) — pronunciation differs significantly"
+            )
+        )
         print("-" * width)
         show_diff(orig_norm, text_norm)
         return False
@@ -239,14 +212,10 @@ def show_diff(a: str, b: str) -> None:
     print()
     print(f"    Expected:   {a}")
     print(f"    Got:        {b}")
-    print(f"    {'':16s}{"".join(diff_line)}")
+    print(f"    {'':16s}{''.join(diff_line)}")
     print(f"    {'':16s}{''.join('─' if ch == ' ' else ch for ch in diff_line)}")
     print()
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -279,11 +248,10 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    print(cyan(f"\n🇨🇳  Mandarin Pronunciation Validator"))
+    print(cyan("\n🇨🇳  Mandarin Pronunciation Validator"))
     print(cyan(f"  Text: {args.text}"))
     print()
 
-    # Step 1: Generate audio
     print(cyan("🔊 Step 1: Generating TTS audio …"))
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         wav_path = Path(tmp.name)
@@ -297,16 +265,13 @@ def main() -> None:
             kokopop_say_bin=args.bin,
         )
 
-        # Step 2: Transcribe
         print(cyan("\n🎙  Step 2: Transcribing with Whisper …"))
         result = transcribe(wav_path, model_name=args.whisper_model)
 
-        # Step 3: Compare
         print(cyan("\n📊 Step 3: Comparing …"))
         matched = report(args.text, result)
         sys.exit(0 if matched else 1)
     finally:
-        # Clean up temp file
         if wav_path.exists():
             wav_path.unlink()
 

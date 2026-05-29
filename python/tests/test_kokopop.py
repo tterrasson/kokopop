@@ -63,7 +63,9 @@ def mock_gguf(tmp_path):
     _put_kv_u32(data, "kokopop.kokoro.version", 4)
     _put_kv_bool(data, "kokopop.mock", True)
     _put_kv_u32(data, "kokopop.sample_rate", 24000)
-    _put_kv_str_array(data, "tokenizer.ggml.tokens", ["", "a", "b", "c", " ", "ɑ", "ɔ", "ʃ"])
+    _put_kv_str_array(
+        data, "tokenizer.ggml.tokens", ["", "a", "b", "c", " ", "ɑ", "ɔ", "ʃ"]
+    )
     _put_kv_str_array(data, "kokopop.voices", ["af_heart"])
 
     _put_string(data, "kokopop.voice.af_heart")
@@ -202,16 +204,18 @@ def test_model_stream_iterator(mock_gguf):
 
 def test_model_stream_accepts_disabled_diffusion_options(mock_gguf):
     model = kokopop.Model(str(mock_gguf), backend="cpu")
-    chunks = list(model.stream(
-        "Alpha sentence.",
-        voice="af_heart",
-        enable_diffusion=False,
-        diffusion_seed=1234,
-        diffusion_steps=7,
-        diffusion_alpha=0.2,
-        diffusion_beta=0.6,
-        diffusion_embedding_scale=1.5,
-    ))
+    chunks = list(
+        model.stream(
+            "Alpha sentence.",
+            voice="af_heart",
+            enable_diffusion=False,
+            diffusion_seed=1234,
+            diffusion_steps=7,
+            diffusion_alpha=0.2,
+            diffusion_beta=0.6,
+            diffusion_embedding_scale=1.5,
+        )
+    )
     assert chunks
     assert any(chunk.is_final for chunk in chunks)
 

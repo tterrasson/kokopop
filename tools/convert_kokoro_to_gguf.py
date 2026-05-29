@@ -3,8 +3,6 @@
 Convert hexgrad Kokoro PyTorch weights to the kokopop GGUF layout.
 """
 
-from __future__ import annotations
-
 import argparse
 import ctypes
 import hashlib
@@ -22,9 +20,6 @@ import torch
 from huggingface_hub import hf_hub_download, list_repo_files
 from kokoro import KModel
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Suppress third-party warnings we cannot fix (kokoro package)
-# ─────────────────────────────────────────────────────────────────────────────
 warnings.filterwarnings(
     "ignore",
     message="dropout.*num_layers",
@@ -38,27 +33,15 @@ warnings.filterwarnings(
 
 logger = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Model defaults
-# ─────────────────────────────────────────────────────────────────────────────
-
 DEFAULT_REPO = "hexgrad/Kokoro-82M"
 DEFAULT_VOICES = "af_heart,ff_siwis"
 DEFAULT_MODEL_NAME = "kokoro-v1_0.pth"
-
-# ─────────────────────────────────────────────────────────────────────────────
-# GGUF type constants
-# ─────────────────────────────────────────────────────────────────────────────
 
 GGUF_TYPE_UINT32 = 4
 GGUF_TYPE_FLOAT32 = 6
 GGUF_TYPE_BOOL = 7
 GGUF_TYPE_STRING = 8
 GGUF_TYPE_ARRAY = 9
-
-# ─────────────────────────────────────────────────────────────────────────────
-# GGML type constants
-# ─────────────────────────────────────────────────────────────────────────────
 
 GGML_TYPE_F32 = 0
 GGML_TYPE_F16 = 1
@@ -101,11 +84,6 @@ _CONV1D_PATTERNS: tuple[str, ...] = (
 )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Alignment & utility helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-
 def align(value: int, alignment: int) -> int:
     """Return *value* rounded up to the next multiple of *alignment*."""
     return (value + alignment - 1) // alignment * alignment
@@ -123,11 +101,6 @@ def weight_norm_value(module) -> np.ndarray:
     weight_g = getattr(module, "weight_g")
     weight_v = getattr(module, "weight_v")
     return as_f32(torch._weight_norm(weight_v, weight_g, 0))
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Tensor type detection
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 def is_conv1d_weight(name: str) -> bool:
@@ -162,11 +135,6 @@ def _downgrade_type(ggml_type: int, innermost_dim: int) -> int:
         if _is_type_aligned(GGML_TYPE_Q8_0, innermost_dim):
             return GGML_TYPE_Q8_0
     return GGML_TYPE_F16
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Quantization rules
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 def _target_type(logical: str, ndim: int) -> int:
@@ -223,10 +191,6 @@ def resolve_tensor_type(writer, name: str, data: np.ndarray) -> int:
     return target
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# libggml ctypes loading (for quantization)
-# ─────────────────────────────────────────────────────────────────────────────
-
 _ggml_lib = None
 
 
@@ -248,13 +212,13 @@ def _setup_ggml_ctypes(lib) -> None:
     lib.ggml_get_type_traits.restype = ctypes.POINTER(GgmlTypeTraits)
 
     lib.ggml_quantize_chunk.argtypes = [
-        ctypes.c_int,       # type
-        ctypes.c_void_p,    # src (float*)
-        ctypes.c_void_p,    # dst (void*)
-        ctypes.c_int64,     # start
-        ctypes.c_int64,     # nrows
-        ctypes.c_int64,     # n_per_row
-        ctypes.c_void_p,    # imatrix (float* or NULL)
+        ctypes.c_int,  # type
+        ctypes.c_void_p,  # src (float*)
+        ctypes.c_void_p,  # dst (void*)
+        ctypes.c_int64,  # start
+        ctypes.c_int64,  # nrows
+        ctypes.c_int64,  # n_per_row
+        ctypes.c_void_p,  # imatrix (float* or NULL)
     ]
     lib.ggml_quantize_chunk.restype = ctypes.c_size_t
 
@@ -281,7 +245,8 @@ def _load_ggml_lib():
                 _ggml_lib = ctypes.CDLL(str(path))
                 _setup_ggml_ctypes(_ggml_lib)
                 return _ggml_lib
-            except OSError:
+            except OSError as e:
+                logger.debug("failed to load ggml from %s: %s", path, e)
                 continue
 
     found = ctypes.util.find_library("ggml")
@@ -290,15 +255,11 @@ def _load_ggml_lib():
             _ggml_lib = ctypes.CDLL(found)
             _setup_ggml_ctypes(_ggml_lib)
             return _ggml_lib
-        except OSError:
-            pass
+        except OSError as e:
+            logger.warning("found ggml at %s but failed to load it: %s", found, e)
 
+    logger.warning("libggml not found; quantization support unavailable")
     return None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Tensor data class
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 @dataclass
@@ -333,7 +294,8 @@ class TensorEntry:
         if libggml is None:
             logger.warning(
                 "libggml not found, writing %s as F16 instead of type %s",
-                self.name, self.ggml_type,
+                self.name,
+                self.ggml_type,
             )
             return np.asarray(self.data, dtype=np.float16).tobytes(order="C")
 
@@ -363,17 +325,12 @@ class TensorEntry:
             self.ggml_type,
             ctypes.cast(src_arr, ctypes.c_void_p),
             quant_buf,
-            0,        # start
+            0,  # start
             nrows,
             n_per_row,
-            None,     # imatrix
+            None,  # imatrix
         )
         return quant_buf.raw
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# GGUF writer
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 class GGUFWriter:
@@ -472,7 +429,7 @@ class GGUFWriter:
             elif typ == GGUF_TYPE_ARRAY:
                 out += struct.pack("<I", GGUF_TYPE_STRING)
                 out += struct.pack("<Q", len(value))
-                for item in (value if isinstance(value, list) else [value]):
+                for item in value if isinstance(value, list) else [value]:
                     out += self._string(item)
             else:
                 raise ValueError(f"unsupported GGUF kv type {typ}")
@@ -517,11 +474,6 @@ class GGUFWriter:
 
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_bytes(blob)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# State-dict conversion helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 def pack_lstm(name: str, tensor, writer: GGUFWriter) -> None:
@@ -600,21 +552,11 @@ def add_regularized_modules(prefix: str, module, writer: GGUFWriter) -> None:
         writer.add_tensor(f"{prefix}.{name}", param)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Vocabulary builder
-# ─────────────────────────────────────────────────────────────────────────────
-
-
 def build_vocab(config: dict) -> list[str]:
     """Build the vocabulary list from the model config."""
     reverse = {int(v): k for k, v in config["vocab"].items()}
     max_id = max(reverse)
     return [""] + [reverse.get(i, "") for i in range(1, max_id + 1)]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CLI entry point
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 def _resolve_file(filename: str, args: argparse.Namespace) -> str:
@@ -638,7 +580,9 @@ def _discover_voices(args: argparse.Namespace) -> list[str]:
     )
 
 
-_KMODEL_KEYS = frozenset({"bert", "bert_encoder", "predictor", "text_encoder", "decoder"})
+_KMODEL_KEYS = frozenset(
+    {"bert", "bert_encoder", "predictor", "text_encoder", "decoder"}
+)
 
 
 def _normalize_wn_checkpoint(model_path: str) -> str:
@@ -658,7 +602,9 @@ def _normalize_wn_checkpoint(model_path: str) -> str:
 
     unknown_keys = set(checkpoint.keys()) - _KMODEL_KEYS
     if unknown_keys:
-        logger.info(f"stripping unknown checkpoint keys not used by KModel: {unknown_keys}")
+        logger.info(
+            f"stripping unknown checkpoint keys not used by KModel: {unknown_keys}"
+        )
 
     needs_wn_fix = any(
         ".parametrizations.weight." in k
@@ -670,7 +616,9 @@ def _normalize_wn_checkpoint(model_path: str) -> str:
         return model_path
 
     if needs_wn_fix:
-        logger.info("checkpoint uses new parametrizations weight_norm API — remapping keys")
+        logger.info(
+            "checkpoint uses new parametrizations weight_norm API — remapping keys"
+        )
 
     def _remap(sd: dict) -> dict:
         out = {}
@@ -707,7 +655,7 @@ def _remap_diffusion_key(key: str) -> str:
     flattened ``to_time.0.weights`` / ``to_time.1`` — collapse the extra level.
     """
     if key.startswith("to_time.0."):
-        return "to_time." + key[len("to_time.0."):]
+        return "to_time." + key[len("to_time.0.") :]
     return key
 
 
@@ -728,14 +676,20 @@ def _extract_diffusion_state_dict(model_path: str) -> dict | None:
     for k, v in raw.items():
         if not k.startswith(prefix):
             continue
-        name = _remap_diffusion_key(k[len(prefix):])
+        name = _remap_diffusion_key(k[len(prefix) :])
         # to_out is a Conv1d(kernel_size=1) → stored as [out, in, 1]. The runtime
         # reads it as a plain linear weight, so drop the trailing kernel axis.
-        if name == "to_out.1.weight" and getattr(v, "ndim", 0) == 3 and v.shape[-1] == 1:
+        if (
+            name == "to_out.1.weight"
+            and getattr(v, "ndim", 0) == 3
+            and v.shape[-1] == 1
+        ):
             v = v.squeeze(-1)
         unet_sd[name] = v
     if not unet_sd:
-        logger.warning("'diffusion' key found in checkpoint but no 'module.diffusion.net.*' tensors")
+        logger.warning(
+            "'diffusion' key found in checkpoint but no 'module.diffusion.net.*' tensors"
+        )
         return None
     return unet_sd
 
@@ -767,48 +721,22 @@ def convert(args: argparse.Namespace) -> None:
         voices = [v.strip() for v in args.voices.split(",") if v.strip()]
 
     writer = GGUFWriter(Path(args.output))
-
-    # Metadata
-    writer.add_u32("kokopop.kokoro.version", KOKOPOP_GGUF_VERSION)
-    writer.add_bool("kokopop.mock", False)
-    writer.add_u32("kokopop.sample_rate", 24000)
-    writer.add_string("kokopop.arch", "kokoro-82m")
-    writer.add_string("kokopop.tensor_layout", "runtime-v3")
-    writer.add_string("kokopop.source_repo", args.local_dir or args.repo_id)
-    writer.add_string("kokopop.quantization", QUANTIZATION_LABEL)
-    writer.add_string_array("tokenizer.ggml.tokens", build_vocab(config))
-    writer.add_string_array("kokopop.voices", voices)
-
-    # Model dimensions
-    writer.add_u32("kokopop.context_length", int(config["plbert"]["max_position_embeddings"]))
-    writer.add_u32("kokopop.hidden_dim", int(config["hidden_dim"]))
-    writer.add_u32("kokopop.style_dim", int(config["style_dim"]))
-    writer.add_u32("kokopop.max_dur", int(config["max_dur"]))
-    writer.add_u32("kokopop.n_mels", int(config["n_mels"]))
+    _write_model_metadata(writer, config, voices, args)
 
     # Prefer weights loaded directly from the checkpoint (StyleTTS2 fine-tunes).
     # Fall back to model.diffusion for KModel versions that natively support it.
     _model_diffusion = getattr(model, "diffusion", None)
     diffusion_available = bool(
         diffusion_unet_sd is not None
-        or (_model_diffusion is not None and getattr(model, "diffusion_available", False))
+        or (
+            _model_diffusion is not None
+            and getattr(model, "diffusion_available", False)
+        )
     )
     writer.add_bool("kokopop.diffusion.available", diffusion_available)
-
     if diffusion_available:
-        writer.add_u32("kokopop.diffusion.style_dim", int(config["style_dim"]) * 2)
-        writer.add_u32("kokopop.diffusion.embedding_dim", int(config["plbert"]["hidden_size"]))
-        writer.add_u32("kokopop.diffusion.steps_default", 5)
-        writer.add_f32("kokopop.diffusion.sigma_min", 0.0001)
-        writer.add_f32("kokopop.diffusion.sigma_max", 3.0)
-        writer.add_f32("kokopop.diffusion.rho", 9.0)
-        # sigma_data is a scalar estimated during training (not stored in the
-        # .pth — it lives in the StyleTTS2 training config YAML under
-        # model_params.diffusion.dist.sigma_data). Pass it via --diffusion-sigma-data.
-        writer.add_f32("kokopop.diffusion.sigma_data", float(args.diffusion_sigma_data))
-        logger.info(f"diffusion sigma_data = {args.diffusion_sigma_data}")
+        _write_diffusion_metadata(writer, config, args)
 
-    # Tensors
     add_state_dict("kokopop.albert", model.bert.state_dict(), writer)
     writer.add_tensor("kokopop.bert_encoder.weight", model.bert_encoder.weight)
     writer.add_tensor("kokopop.bert_encoder.bias", model.bert_encoder.bias)
@@ -820,13 +748,62 @@ def convert(args: argparse.Namespace) -> None:
         unet_sd = diffusion_unet_sd or _model_diffusion.unet.state_dict()
         add_state_dict("kokopop.diffusion", unet_sd, writer)
 
+    _write_voice_tensors(writer, voices, args)
+
+    writer.write()
+    print(f"wrote {args.output}")
+
+
+def _write_model_metadata(
+    writer: GGUFWriter,
+    config: dict,
+    voices: list[str],
+    args: argparse.Namespace,
+) -> None:
+    writer.add_u32("kokopop.kokoro.version", KOKOPOP_GGUF_VERSION)
+    writer.add_bool("kokopop.mock", False)
+    writer.add_u32("kokopop.sample_rate", 24000)
+    writer.add_string("kokopop.arch", "kokoro-82m")
+    writer.add_string("kokopop.tensor_layout", "runtime-v3")
+    writer.add_string("kokopop.source_repo", args.local_dir or args.repo_id)
+    writer.add_string("kokopop.quantization", QUANTIZATION_LABEL)
+    writer.add_string_array("tokenizer.ggml.tokens", build_vocab(config))
+    writer.add_string_array("kokopop.voices", voices)
+
+    writer.add_u32(
+        "kokopop.context_length", int(config["plbert"]["max_position_embeddings"])
+    )
+    writer.add_u32("kokopop.hidden_dim", int(config["hidden_dim"]))
+    writer.add_u32("kokopop.style_dim", int(config["style_dim"]))
+    writer.add_u32("kokopop.max_dur", int(config["max_dur"]))
+    writer.add_u32("kokopop.n_mels", int(config["n_mels"]))
+
+
+def _write_diffusion_metadata(
+    writer: GGUFWriter, config: dict, args: argparse.Namespace
+) -> None:
+    writer.add_u32("kokopop.diffusion.style_dim", int(config["style_dim"]) * 2)
+    writer.add_u32(
+        "kokopop.diffusion.embedding_dim", int(config["plbert"]["hidden_size"])
+    )
+    writer.add_u32("kokopop.diffusion.steps_default", 5)
+    writer.add_f32("kokopop.diffusion.sigma_min", 0.0001)
+    writer.add_f32("kokopop.diffusion.sigma_max", 3.0)
+    writer.add_f32("kokopop.diffusion.rho", 9.0)
+    # sigma_data is a scalar estimated during training (not stored in the
+    # .pth — it lives in the StyleTTS2 training config YAML under
+    # model_params.diffusion.dist.sigma_data). Pass it via --diffusion-sigma-data.
+    writer.add_f32("kokopop.diffusion.sigma_data", float(args.diffusion_sigma_data))
+    logger.info(f"diffusion sigma_data = {args.diffusion_sigma_data}")
+
+
+def _write_voice_tensors(
+    writer: GGUFWriter, voices: list[str], args: argparse.Namespace
+) -> None:
     for voice in voices:
         voice_path = _resolve_file(f"voices/{voice}.pt", args)
         pack = torch.load(voice_path, weights_only=True).squeeze(1)
         writer.add_tensor(f"kokopop.voice.{voice}", pack)
-
-    writer.write()
-    print(f"wrote {args.output}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -836,23 +813,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", required=True, help="output GGUF path")
     parser.add_argument("--repo-id", default=DEFAULT_REPO)
     parser.add_argument(
-        "--local-dir", default=None,
+        "--local-dir",
+        default=None,
         help="load model files from this local directory instead of HuggingFace",
     )
     parser.add_argument(
-        "--model-name", default=DEFAULT_MODEL_NAME,
+        "--model-name",
+        default=DEFAULT_MODEL_NAME,
         help="filename of the PyTorch weights inside the repo (default: %(default)s)",
     )
     parser.add_argument("--voices", default=DEFAULT_VOICES)
     parser.add_argument(
-        "--all-voices", action="store_true",
+        "--all-voices",
+        action="store_true",
         help="include all voices found in voices/* (overrides --voices)",
     )
     parser.add_argument(
-        "--diffusion-sigma-data", type=float, default=0.2,
+        "--diffusion-sigma-data",
+        type=float,
+        default=0.2,
         help="diffusion sigma_data estimated during training (found in the "
-             "StyleTTS2 config YAML at model_params.diffusion.dist.sigma_data; "
-             "default: %(default)s)",
+        "StyleTTS2 config YAML at model_params.diffusion.dist.sigma_data; "
+        "default: %(default)s)",
     )
     return parser.parse_args()
 

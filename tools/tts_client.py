@@ -8,8 +8,6 @@ Usage:
     uv run python tools/tts_client.py "Hello world" --format wav --out hello.wav
 """
 
-from __future__ import annotations
-
 import argparse
 import json
 import random
@@ -45,10 +43,19 @@ def _pcm_to_wav(pcm: bytes, sample_rate: int = 24000) -> bytes:
     data_size = len(pcm)
     header = struct.pack(
         "<4sI4s4sIHHIIHH4sI",
-        b"RIFF", 36 + data_size, b"WAVE",
-        b"fmt ", 16, 3, num_channels,
-        sample_rate, byte_rate, block_align, bits_per_sample,
-        b"data", data_size,
+        b"RIFF",
+        36 + data_size,
+        b"WAVE",
+        b"fmt ",
+        16,
+        3,
+        num_channels,
+        sample_rate,
+        byte_rate,
+        block_align,
+        bits_per_sample,
+        b"data",
+        data_size,
     )
     return header + pcm
 
@@ -120,49 +127,120 @@ def fetch_tts(
     diffusion_beta: float | None = None,
     diffusion_embedding_scale: float | None = None,
 ) -> bytes:
-    payload = _build_payload(text, voice, speed, mode, fmt, prebuffer_chunks,
-                             first_chunk_tokens, diffusion, diffusion_seed,
-                             diffusion_steps, diffusion_alpha, diffusion_beta,
-                             diffusion_embedding_scale)
+    payload = _build_payload(
+        text,
+        voice,
+        speed,
+        mode,
+        fmt,
+        prebuffer_chunks,
+        first_chunk_tokens,
+        diffusion,
+        diffusion_seed,
+        diffusion_steps,
+        diffusion_alpha,
+        diffusion_beta,
+        diffusion_embedding_scale,
+    )
     return _send_tts(url, payload, lambda resp: _read_stream(resp, emit_stdout))
 
 
-def main() -> None:
+def _add_diffusion_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--diffusion",
+        action="store_true",
+        help="Enable diffusion style sampling (requires a GGUF with diffusion tensors)",
+    )
+    parser.add_argument(
+        "--diffusion-seed",
+        type=int,
+        default=None,
+        help="Seed for diffusion sampling. Default: a random seed per call "
+        "(so successive calls vary). Pass a fixed value to reproduce output.",
+    )
+    parser.add_argument(
+        "--diffusion-steps",
+        type=int,
+        default=None,
+        help="Diffusion sampler steps (server default: 5). Controls sampling "
+        "accuracy, not effect strength.",
+    )
+    parser.add_argument(
+        "--diffusion-alpha",
+        type=float,
+        default=None,
+        help="Mix of the diffused style into the predictor style / prosody "
+        "(server default: 0.1). Raise (~0.3-0.7) for more prosody variation.",
+    )
+    parser.add_argument(
+        "--diffusion-beta",
+        type=float,
+        default=None,
+        help="Mix of the diffused style into the decoder style / timbre "
+        "(server default: 0.5).",
+    )
+    parser.add_argument(
+        "--diffusion-embedding-scale",
+        type=float,
+        default=None,
+        help="Classifier-free guidance scale (server default: 1.0). Above 1.0 "
+        "amplifies text-conditioned expressiveness (try 1.5-2.0).",
+    )
+
+
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="kokopop TTS HTTP client")
     parser.add_argument("text", nargs="?", default=None, help="Text to synthesize")
-    parser.add_argument("--file", "-f", default=None, metavar="PATH",
-                        help="Read text from a file (alternative to positional text)")
-    parser.add_argument("--url", default="http://127.0.0.1:8080/tts",
-                        help="Server URL (default: http://127.0.0.1:8080/tts)")
+    parser.add_argument(
+        "--file",
+        "-f",
+        default=None,
+        metavar="PATH",
+        help="Read text from a file (alternative to positional text)",
+    )
+    parser.add_argument(
+        "--url",
+        default="http://127.0.0.1:8080/tts",
+        help="Server URL (default: http://127.0.0.1:8080/tts)",
+    )
     parser.add_argument("--voice", default=None, help="Voice name (e.g. ff_siwis)")
     parser.add_argument("--speed", type=float, default=1.0, help="Speed multiplier")
-    parser.add_argument("--mode", choices=["adaptative", "long_form"],
-                        default="adaptative", help="Synthesis mode")
-    parser.add_argument("--format", choices=["pcm", "wav", "ogg"], default="pcm",
-                        dest="fmt", help="Output format: pcm, wav, or ogg")
-    parser.add_argument("--prebuffer-chunks", type=int, default=0,
-                        help="Server-side Ogg synthesis chunks to buffer before playback")
-    parser.add_argument("--first-chunk-tokens", type=int, default=None,
-                        help="Target max tokens for the first audio chunk (adaptive mode only)")
-    parser.add_argument("--diffusion", action="store_true",
-                        help="Enable diffusion style sampling (requires a GGUF with diffusion tensors)")
-    parser.add_argument("--diffusion-seed", type=int, default=None,
-                        help="Seed for diffusion sampling. Default: a random seed per call "
-                             "(so successive calls vary). Pass a fixed value to reproduce output.")
-    parser.add_argument("--diffusion-steps", type=int, default=None,
-                        help="Diffusion sampler steps (server default: 5). Controls sampling "
-                             "accuracy, not effect strength.")
-    parser.add_argument("--diffusion-alpha", type=float, default=None,
-                        help="Mix of the diffused style into the predictor style / prosody "
-                             "(server default: 0.1). Raise (~0.3-0.7) for more prosody variation.")
-    parser.add_argument("--diffusion-beta", type=float, default=None,
-                        help="Mix of the diffused style into the decoder style / timbre "
-                             "(server default: 0.5).")
-    parser.add_argument("--diffusion-embedding-scale", type=float, default=None,
-                        help="Classifier-free guidance scale (server default: 1.0). Above 1.0 "
-                             "amplifies text-conditioned expressiveness (try 1.5-2.0).")
-    parser.add_argument("--out", default=None,
-                        help="Output file. If omitted, streaming formats write to stdout.")
+    parser.add_argument(
+        "--mode",
+        choices=["adaptative", "long_form"],
+        default="adaptative",
+        help="Synthesis mode",
+    )
+    parser.add_argument(
+        "--format",
+        choices=["pcm", "wav", "ogg"],
+        default="pcm",
+        dest="fmt",
+        help="Output format: pcm, wav, or ogg",
+    )
+    parser.add_argument(
+        "--prebuffer-chunks",
+        type=int,
+        default=0,
+        help="Server-side Ogg synthesis chunks to buffer before playback",
+    )
+    parser.add_argument(
+        "--first-chunk-tokens",
+        type=int,
+        default=None,
+        help="Target max tokens for the first audio chunk (adaptive mode only)",
+    )
+    _add_diffusion_args(parser)
+    parser.add_argument(
+        "--out",
+        default=None,
+        help="Output file. If omitted, streaming formats write to stdout.",
+    )
+    return parser
+
+
+def main() -> None:
+    parser = _build_parser()
     args = parser.parse_args()
 
     if args.text is not None:
@@ -176,22 +254,36 @@ def main() -> None:
     # --diffusion-seed reproduces a given sample.
     diffusion_seed = args.diffusion_seed
     if args.diffusion and diffusion_seed is None:
-        diffusion_seed = random.randrange(2 ** 32)
+        diffusion_seed = random.randrange(2**32)
 
     emit_stdout = args.out is None and not sys.stdout.buffer.isatty()
     data = fetch_tts(
-        text, args.voice, args.speed, args.mode, args.fmt, args.url,
-        emit_stdout, max(0, args.prebuffer_chunks), args.first_chunk_tokens,
-        args.diffusion, diffusion_seed, args.diffusion_steps,
-        args.diffusion_alpha, args.diffusion_beta, args.diffusion_embedding_scale)
+        text,
+        args.voice,
+        args.speed,
+        args.mode,
+        args.fmt,
+        args.url,
+        emit_stdout,
+        max(0, args.prebuffer_chunks),
+        args.first_chunk_tokens,
+        args.diffusion,
+        diffusion_seed,
+        args.diffusion_steps,
+        args.diffusion_alpha,
+        args.diffusion_beta,
+        args.diffusion_embedding_scale,
+    )
 
     if args.out:
         output = _pcm_to_wav(data) if args.fmt == "pcm" else data
         Path(args.out).write_bytes(output)
         print(f"Saved {len(output):,} bytes -> {args.out}", file=sys.stderr)
     elif not emit_stdout:
-        print("No --out specified and stdout is a TTY. Use --out or pipe to ffplay.",
-              file=sys.stderr)
+        print(
+            "No --out specified and stdout is a TTY. Use --out or pipe to ffplay.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
 
