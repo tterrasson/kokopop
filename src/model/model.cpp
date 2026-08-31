@@ -550,13 +550,17 @@ bool load_model_from_gguf(
         m->n_threads = options && options->n_threads > 0 ? options->n_threads : def;
     }
     const int32_t requested_backend = options ? options->backend : KOKOPOP_BACKEND_AUTO;
-    if (requested_backend != KOKOPOP_BACKEND_AUTO &&
-        requested_backend != KOKOPOP_BACKEND_CPU &&
-        requested_backend != KOKOPOP_BACKEND_METAL &&
-        requested_backend != KOKOPOP_BACKEND_CUDA &&
-        requested_backend != KOKOPOP_BACKEND_VULKAN) {
-        error = "invalid kokopop backend option";
-        return false;
+    switch (requested_backend) {
+        case KOKOPOP_BACKEND_AUTO:
+        case KOKOPOP_BACKEND_CPU:
+        case KOKOPOP_BACKEND_METAL:
+        case KOKOPOP_BACKEND_CUDA:
+        case KOKOPOP_BACKEND_VULKAN:
+        case KOKOPOP_BACKEND_OPENCL:
+            break;
+        default:
+            error = "invalid kokopop backend option";
+            return false;
     }
 
     uint32_t version = 0;

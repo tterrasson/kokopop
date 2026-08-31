@@ -10,6 +10,7 @@ A standalone C++ library and toolkit for running [Kokoro](https://github.com/hex
   - **Metal GPU** (macOS)
   - **CUDA** (Linux/Windows) on NVIDIA GPUs
   - **Vulkan** (Linux/Windows/macOS via MoltenVK)
+  - **OpenCL** (Android/Adreno, where Vulkan is unavailable)
 - **Streaming API** for real-time audio generation
 - **Chunked synthesis** for long-form text processing
 - **WAV, PCM (float32/s16), and Ogg/Opus audio output**
@@ -80,6 +81,30 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release -DKOKOPOP_ENABLE_VULKAN=ON
 cmake --build build
 ```
 
+### Build with OpenCL support
+
+The OpenCL backend targets Qualcomm Adreno GPUs on Android, where Vulkan is not
+an option: `ggml-vulkan` hard-requires `VK_KHR_16bit_storage`, which the Adreno
+6xx driver does not expose.
+
+ggml's OpenCL backend needs the Khronos headers (`CL/cl.h`) and an ICD loader.
+kokopop deliberately does not call `find_package(OpenCL)` itself, ggml does,
+and cross-compiling embedders pre-seed the result as cache variables (the same
+pattern as `ESPEAK_NG_LIBRARY` for Android builds):
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DKOKOPOP_ENABLE_OPENCL=ON \
+  -DOpenCL_INCLUDE_DIR=/path/to/OpenCL-Headers \
+  -DOpenCL_LIBRARY=/path/to/libOpenCL.so
+cmake --build build
+```
+
+Kernels are embedded in the library (`GGML_OPENCL_EMBED_KERNELS=ON`), so there
+are no `.cl` files to ship alongside it. If kernel compilation fails at runtime
+on an older driver, set `-DKOKOPOP_OPENCL_TARGET_VERSION=200`; if the optimized
+Adreno matmul path misbehaves, rebuild ggml with
+`-DGGML_OPENCL_USE_ADRENO_KERNELS=OFF` to fall back to the generic kernels.
+
 ### HTTP Server Dependencies (Ogg/Opus)
 
 The HTTP server (`kokopop_stream --http`) supports Ogg/Opus audio streaming. Install the required libraries:
@@ -145,7 +170,8 @@ Synthesize text to a WAV file:
 ```
 
 For embedding, see the [C API guide](docs/c-api.md), including one-shot
-synthesis, pull-based chunked synthesis, and streaming audio encoders.
+synthesis, backend selection, pull-based chunked synthesis, and streaming audio
+encoders.
 
 Generate audio from phonemes:
 
@@ -214,7 +240,7 @@ Start an async, event-driven HTTP server for TTS synthesis. Uses `poll()` for no
 # Bind to all interfaces, use a different port
 ./build/kokopop_stream --model models/kokoro.gguf --http --port 9000 --bind 0.0.0.0
 
-# Force a specific backend (cpu, metal, cuda, vulkan)
+# Force a specific backend (cpu, metal, cuda, vulkan, opencl)
 ./build/kokopop_stream --model models/kokoro.gguf --http --backend cuda
 
 # Set default speed and mode for all requests
@@ -235,7 +261,7 @@ Start an async, event-driven HTTP server for TTS synthesis. Uses `poll()` for no
 | `--port N` | `8080` | HTTP server port |
 | `--bind ADDR` | `127.0.0.1` | HTTP server bind address (use `0.0.0.0` for all interfaces) |
 | `--idle-unload N` | disabled | Unload model after N minutes of inactivity; reload on next request (saves memory) |
-| `--backend` | `auto` | Inference backend: `cpu`, `metal`, `cuda`, or `vulkan` |
+| `--backend` | `auto` | Inference backend: `cpu`, `metal`, `cuda`, `vulkan`, or `opencl` |
 | `--threads N` | `min(4, hw_concurrency)` | Number of inference threads (affects model loading; scheduler worker is single-threaded) |
 | `--speed FLOAT` | `1.0` | Default synthesis speed for HTTP requests |
 | `--mode MODE` | `adaptative` | Default synthesis mode: `adaptative` or `long_form` |
@@ -500,7 +526,7 @@ All functions return `KOKOPOP_OK` (0) on success. On failure, call
 
 /* Optional: configure backend and thread count */
 kokopop_model_options model_opts = {0};
-model_opts.backend    = KOKOPOP_BACKEND_AUTO; /* CPU, Metal, CUDA, or Vulkan */
+model_opts.backend    = KOKOPOP_BACKEND_AUTO; /* CPU, Metal, CUDA, Vulkan, or OpenCL */
 model_opts.n_threads  = 4;
 
 kokopop_model *model = NULL;
@@ -518,6 +544,9 @@ kokopop_write_wav("output.wav", &audio);
 
 /* Query the model sample rate */
 int sample_rate = kokopop_model_sample_rate(model); /* typically 24000 */
+
+/* Query the backend AUTO actually resolved to (KOKOPOP_BACKEND_*) */
+int32_t resolved_backend = kokopop_model_backend(model);
 
 kokopop_audio_free(&audio);
 kokopop_model_free(model);
@@ -639,6 +668,9 @@ Kokopop supports the following languages:
 | `KOKOPOP_VULKAN_DEBUG` | `OFF` | Enable Vulkan debug output in ggml |
 | `KOKOPOP_VULKAN_MEMORY_DEBUG` | `OFF` | Enable Vulkan memory debug output in ggml |
 | `KOKOPOP_VULKAN_SHADER_DEBUG_INFO` | `OFF` | Build Vulkan shaders with debug info |
+| `KOKOPOP_ENABLE_OPENCL` | `OFF` | Enable OpenCL GPU backend (Adreno / Android) |
+| `KOKOPOP_OPENCL_PROFILING` | `OFF` | Enable OpenCL profiling in ggml (adds CPU overhead) |
+| `KOKOPOP_OPENCL_TARGET_VERSION` | `300` | OpenCL version ggml targets (try `200` on older Adreno drivers) |
 | `KOKOPOP_BUILD_BENCH` | `OFF`   | Build benchmarks (requires model)|
 
 ## Testing

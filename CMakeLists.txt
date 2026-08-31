@@ -14,6 +14,10 @@ option(KOKOPOP_VULKAN_VALIDATE "Enable Vulkan validation layers in ggml" OFF)
 option(KOKOPOP_VULKAN_DEBUG "Enable Vulkan debug output in ggml" OFF)
 option(KOKOPOP_VULKAN_MEMORY_DEBUG "Enable Vulkan memory debug output in ggml" OFF)
 option(KOKOPOP_VULKAN_SHADER_DEBUG_INFO "Enable Vulkan shader debug info in ggml" OFF)
+option(KOKOPOP_ENABLE_OPENCL "Enable OpenCL (GPU) backend" OFF)
+option(KOKOPOP_OPENCL_PROFILING "Enable OpenCL profiling in ggml" OFF)
+set(KOKOPOP_OPENCL_TARGET_VERSION "300" CACHE STRING
+  "OpenCL target version passed to ggml (try 200 on older Adreno drivers)")
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -72,6 +76,18 @@ if(KOKOPOP_ENABLE_VULKAN)
   set(GGML_VULKAN_DEBUG ${KOKOPOP_VULKAN_DEBUG} CACHE BOOL "" FORCE)
   set(GGML_VULKAN_MEMORY_DEBUG ${KOKOPOP_VULKAN_MEMORY_DEBUG} CACHE BOOL "" FORCE)
   set(GGML_VULKAN_SHADER_DEBUG_INFO ${KOKOPOP_VULKAN_SHADER_DEBUG_INFO} CACHE BOOL "" FORCE)
+endif()
+if(KOKOPOP_ENABLE_OPENCL)
+  # No SPIR-V-headers equivalent here: what ggml-opencl needs is
+  # find_package(OpenCL) to succeed, which it does itself. Deliberately do NOT
+  # call find_package(OpenCL) in kokopop's own CMake — cross-compiling embedders
+  # (Android) pre-seed OpenCL_INCLUDE_DIR / OpenCL_LIBRARY as cache variables,
+  # the same way ESPEAK_NG_LIBRARY is injected today.
+  set(GGML_OPENCL ON CACHE BOOL "" FORCE)
+  set(GGML_OPENCL_EMBED_KERNELS ON CACHE BOOL "" FORCE)
+  set(GGML_OPENCL_USE_ADRENO_KERNELS ON CACHE BOOL "" FORCE)
+  set(GGML_OPENCL_TARGET_VERSION ${KOKOPOP_OPENCL_TARGET_VERSION} CACHE STRING "" FORCE)
+  set(GGML_OPENCL_PROFILING ${KOKOPOP_OPENCL_PROFILING} CACHE BOOL "" FORCE)
 endif()
 FetchContent_MakeAvailable(ggml)
 if(KOKOPOP_ENABLE_VULKAN AND TARGET ggml-vulkan)
@@ -146,6 +162,7 @@ endif()
 
 # Core utilities
 set(_kokopop_core_sources
+  src/core/backend_names.cpp
   src/core/error.cpp
   src/core/file_mapping.cpp
   src/core/replace.cpp
@@ -170,6 +187,9 @@ if(KOKOPOP_ENABLE_CUDA)
 endif()
 if(KOKOPOP_ENABLE_VULKAN)
   list(APPEND _kokopop_backend_sources src/backend/vulkan.cpp)
+endif()
+if(KOKOPOP_ENABLE_OPENCL)
+  list(APPEND _kokopop_backend_sources src/backend/opencl.cpp)
 endif()
 
 # Model module (GGUF loading)
@@ -312,6 +332,13 @@ if(KOKOPOP_ENABLE_VULKAN)
   message(STATUS "kokopop: Vulkan backend enabled")
 else()
   message(STATUS "kokopop: Vulkan backend disabled")
+endif()
+
+if(KOKOPOP_ENABLE_OPENCL)
+  target_compile_definitions(kokopop PUBLIC KOKOPOP_HAS_OPENCL)
+  message(STATUS "kokopop: OpenCL backend enabled")
+else()
+  message(STATUS "kokopop: OpenCL backend disabled")
 endif()
 
 if(MSVC)

@@ -643,7 +643,10 @@ ggml_tensor * add_channel_bias(ggml_context * ctx, ggml_tensor * x, ggml_tensor 
 // - 2D quantized weights: im2col + quantized mul_mat
 // ---------------------------------------------------------------------------
 
-ggml_tensor * conv1d(
+// Emits the convolution as a single CONV_2D node (a 1D conv is a 2D conv with
+// KH = 1), so no im2col buffer is ever materialised. Returns nullptr when the
+// shapes or types do not fit, and the caller falls back to im2col + mul_mat.
+static ggml_tensor * conv1d_direct(
     ggml_context * ctx,
     ggml_tensor * weight,
     ggml_tensor * input,
@@ -652,7 +655,65 @@ ggml_tensor * conv1d(
     int dilation,
     int kernel_size) {
 
+    // ggml_conv_2d_direct reshapes both operands, which needs contiguity, and
+    // the backends only implement f32 output (f16 or f32 kernel).
+    if (!ggml_is_contiguous(weight) || !ggml_is_contiguous(input) ||
+        input->type != GGML_TYPE_F32 || input->ne[3] != 1 ||
+        (weight->type != GGML_TYPE_F16 && weight->type != GGML_TYPE_F32)) {
+        return nullptr;
+    }
+
+    // weight is either [K, IC, OC] already, or [IC*K, OC] to be unpacked.
+    ggml_tensor * w3d = nullptr;
+    if (weight->ne[2] > 1 || weight->ne[0] == kernel_size) {
+        if (weight->ne[0] != kernel_size) {
+            return nullptr;
+        }
+        w3d = weight;
+    } else {
+        const int64_t ick = weight->ne[0];
+        if (ick % kernel_size != 0) {
+            return nullptr;
+        }
+        w3d = ggml_reshape_3d(ctx, weight, kernel_size, ick / kernel_size, weight->ne[1]);
+    }
+
+    const int64_t ic = w3d->ne[1];
+    const int64_t oc = w3d->ne[2];
+    const int64_t n  = input->ne[2];
+    if (input->ne[1] != ic) {
+        return nullptr;
+    }
+
+    // [K, IC, OC] -> [KW, KH=1, IC, OC] and [T, IC, N] -> [W, H=1, IC, N].
+    // Both are pure reshapes: element order is unchanged.
+    ggml_tensor * a = ggml_reshape_4d(ctx, w3d, kernel_size, 1, ic, oc);
+    ggml_tensor * b = ggml_reshape_4d(ctx, input, input->ne[0], 1, ic, n);
+
+    ggml_tensor * out = ggml_conv_2d_direct(ctx, a, b, stride, 1, padding, 0, dilation, 1);
+
+    // [OW, 1, OC, N] -> [OL, OC, N], the layout every other conv1d path returns.
+    return ggml_reshape_3d(ctx, out, out->ne[0], oc, n);
+}
+
+ggml_tensor * conv1d(
+    ggml_context * ctx,
+    ggml_tensor * weight,
+    ggml_tensor * input,
+    int stride,
+    int padding,
+    int dilation,
+    int kernel_size,
+    bool direct) {
+
     GGML_ASSERT(kernel_size > 0);
+
+    if (direct) {
+        ggml_tensor * out = conv1d_direct(ctx, weight, input, stride, padding, dilation, kernel_size);
+        if (out != nullptr) {
+            return out;
+        }
+    }
 
     const bool kernel_is_3d =
         (weight->ne[2] > 1) ||
@@ -884,6 +945,22 @@ ggml_tensor * adain_1d(
     return adain_1d(ctx, x, style, AdaIn1dWeights{nw, nb, gw, gb, bw, bb});
 }
 
+// Shorthand for the convolution policy of the active backend.
+static bool direct_conv(const Model & model) {
+    return model.backend != nullptr && model.backend->prefers_direct_conv();
+}
+
+ggml_tensor * graph_leaky_relu(ggml_context * ctx, const Model & model, ggml_tensor * x, float slope) {
+    if (model.backend == nullptr || model.backend->has_leaky_relu()) {
+        return ggml_leaky_relu(ctx, x, slope, false);
+    }
+    // relu(x) - slope * relu(-x). Exactly the same value for every input,
+    // including negative zero, and every op here has an OpenCL kernel.
+    ggml_tensor * pos = ggml_relu(ctx, x);
+    ggml_tensor * neg = ggml_scale(ctx, ggml_relu(ctx, ggml_neg(ctx, x)), slope);
+    return ggml_sub(ctx, pos, neg);
+}
+
 ggml_tensor * adain_resblk1d(
     ggml_context * ctx,
     Model & model,
@@ -926,7 +1003,7 @@ ggml_tensor * adain_resblk1d(
         return nullptr;
     }
 
-    cur = ggml_leaky_relu(ctx, cur, 0.2f, false);
+    cur = graph_leaky_relu(ctx, model, cur, 0.2f);
     if (upsample) {
         cur = depthwise_pool_upsample(ctx, model, cur, prefix, error);
         if (cur == nullptr) {
@@ -934,7 +1011,7 @@ ggml_tensor * adain_resblk1d(
         }
     }
 
-    cur = add_channel_bias(ctx, conv1d(ctx, conv1, cur, 1, 1, 1, 3), conv1_b);
+    cur = add_channel_bias(ctx, conv1d(ctx, conv1, cur, 1, 1, 1, 3, direct_conv(model)), conv1_b);
 
     cur = cached != nullptr
         ? adain_1d(ctx, cur, style, cached->norm2)
@@ -943,13 +1020,13 @@ ggml_tensor * adain_resblk1d(
         return nullptr;
     }
 
-    cur = ggml_leaky_relu(ctx, cur, 0.2f, false);
-    cur = add_channel_bias(ctx, conv1d(ctx, conv2, cur, 1, 1, 1, 3), conv2_b);
+    cur = graph_leaky_relu(ctx, model, cur, 0.2f);
+    cur = add_channel_bias(ctx, conv1d(ctx, conv2, cur, 1, 1, 1, 3, direct_conv(model)), conv2_b);
 
     ggml_tensor * residual = maybe_upsample_nearest(ctx, x, upsample);
     ggml_tensor * conv1x1 = cached != nullptr ? cached->conv1x1_w : model.cached_tensor(prefix + ".conv1x1.weight");
     if (conv1x1 != nullptr) {
-        residual = conv1d(ctx, conv1x1, residual, 1, 0, 1, 1);
+        residual = conv1d(ctx, conv1x1, residual, 1, 0, 1, 1, direct_conv(model));
     }
 
     return ggml_scale(ctx, ggml_add(ctx, cur, residual), KOKOPOP_INV_SQRT2);
@@ -967,7 +1044,8 @@ ggml_tensor * graph_generator_resblock(
     int kernel_size,
     const GeneratorResblockWeights & weights,
     std::string & error,
-    bool fused_snake) {
+    bool fused_snake,
+    bool direct) {
 
     for (int i = 0; i < 3; ++i) {
         const size_t idx = static_cast<size_t>(i);
@@ -980,7 +1058,7 @@ ggml_tensor * graph_generator_resblock(
 
         cur = add_channel_bias(
             ctx,
-            conv1d(ctx, weights.convs1_w[idx], cur, 1, weights.paddings[idx], KOKOPOP_RESBLOCK_DILATIONS[i], kernel_size),
+            conv1d(ctx, weights.convs1_w[idx], cur, 1, weights.paddings[idx], KOKOPOP_RESBLOCK_DILATIONS[i], kernel_size, direct),
             weights.convs1_b[idx]);
 
         cur = adain_1d(ctx, cur, style, weights.adain2[idx]);
@@ -991,7 +1069,7 @@ ggml_tensor * graph_generator_resblock(
 
         cur = add_channel_bias(
             ctx,
-            conv1d(ctx, weights.convs2_w[idx], cur, 1, kernel_size / 2, 1, kernel_size),
+            conv1d(ctx, weights.convs2_w[idx], cur, 1, kernel_size / 2, 1, kernel_size, direct),
             weights.convs2_b[idx]);
 
         x = ggml_add(ctx, x, cur);
@@ -1037,7 +1115,8 @@ ggml_tensor * graph_generator_resblock(
             kernel_size,
             cached->second,
             error,
-            model.backend_type == KOKOPOP_BACKEND_CPU);
+            model.backend_type == KOKOPOP_BACKEND_CPU,
+            direct_conv(model));
     }
 
     int paddings[3];
@@ -1065,7 +1144,7 @@ ggml_tensor * graph_generator_resblock(
 
         cur = add_channel_bias(
             ctx,
-            conv1d(ctx, conv1_w, cur, 1, paddings[i], KOKOPOP_RESBLOCK_DILATIONS[i], kernel_size),
+            conv1d(ctx, conv1_w, cur, 1, paddings[i], KOKOPOP_RESBLOCK_DILATIONS[i], kernel_size, direct_conv(model)),
             conv1_b);
 
         cur = adain_1d(ctx, model, cur, style, prefix + ".adain2." + std::to_string(i), error);
@@ -1086,7 +1165,7 @@ ggml_tensor * graph_generator_resblock(
 
         cur = add_channel_bias(
             ctx,
-            conv1d(ctx, conv2_w, cur, 1, kernel_size / 2, 1, kernel_size),
+            conv1d(ctx, conv2_w, cur, 1, kernel_size / 2, 1, kernel_size, direct_conv(model)),
             conv2_b);
 
         x = ggml_add(ctx, x, cur);
@@ -1489,7 +1568,7 @@ ggml_tensor * text_encoder(
         ggml_tensor * input_tw = ggml_cont(ctx, ggml_transpose(ctx, cur));
         cur = add_channel_bias(ctx, conv1d_chfirst(ctx, conv_w, input_tw, 1, 2, 1, 5), conv_b);
         cur = ggml_add(ctx, ggml_mul(ctx, ggml_norm(ctx, cur, 1e-5f), norm_w), norm_b);
-        cur = ggml_leaky_relu(ctx, cur, 0.2f, false);
+        cur = graph_leaky_relu(ctx, model, cur, 0.2f);
     }
 
     cur = bidirectional_lstm(ctx, model, cur, "kokopop.text_encoder.lstm", n_tokens, error);

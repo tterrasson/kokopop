@@ -363,13 +363,17 @@ bool run_kokoro_frontend_probe(
             ? ggml_get_next_tensor(ctx, pin_snapshot)
             : ggml_get_first_tensor(ctx);
         // Pin "amplifier" ops to the CPU sub-backend on GPU backends with fp16
-        // drift (MoltenVK). Layer norm divides by sqrt(variance) and explodes
-        // for near-zero variance, magnifying tiny fp16 noise into audible
-        // deformation in the decoder (observed for af_bella). Softmax can drift
-        // independently but does not amplify, so it stays on GPU by default —
-        // set KOKOPOP_VULKAN_PIN_STRICT=1 to pin it too for bit-identical
+        // drift (MoltenVK, Adreno OpenCL). Layer norm divides by sqrt(variance)
+        // and explodes for near-zero variance, magnifying tiny fp16 noise into
+        // audible deformation in the decoder (observed for af_bella). Softmax
+        // can drift independently but does not amplify, so it stays on GPU by
+        // default — set KOKOPOP_PIN_STRICT=1 to pin it too for bit-identical
         // outputs across backends (slower, ~10x more ops on CPU).
-        static const bool strict_pin = std::getenv("KOKOPOP_VULKAN_PIN_STRICT") != nullptr;
+        // KOKOPOP_VULKAN_PIN_STRICT is the former, Vulkan-only name; it is
+        // still honoured now that the setting governs more than one backend.
+        static const bool strict_pin =
+            std::getenv("KOKOPOP_PIN_STRICT") != nullptr ||
+            std::getenv("KOKOPOP_VULKAN_PIN_STRICT") != nullptr;
         for (ggml_tensor * t = first_new; t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             switch (t->op) {
                 case GGML_OP_NORM:

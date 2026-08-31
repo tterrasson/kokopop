@@ -1,6 +1,8 @@
 #include "kokopop.h"
 #include "yyjson.h"
 
+#include "core/backend_names.h"
+
 #include "streaming/streaming.h"
 #include "stdio/stdio_stream.h"
 #include "http/async_server.h"
@@ -33,7 +35,9 @@ void usage(const char * argv0) {
     std::fputs("usage: ", stderr);
     std::fputs(argv0, stderr);
     std::fputs(" --model kokoro.gguf "
-        "[--voice NAME] [--speed 1.0] [--mode adaptative|long_form] [--threads N] [--backend cpu|metal|cuda|vulkan]\n"
+        "[--voice NAME] [--speed 1.0] [--mode adaptative|long_form] [--threads N] [--backend ", stderr);
+    std::fputs(kokopop::backend_name_list(), stderr);
+    std::fputs("]\n"
         "       [--out out.wav]\n"
         "       [--http] [--port N] [--bind ADDR]\n"
         "\n"
@@ -58,7 +62,7 @@ void usage(const char * argv0) {
         "  --mode MODE     adaptative (default) or long_form\n"
         "  --out PATH      Save full audio to WAV file (stdio mode)\n"
         "  --threads N     Number of threads (default: min(4, hw_concurrency))\n"
-        "  --backend       Use CPU, Metal, CUDA, or Vulkan backend (default: auto)\n"
+        "  --backend       Inference backend (default: auto)\n"
         "  --http          Run in HTTP server mode (async, event-driven)\n"
         "  --port N        HTTP server port (default: 8080)\n"
         "  --bind ADDR     HTTP server bind address (default: 127.0.0.1)\n"
@@ -281,7 +285,7 @@ int main(int argc, char ** argv) {
     std::string mode_str = "adaptative";
     std::string out_path;
     int threads = std::min(4, static_cast<int>(std::thread::hardware_concurrency()));
-    int backend = KOKOPOP_BACKEND_AUTO;
+    int32_t backend = KOKOPOP_BACKEND_AUTO;
 
     bool http_mode = false;
     int http_port = 8080;
@@ -317,16 +321,9 @@ int main(int argc, char ** argv) {
             } else if (std::strcmp(argv[i], "--backend") == 0) {
                 const char * v = arg_value(i, argc, argv);
                 if (!v) { usage(argv[0]); return 2; }
-                if (std::strcmp(v, "cpu") == 0) {
-                    backend = KOKOPOP_BACKEND_CPU;
-                } else if (std::strcmp(v, "metal") == 0) {
-                    backend = KOKOPOP_BACKEND_METAL;
-                } else if (std::strcmp(v, "cuda") == 0) {
-                    backend = KOKOPOP_BACKEND_CUDA;
-                } else if (std::strcmp(v, "vulkan") == 0) {
-                    backend = KOKOPOP_BACKEND_VULKAN;
-                } else {
-                    std::fprintf(stderr, "error: invalid backend '%s' (use 'cpu', 'metal', 'cuda', or 'vulkan')\n", v);
+                if (!kokopop::backend_from_name(v, backend)) {
+                    std::fprintf(stderr, "error: invalid backend '%s' (use %s)\n",
+                                 v, kokopop::backend_name_list());
                     return 2;
                 }
             } else if (std::strcmp(argv[i], "--http") == 0) {

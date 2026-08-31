@@ -14,6 +14,7 @@ class Backend:
     METAL = "metal"
     CUDA = "cuda"
     VULKAN = "vulkan"
+    OPENCL = "opencl"
 
 
 class Mode:

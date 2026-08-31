@@ -23,6 +23,40 @@ Use `kokopop_synthesize_phonemes()` when your input is already phonemized.
 `kokopop_audio` owns its `samples` pointer and must be released with
 `kokopop_audio_free()`.
 
+## Backend selection
+
+`kokopop_model_options.backend` picks the inference backend. `KOKOPOP_BACKEND_AUTO`
+(the default) tries CUDA, Metal, Vulkan and OpenCL in that order and falls back to
+the CPU; every other value is a hard request that fails if the backend is not
+compiled in or not available at runtime.
+
+| Value | Meaning |
+|---|---|
+| `KOKOPOP_BACKEND_AUTO` | Resolve at load time (default) |
+| `KOKOPOP_BACKEND_CPU` | CPU |
+| `KOKOPOP_BACKEND_METAL` | Metal (macOS) |
+| `KOKOPOP_BACKEND_CUDA` | CUDA (NVIDIA) |
+| `KOKOPOP_BACKEND_VULKAN` | Vulkan |
+| `KOKOPOP_BACKEND_OPENCL` | OpenCL (Adreno / Android) |
+
+`kokopop_model_backend()` reports which one a loaded model actually got, so a
+caller that passed `AUTO` can tell whether it ended up on the GPU:
+
+```c
+kokopop_model_options model_opts = {0};
+model_opts.backend = KOKOPOP_BACKEND_AUTO;
+
+kokopop_model *model = NULL;
+kokopop_model_load("models/kokoro.gguf", &model_opts, &model);
+
+if (kokopop_model_backend(model) == KOKOPOP_BACKEND_CPU) {
+    /* No GPU backend was available; expect a lower real-time factor. */
+}
+```
+
+It never returns `KOKOPOP_BACKEND_AUTO`, and returns `KOKOPOP_BACKEND_CPU` for a
+`NULL` model.
+
 ## Chunked pull synthesis
 
 Use `kokopop_synthesis` when you want progressive audio chunks and explicit

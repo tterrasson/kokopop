@@ -19,6 +19,7 @@ foreach(_opt
     KOKOPOP_ENABLE_METAL
     KOKOPOP_ENABLE_CUDA
     KOKOPOP_ENABLE_VULKAN
+    KOKOPOP_ENABLE_OPENCL
     KOKOPOP_ENABLE_OPUS)
   if(DEFINED ENV{${_opt}} AND NOT DEFINED ${_opt})
     set(${_opt} $ENV{${_opt}} CACHE BOOL "" FORCE)
@@ -35,7 +36,9 @@ add_subdirectory(${KOKOPOP_CORE_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/kokopop_
 
 Python3_add_library(_native MODULE WITH_SOABI src/kokopop_native.cpp)
 target_link_libraries(_native PRIVATE kokopop Python3::Module)
-target_include_directories(_native PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../include)
+target_include_directories(_native PRIVATE
+  ${CMAKE_CURRENT_LIST_DIR}/../include
+  ${KOKOPOP_CORE_SOURCE_DIR}/src)
 
 if(MSVC)
   target_compile_options(_native PRIVATE /W4)

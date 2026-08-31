@@ -1,4 +1,5 @@
 #include "kokopop.h"
+#include "core/backend_names.h"
 #include "model/model.h"
 #include "inference/kokoro.h"
 #include "synthesis/phonemizer.h"
@@ -60,11 +61,11 @@ std::string find_model(const char * hint) {
 
 void usage(const char * argv0) {
     std::fprintf(stderr,
-        "usage: %s [--model PATH] [--backend cpu|metal|cuda|vulkan] [--phonemes IPA] [--repeat N] "
+        "usage: %s [--model PATH] [--backend %s] [--phonemes IPA] [--repeat N] "
         "[--voice NAME] [--threads N] [--iters N]\n"
-        "  --backend cpu|metal|cuda|vulkan  force inference backend (default: auto)\n"
+        "  --backend %s  force inference backend (default: auto)\n"
         "  --repeat N  repeat the phoneme string N times (multiplies token count)\n",
-        argv0);
+        argv0, kokopop::backend_name_list(), kokopop::backend_name_list());
 }
 
 struct BenchResult {
@@ -106,7 +107,7 @@ int main(int argc, char ** argv) {
     int          threads     = 0;           // 0 = auto
     int          iters       = 5;
     int          repeat      = 1;
-    int          backend     = KOKOPOP_BACKEND_AUTO; // 0 = auto
+    int32_t      backend     = KOKOPOP_BACKEND_AUTO; // 0 = auto
 
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
@@ -124,16 +125,9 @@ int main(int argc, char ** argv) {
             iters = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--backend") == 0 && i + 1 < argc) {
             const char * b = argv[++i];
-            if (std::strcmp(b, "cpu") == 0) {
-                backend = KOKOPOP_BACKEND_CPU;
-            } else if (std::strcmp(b, "metal") == 0) {
-                backend = KOKOPOP_BACKEND_METAL;
-            } else if (std::strcmp(b, "cuda") == 0) {
-                backend = KOKOPOP_BACKEND_CUDA;
-            } else if (std::strcmp(b, "vulkan") == 0) {
-                backend = KOKOPOP_BACKEND_VULKAN;
-            } else {
-                std::fprintf(stderr, "[BENCH] unknown backend: %s (expected cpu|metal|cuda|vulkan)\n", b);
+            if (!kokopop::backend_from_name(b, backend)) {
+                std::fprintf(stderr, "[BENCH] unknown backend: %s (expected %s)\n",
+                             b, kokopop::backend_name_list());
                 usage(argv[0]);
                 return 2;
             }
@@ -170,10 +164,7 @@ int main(int argc, char ** argv) {
     std::printf("[BENCH] voice    : %s\n", voice);
     std::printf("[BENCH] threads  : %d (hw=%d)\n", threads, hw);
     std::printf("[BENCH] iters    : %d\n", iters);
-    std::printf("[BENCH] backend  : %s\n\n", backend == KOKOPOP_BACKEND_CPU ? "cpu"
-                                         : backend == KOKOPOP_BACKEND_METAL ? "metal"
-                                         : backend == KOKOPOP_BACKEND_CUDA ? "cuda"
-                                         : backend == KOKOPOP_BACKEND_VULKAN ? "vulkan" : "auto");
+    std::printf("[BENCH] backend  : %s\n\n", kokopop::backend_name(backend));
 
     ggml_log_set(null_log, nullptr);
 

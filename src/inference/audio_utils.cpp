@@ -594,6 +594,8 @@ bool ggml_generator(
     std::vector<float> & audio,
     std::string & error) {
 
+    const bool direct = model.backend != nullptr && model.backend->prefers_direct_conv();
+
     const int64_t har_len = decoder.length * 60 + 1;
 
     std::vector<float> & har_data = model.tmp_stft_har_f32;
@@ -699,11 +701,11 @@ bool ggml_generator(
             }
         }
 
-        x = ggml_leaky_relu(ctx, x, 0.1f, false);
+        x = graph_leaky_relu(ctx, model, x, 0.1f);
 
         ggml_tensor * x_source = add_channel_bias(
             ctx,
-            conv1d(ctx, noise_conv_w[stage], har_t, sp.noise_stride, sp.noise_padding, 1, sp.noise_kernel),
+            conv1d(ctx, noise_conv_w[stage], har_t, sp.noise_stride, sp.noise_padding, 1, sp.noise_kernel, direct),
             noise_conv_b[stage]);
         if (post_stats) {
             x_source = ggml_cont(ctx, x_source);
@@ -804,7 +806,7 @@ bool ggml_generator(
         ggml_set_name(stage1_out_tap, "kokopop_generator_stage1_out");
         ggml_set_output(stage1_out_tap);
     } else {
-        x = ggml_leaky_relu(ctx, x, 0.01f, false);
+        x = graph_leaky_relu(ctx, model, x, 0.01f);
         pre_post = ggml_cont(ctx, x);
 
         post_w_tensor = require_tensor(model, "kokopop.decoder.generator.conv_post.weight", error);
@@ -814,7 +816,7 @@ bool ggml_generator(
             return false;
         }
 
-        post = add_channel_bias(ctx, conv1d(ctx, post_w_tensor, x, 1, 3, 1, 7), post_b_tensor);
+        post = add_channel_bias(ctx, conv1d(ctx, post_w_tensor, x, 1, 3, 1, 7, direct), post_b_tensor);
         post = ggml_cont(ctx, post);
         ggml_set_name(post, "kokopop_generator_post");
         ggml_set_output(post);

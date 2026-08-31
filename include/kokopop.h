@@ -27,7 +27,8 @@ enum {
     KOKOPOP_BACKEND_CPU = 1,
     KOKOPOP_BACKEND_METAL = 2,
     KOKOPOP_BACKEND_CUDA = 3,
-    KOKOPOP_BACKEND_VULKAN = 4
+    KOKOPOP_BACKEND_VULKAN = 4,
+    KOKOPOP_BACKEND_OPENCL = 5
 };
 
 typedef struct kokopop_model_options {
@@ -168,6 +169,10 @@ KOKOPOP_API const char * kokopop_last_error(void);
 
 /// Get the sample rate of the loaded model
 KOKOPOP_API int kokopop_model_sample_rate(kokopop_model * model);
+
+/// Backend the model actually loaded on, once AUTO has been resolved.
+/// Returns one of KOKOPOP_BACKEND_*, or KOKOPOP_BACKEND_CPU for a null model.
+KOKOPOP_API int32_t kokopop_model_backend(const kokopop_model * model);
 
 #ifdef __cplusplus
 

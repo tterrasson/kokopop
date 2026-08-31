@@ -1,4 +1,5 @@
 #include "kokopop.h"
+#include "core/backend_names.h"
 #include "model/model.h"
 #include "streaming/streaming.h"
 
@@ -55,7 +56,7 @@ void usage(const char * argv0) {
         "Options:\n"
         "  --model PATH        Path to Kokoro GGUF model (required)\n"
         "  --voice NAME        Voice name (default: auto-resolve to first available)\n"
-        "  --backend cpu|metal|cuda|vulkan Inference backend (default: auto)\n"
+        "  --backend %s Inference backend (default: auto)\n"
         "  --threads N         Thread count (default: min(4, hw_concurrency))\n"
         "  --n-sentences N     Number of sentences to use (default: 10, range: 3-12)\n"
         "  --speed F           Synthesis speed multiplier (default: 1.0)\n"
@@ -66,7 +67,7 @@ void usage(const char * argv0) {
         "  %s --model models/kokoro-md.gguf\n"
         "  %s --model models/kokoro-md.gguf --backend metal --threads 8\n"
         "  %s --model models/kokoro-md.gguf --n-sentences 5 --seed 42\n",
-        argv0, argv0, argv0, argv0);
+        argv0, kokopop::backend_name_list(), argv0, argv0, argv0);
 }
 
 const char * arg_value(int & i, int argc, char ** argv) {
@@ -81,7 +82,7 @@ struct Options {
     float speed = 1.0f;
     int threads = 0;          // 0 = auto
     int n_sentences = 10;
-    int backend = KOKOPOP_BACKEND_AUTO;
+    int32_t backend = KOKOPOP_BACKEND_AUTO;
     unsigned int seed = 0;
 };
 
@@ -110,16 +111,9 @@ bool parse_args(int argc, char ** argv, Options & opts) {
         } else if (std::strcmp(argv[i], "--backend") == 0) {
             const char * v = arg_value(i, argc, argv);
             if (!v) { usage(argv[0]); return false; }
-            if (std::strcmp(v, "cpu") == 0) {
-                opts.backend = KOKOPOP_BACKEND_CPU;
-            } else if (std::strcmp(v, "metal") == 0) {
-                opts.backend = KOKOPOP_BACKEND_METAL;
-            } else if (std::strcmp(v, "cuda") == 0) {
-                opts.backend = KOKOPOP_BACKEND_CUDA;
-            } else if (std::strcmp(v, "vulkan") == 0) {
-                opts.backend = KOKOPOP_BACKEND_VULKAN;
-            } else {
-                std::fprintf(stderr, "error: invalid backend '%s' (use 'cpu', 'metal', 'cuda', or 'vulkan')\n", v);
+            if (!kokopop::backend_from_name(v, opts.backend)) {
+                std::fprintf(stderr, "error: invalid backend '%s' (use %s)\n",
+                             v, kokopop::backend_name_list());
                 return false;
             }
         } else if (std::strcmp(argv[i], "--seed") == 0) {
@@ -277,14 +271,6 @@ void print_summary(const std::vector<ChunkResult> & results,
     std::printf("\n");
 }
 
-// Backend label
-const char * backend_label(int backend_type) {
-    if (backend_type == KOKOPOP_BACKEND_METAL) return "Metal";
-    if (backend_type == KOKOPOP_BACKEND_CUDA)  return "CUDA";
-    if (backend_type == KOKOPOP_BACKEND_VULKAN) return "Vulkan";
-    return "CPU";
-}
-
 } // namespace
 
 // ============================================================================
@@ -337,7 +323,7 @@ int main(int argc, char ** argv) {
     }
 
     const int sample_rate = model->sample_rate;
-    const char * backend_name = backend_label(model->backend_type);
+    const char * backend_name = kokopop::backend_display_name(kokopop_model_backend(model_handle));
 
     // ---- Resolve voice (auto-select first available if not specified) ----
     std::string voice = kokopop::resolve_voice_name(opts.voice, model->voices);

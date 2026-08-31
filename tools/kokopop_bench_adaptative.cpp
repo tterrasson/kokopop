@@ -15,6 +15,7 @@
 
 #include "kokopop.h"
 
+#include "core/backend_names.h"
 #include "streaming/streaming.h"
 #include "http/synthesis_scheduler.h"
 
@@ -44,7 +45,9 @@ void usage(const char * argv0) {
         "  --text STR      Text to synthesize (mutually exclusive with --file)\n"
         "  --file PATH     Read text from file (mutually exclusive with --text)\n"
         "  --threads N     Number of threads (default: min(4, hw_concurrency))\n"
-        "  --backend       cpu, metal, cuda, or vulkan (default: auto)\n"
+        "  --backend       Inference backend, one of ", stderr);
+    std::fputs(kokopop::backend_name_list(), stderr);
+    std::fputs(" (default: auto)\n"
         "  --speed FLOAT   Synthesis speed (default: 1.0)\n"
         "  --runs N        Number of benchmark runs (default: 3)\n"
         "\n",
@@ -94,7 +97,7 @@ int main(int argc, char ** argv) {
     std::string text;
     std::string file_path;
     int threads = std::min(4, static_cast<int>(std::thread::hardware_concurrency()));
-    int backend = KOKOPOP_BACKEND_AUTO;
+    int32_t backend = KOKOPOP_BACKEND_AUTO;
     float speed = 1.0f;
     int n_runs = 3;
 
@@ -112,11 +115,11 @@ int main(int argc, char ** argv) {
                 threads = std::stoi(arg_value(i, argc, argv));
             } else if (std::strcmp(argv[i], "--backend") == 0) {
                 const char * v = arg_value(i, argc, argv);
-                if      (std::strcmp(v, "cpu")   == 0) backend = KOKOPOP_BACKEND_CPU;
-                else if (std::strcmp(v, "metal") == 0) backend = KOKOPOP_BACKEND_METAL;
-                else if (std::strcmp(v, "cuda")  == 0) backend = KOKOPOP_BACKEND_CUDA;
-                else if (std::strcmp(v, "vulkan") == 0) backend = KOKOPOP_BACKEND_VULKAN;
-                else { std::fprintf(stderr, "error: invalid backend '%s'\n", v); return 2; }
+                if (!kokopop::backend_from_name(v, backend)) {
+                    std::fprintf(stderr, "error: invalid backend '%s' (use %s)\n",
+                                 v, kokopop::backend_name_list());
+                    return 2;
+                }
             } else if (std::strcmp(argv[i], "--speed") == 0) {
                 speed = std::stof(arg_value(i, argc, argv));
             } else if (std::strcmp(argv[i], "--runs") == 0) {

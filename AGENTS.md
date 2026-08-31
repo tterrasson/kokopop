@@ -11,7 +11,7 @@ Standalone C++ runtime for Kokoro text-to-speech models in GGUF format.
 include/          Public header (kokopop.h — C/C++ API)
 src/
   core/           Error handling, UTF-8, string replace, WAV I/O
-  backend/        CPU + Metal GPU inference backends
+  backend/        CPU + Metal / CUDA / Vulkan / OpenCL GPU inference backends
   model/          GGUF model loading
   inference/      Kokoro graph ops, audio utilities
   synthesis/      Phonemizer, text chunking/splitting, G2P (zh_g2p), main synth pipeline
@@ -45,6 +45,10 @@ cmake --build build
 | `KOKOPOP_BUILD_TOOLS` | `OFF` | Build CLI tools |
 | `KOKOPOP_ENABLE_METAL` | `OFF` | Metal GPU backend (macOS) |
 | `KOKOPOP_ENABLE_CUDA` | `OFF` | CUDA backend (NVIDIA GPUs) |
+| `KOKOPOP_ENABLE_VULKAN` | `OFF` | Vulkan GPU backend (requires SPIR-V headers) |
+| `KOKOPOP_ENABLE_OPENCL` | `OFF` | OpenCL GPU backend (Adreno / Android) |
+| `KOKOPOP_OPENCL_PROFILING` | `OFF` | OpenCL profiling in ggml (debug only) |
+| `KOKOPOP_OPENCL_TARGET_VERSION` | `300` | OpenCL version ggml targets (`200` on older Adreno) |
 | `KOKOPOP_BUILD_BENCH` | `OFF` | Build benchmarks |
 
 ## Run

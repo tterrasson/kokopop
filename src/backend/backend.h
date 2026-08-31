@@ -55,6 +55,21 @@ struct Backend {
     // build and sched_alloc_graph(); applied lazily on next alloc.
     virtual void defer_cpu_assignment(ggml_tensor * tensor) { (void)tensor; }
 
+    /// False when the backend has no LEAKY_RELU kernel, so ggml-sched would
+    /// bounce the tensor to the CPU sub-backend and back. Graph builders then
+    /// emit the equivalent relu/neg/scale/sub chain instead (see
+    /// graph_leaky_relu). Only worth doing where it is true: on the CPU the
+    /// decomposition is three extra passes over the tensor for nothing.
+    virtual bool has_leaky_relu() const { return true; }
+
+    /// True when a convolution should be emitted as a direct CONV_2D rather
+    /// than im2col + mul_mat. im2col materialises [OW*KW, IC] floats: for the
+    /// Kokoro vocoder that is ~490 MiB written and read back per convolution,
+    /// which measured as 65% of total OpenCL time on an Adreno 630. Backends
+    /// with a real direct-convolution kernel should say true; the CPU should
+    /// not, its im2col + blocked gemm is faster than a naive direct loop.
+    virtual bool prefers_direct_conv() const { return false; }
+
     // ---- Graph execution ----
 
     // Execute the graph.
@@ -231,7 +246,7 @@ std::unique_ptr<Backend> create_cpu_backend(int32_t n_threads);
 // Factory: create the backend for the given request.
 // requested: KOKOPOP_BACKEND_AUTO (0), KOKOPOP_BACKEND_CPU (1),
 //            KOKOPOP_BACKEND_METAL (2), KOKOPOP_BACKEND_CUDA (3),
-//            KOKOPOP_BACKEND_VULKAN (4)
+//            KOKOPOP_BACKEND_VULKAN (4), KOKOPOP_BACKEND_OPENCL (5)
 std::unique_ptr<Backend> create_backend(
     int32_t requested, int32_t n_threads, std::string & error);
 

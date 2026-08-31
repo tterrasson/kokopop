@@ -515,6 +515,11 @@ int kokopop_model_sample_rate(kokopop_model * model) {
     return model->impl->sample_rate;
 }
 
+int32_t kokopop_model_backend(const kokopop_model * model) {
+    if (!model || !model->impl) return KOKOPOP_BACKEND_CPU;
+    return model->impl->backend_type;
+}
+
 kokopop::Model * kokopop_model_get_impl(kokopop_model * model) {
     if (!model || !model->impl) return nullptr;
     return model->impl.get();

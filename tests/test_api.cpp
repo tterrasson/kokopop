@@ -37,6 +37,37 @@ TEST_CASE("api_error_null_model") {
     CHECK_EQ(kokopop_synthesize_phonemes(nullptr, "abc", "af_heart", 1.0f, &audio), KOKOPOP_ERROR_INVALID_ARGUMENT);
 }
 
+TEST_CASE("api_model_backend_reports_resolved_backend") {
+    const std::string & gguf = shared_mock_gguf();
+    kokopop_model * model = nullptr;
+    kokopop_model_options options{};
+    options.backend = KOKOPOP_BACKEND_AUTO;
+    CHECK_EQ(kokopop_model_load(gguf.c_str(), &options, &model), KOKOPOP_OK);
+    REQUIRE(model != nullptr);
+
+    const int32_t resolved = kokopop_model_backend(model);
+    // AUTO is resolved at load time; the accessor never reports it back.
+    CHECK_NE(resolved, KOKOPOP_BACKEND_AUTO);
+    CHECK_GE(resolved, KOKOPOP_BACKEND_CPU);
+    CHECK_LE(resolved, KOKOPOP_BACKEND_OPENCL);
+    CHECK_EQ(resolved, kokopop_model_get_impl(model)->backend_type);
+    kokopop_model_free(model);
+
+    // Null model is CPU rather than a crash or a sentinel.
+    CHECK_EQ(kokopop_model_backend(nullptr), KOKOPOP_BACKEND_CPU);
+}
+
+TEST_CASE("api_model_backend_cpu_request") {
+    const std::string & gguf = shared_mock_gguf();
+    kokopop_model * model = nullptr;
+    kokopop_model_options options{};
+    options.backend = KOKOPOP_BACKEND_CPU;
+    CHECK_EQ(kokopop_model_load(gguf.c_str(), &options, &model), KOKOPOP_OK);
+    REQUIRE(model != nullptr);
+    CHECK_EQ(kokopop_model_backend(model), KOKOPOP_BACKEND_CPU);
+    kokopop_model_free(model);
+}
+
 TEST_CASE("api_error_empty_phonemes") {
     const std::string & gguf = shared_mock_gguf();
     kokopop_model * model = nullptr;

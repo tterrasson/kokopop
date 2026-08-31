@@ -1,5 +1,6 @@
 #include "kokopop.h"
 
+#include "core/backend_names.h"
 #include "playback/playback.h"
 #include "playback/playback_dummy.h"
 
@@ -19,12 +20,13 @@ namespace {
 void usage(const char * argv0) {
     std::fprintf(stderr,
         "usage: %s --model kokoro.gguf --voice ff_siwis (--text TEXT | --phonemes PHONEMES) "
-        "[--out out.wav | --play] [--speed 1.0] [--threads N] [--backend cpu|metal|cuda|vulkan]\n"
+        "[--out out.wav | --play] [--speed 1.0] [--threads N] [--backend %s]\n"
         "\n"
         "  --out out.wav   Write audio to a WAV file\n"
         "  --play          Play audio directly (mutually exclusive with --out)\n"
-        "  --backend       Use CPU, Metal, CUDA, or Vulkan backend (default: auto)\n",
-        argv0);
+        "  --backend       Inference backend (default: auto)\n",
+        argv0,
+        kokopop::backend_name_list());
 }
 
 const char * arg_value(int & i, int argc, char ** argv) {
@@ -46,7 +48,7 @@ int main(int argc, char ** argv) {
     bool play = false;
     float speed = 1.0f;
     int threads = std::min(4, static_cast<int>(std::thread::hardware_concurrency()));
-    int backend = KOKOPOP_BACKEND_AUTO;
+    int32_t backend = KOKOPOP_BACKEND_AUTO;
 
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--model") == 0) {
@@ -90,16 +92,9 @@ int main(int argc, char ** argv) {
         } else if (std::strcmp(argv[i], "--backend") == 0) {
             const char * v = arg_value(i, argc, argv);
             if (!v) { usage(argv[0]); return 2; }
-            if (std::strcmp(v, "cpu") == 0) {
-                backend = KOKOPOP_BACKEND_CPU;
-            } else if (std::strcmp(v, "metal") == 0) {
-                backend = KOKOPOP_BACKEND_METAL;
-            } else if (std::strcmp(v, "cuda") == 0) {
-                backend = KOKOPOP_BACKEND_CUDA;
-            } else if (std::strcmp(v, "vulkan") == 0) {
-                backend = KOKOPOP_BACKEND_VULKAN;
-            } else {
-                std::fprintf(stderr, "error: invalid backend '%s' (use 'cpu', 'metal', 'cuda', or 'vulkan')\n", v);
+            if (!kokopop::backend_from_name(v, backend)) {
+                std::fprintf(stderr, "error: invalid backend '%s' (use %s)\n",
+                             v, kokopop::backend_name_list());
                 return 2;
             }
         } else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {

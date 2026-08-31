@@ -43,9 +43,15 @@ ggml_tensor * require_tensor(Model & model, const char * name, std::string & err
 ggml_tensor * layer_norm(ggml_context * ctx, ggml_tensor * x, ggml_tensor * weight, ggml_tensor * bias, float eps);
 ggml_tensor * linear(ggml_context * ctx, ggml_tensor * weight, ggml_tensor * bias, ggml_tensor * x);
 ggml_tensor * add_channel_bias(ggml_context * ctx, ggml_tensor * x, ggml_tensor * bias);
+// ggml_leaky_relu, unless the active backend has no kernel for it, in which
+// case the mathematically identical relu(x) - slope*relu(-x) is emitted so the
+// tensor stays on the device (see Backend::has_leaky_relu).
+ggml_tensor * graph_leaky_relu(ggml_context * ctx, const Model & model, ggml_tensor * x, float slope);
+// direct=true asks for a single CONV_2D node instead of im2col + mul_mat; see
+// Backend::prefers_direct_conv. Silently falls back when the shapes do not fit.
 ggml_tensor * conv1d(
     ggml_context * ctx, ggml_tensor * weight, ggml_tensor * input,
-    int stride, int padding, int dilation, int kernel_size);
+    int stride, int padding, int dilation, int kernel_size, bool direct = false);
 ggml_tensor * conv_transpose1d_crop(
     ggml_context * ctx,
     ggml_tensor * weight,
@@ -115,7 +121,8 @@ ggml_tensor * graph_generator_resblock(
     int kernel_size,
     const GeneratorResblockWeights & weights,
     std::string & error,
-    bool fused_snake = false);
+    bool fused_snake = false,
+    bool direct = false);
 ggml_tensor * graph_generator_resblock(
     ggml_context * ctx,
     Model & model,

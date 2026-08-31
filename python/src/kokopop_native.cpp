@@ -3,6 +3,8 @@
 
 #include "kokopop.h"
 
+#include "core/backend_names.h"
+
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -63,19 +65,17 @@ struct StreamIteratorObject {
 };
 
 int parse_backend(const char * backend, int32_t & out) {
-    const std::string value = backend ? backend : "auto";
-    if (value == "auto") {
+    const char * value = backend ? backend : "auto";
+    if (std::strcmp(value, "auto") == 0) {
         out = KOKOPOP_BACKEND_AUTO;
-    } else if (value == "cpu") {
-        out = KOKOPOP_BACKEND_CPU;
-    } else if (value == "metal") {
-        out = KOKOPOP_BACKEND_METAL;
-    } else if (value == "cuda") {
-        out = KOKOPOP_BACKEND_CUDA;
-    } else if (value == "vulkan") {
-        out = KOKOPOP_BACKEND_VULKAN;
-    } else {
-        PyErr_SetString(PyExc_ValueError, "backend must be one of: auto, cpu, metal, cuda, vulkan");
+        return 0;
+    }
+    // backend_from_name deliberately rejects "auto": it is the default, not a
+    // backend the CLI tools can be pinned to. Python accepts it explicitly.
+    if (!kokopop::backend_from_name(value, out)) {
+        const std::string message =
+            std::string("backend must be one of: auto|") + kokopop::backend_name_list();
+        PyErr_SetString(PyExc_ValueError, message.c_str());
         return -1;
     }
     return 0;
