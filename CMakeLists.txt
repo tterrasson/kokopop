@@ -35,20 +35,17 @@ include(FetchContent)
 FetchContent_Declare(
   ggml
   GIT_REPOSITORY https://github.com/ggml-org/ggml.git
-  GIT_TAG        0ce7ad348a3151e1da9f65d962044546bcaad421
+  GIT_TAG        36da57138425487184aa1da2eee2cde155909c6f
   GIT_SHALLOW    FALSE
   # Fix 4: dispatch CONV_TRANSPOSE_1D with 32 threads/group and simd_sum
   #         reduction, avoiding GPU watchdog on large generator dims.
   # Apply only when the patch still matches. This keeps re-configure
   # idempotent without leaving .rej files in FetchContent sources.
-  # Fix 5 (CUDA): IM2COL crashes with "invalid argument" when OW exceeds 65535
-  #         (long vocoder sequences). Merged upstream in GGML 0ce7ad3; the
-  #         patch is retained so older local fetches remain idempotent.
-  # Note: Fix 3 (scalar NORM kernel) is now merged upstream in GGML a056a26.
+  # Note: Fix 3 (scalar NORM kernel) is merged upstream in GGML a056a26, and
+  #       Fix 5 (CUDA IM2COL grid-dim Y overflow) in GGML 0ce7ad3; both patches
+  #       have been dropped.
   PATCH_COMMAND
     ${CMAKE_COMMAND} -DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/patches/ggml-conv-transpose-1d-simd.patch -P ${CMAKE_CURRENT_SOURCE_DIR}/tools/apply_patch_if_needed.cmake
-    COMMAND
-    ${CMAKE_COMMAND} -DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/patches/ggml-cuda-im2col-griddim.patch -P ${CMAKE_CURRENT_SOURCE_DIR}/tools/apply_patch_if_needed.cmake
 )
 if(KOKOPOP_ENABLE_CUDA)
   set(GGML_CUDA ON CACHE BOOL "" FORCE)
