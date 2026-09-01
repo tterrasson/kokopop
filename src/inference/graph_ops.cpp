@@ -1,6 +1,10 @@
 #include "kokoro.h"
 #include "lstm_fused.h"
 
+#ifdef KOKOPOP_HAS_OPENCL
+#include <ggml-opencl.h>
+#endif
+
 #ifdef KOKOPOP_HAS_METAL
 #include "backend/metal_vocoder.h"
 #include "backend/metal_lstm.h"
@@ -375,6 +379,16 @@ static void metal_generator_stage_callback(
 // output are truly contiguous in the expected [time, channel] layout.
 // ---------------------------------------------------------------------------
 
+#ifdef KOKOPOP_HAS_OPENCL
+using SnakeOpenclParams = ggml_opencl_snake_params_v1;
+static constexpr uint64_t kSnakeOpenclParamsMagic = GGML_OPENCL_SNAKE_PARAMS_V1_MAGIC;
+#else
+struct SnakeOpenclParams { uint64_t magic; };
+static constexpr uint64_t kSnakeOpenclParamsMagic = UINT64_C(0x4b4f4b4f534e4b31);
+#endif
+
+static const SnakeOpenclParams kSnakeOpenclParams { kSnakeOpenclParamsMagic };
+
 static void snake1d_fused_callback(
     ggml_tensor       * dst,
     const ggml_tensor * a,
@@ -506,8 +520,18 @@ static ggml_tensor * snake1d_impl(
     if (allow_fused && x->type == GGML_TYPE_F32) {
         // The callback itself is stride-safe, but materializing x keeps the
         // fast path active and makes allocator behaviour easier to reason about.
-        x = ggml_cont(ctx, x);
-        return ggml_map_custom2(ctx, x, alpha_2d, snake1d_fused_callback, GGML_N_TASKS_MAX, nullptr);
+        // Only when it is not already contiguous, though: on the vocoder the
+        // input is the output of a bias ADD, and an unconditional cont there is
+        // a full 8 MiB read and write per activation for nothing (measured:
+        // 48 copies, ~75 ms on the reference utterance).
+        if (!ggml_is_contiguous(x)) {
+            x = ggml_cont(ctx, x);
+        }
+        ggml_tensor * out = ggml_map_custom2(
+            ctx, x, alpha_2d, snake1d_fused_callback, GGML_N_TASKS_MAX,
+            const_cast<SnakeOpenclParams *>(&kSnakeOpenclParams));
+        ggml_set_name(out, "kokopop_snake_fused_v1");
+        return out;
     }
 
     // No ggml_repeat of alpha: mul/div already broadcast a [1, C] operand over
@@ -749,7 +773,8 @@ ggml_tensor * conv1d_chfirst(
     int stride,
     int padding,
     int dilation,
-    int kernel_size) {
+    int kernel_size,
+    bool direct) {
 
     GGML_ASSERT(kernel_size > 0);
 
@@ -757,8 +782,8 @@ ggml_tensor * conv1d_chfirst(
         (weight->ne[2] > 1) ||
         (weight->ne[0] == kernel_size);
 
-    if (kernel_is_3d || weight->type == GGML_TYPE_F16) {
-        ggml_tensor * out = conv1d(ctx, weight, input, stride, padding, dilation, kernel_size);
+    if (direct || kernel_is_3d || weight->type == GGML_TYPE_F16) {
+        ggml_tensor * out = conv1d(ctx, weight, input, stride, padding, dilation, kernel_size, direct);
         return ggml_cont(ctx, ggml_transpose(ctx, out));
     }
 
@@ -917,7 +942,9 @@ ggml_tensor * graph_snake1d(
         return nullptr;
     }
 
-    return snake1d_impl(ctx, x, alpha, alpha_name, error, model.backend_type == KOKOPOP_BACKEND_CPU);
+    const bool fused = model.backend_type == KOKOPOP_BACKEND_CPU ||
+                       model.backend_type == KOKOPOP_BACKEND_OPENCL;
+    return snake1d_impl(ctx, x, alpha, alpha_name, error, fused);
 }
 
 // ---------------------------------------------------------------------------
@@ -1120,7 +1147,8 @@ ggml_tensor * graph_generator_resblock(
             kernel_size,
             cached->second,
             error,
-            model.backend_type == KOKOPOP_BACKEND_CPU,
+            model.backend_type == KOKOPOP_BACKEND_CPU ||
+                model.backend_type == KOKOPOP_BACKEND_OPENCL,
             direct_conv(model));
     }
 
@@ -1574,7 +1602,10 @@ ggml_tensor * text_encoder(
         }
 
         ggml_tensor * input_tw = ggml_cont(ctx, ggml_transpose(ctx, cur));
-        cur = add_channel_bias(ctx, conv1d_chfirst(ctx, conv_w, input_tw, 1, 2, 1, 5), conv_b);
+        cur = add_channel_bias(
+            ctx,
+            conv1d_chfirst(ctx, conv_w, input_tw, 1, 2, 1, 5, direct_conv(model)),
+            conv_b);
         cur = ggml_add(ctx, ggml_mul(ctx, ggml_norm(ctx, cur, 1e-5f), norm_w), norm_b);
         cur = graph_leaky_relu(ctx, model, cur, 0.2f);
     }

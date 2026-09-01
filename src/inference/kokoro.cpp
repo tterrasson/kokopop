@@ -630,6 +630,7 @@ bool run_kokoro_generation_probe(
     if (ctx == nullptr) {
         return false;
     }
+    const bool direct_conv = model.backend != nullptr && model.backend->prefers_direct_conv();
 
     const int64_t n_tokens = frontend.n_tokens;
     model.backend->set_input_tokens(static_cast<int>(n_tokens));
@@ -751,7 +752,7 @@ bool run_kokoro_generation_probe(
     // materialised copy, only prevents reuse of the buffer; cost is negligible.
     ggml_set_output(decoder_cur);
 
-    ggml_tensor * asr_res = add_channel_bias(ctx, conv1d(ctx, asr_res_w, ggml_cont(ctx, ggml_transpose(ctx, asr)), 1, 0, 1, 1), asr_res_b);
+    ggml_tensor * asr_res = add_channel_bias(ctx, conv1d(ctx, asr_res_w, ggml_cont(ctx, ggml_transpose(ctx, asr)), 1, 0, 1, 1, direct_conv), asr_res_b);
 
     for (int i = 0; i < 4; ++i) {
         decoder_cur = ggml_concat(ctx, ggml_concat(ctx, ggml_concat(ctx, decoder_cur, asr_res, 1), f0_dec, 1), n_dec, 1);
