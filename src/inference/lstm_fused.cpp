@@ -202,8 +202,8 @@ static void cpu_lstm_contiguous(
     const float * __restrict__ pre_gates,
     float * __restrict__ output) {
 
-    const int64_t H  = p.hidden;
-    const int64_t N  = p.n_steps;
+    const int64_t H  = p.opencl.hidden;
+    const int64_t N  = p.opencl.n_steps;
     const int64_t H4 = 4 * H;
 
     // Reuse per-thread scratch buffers to avoid 3 heap allocations per LSTM direction.
@@ -214,15 +214,15 @@ static void cpu_lstm_contiguous(
     c.assign(static_cast<size_t>(H), 0.0f);
     gates.resize(static_cast<size_t>(H4));
 
-    const float * w_base = p.w_hh_rowwise ? p.w_hh_rowwise : p.w_hh_f32;
+    const float * w_base = p.w_hh_rowwise ? p.w_hh_rowwise : p.opencl.w_hh_f32;
 
     for (int64_t step = 0; step < N; ++step) {
-        const int64_t t = p.reverse ? (N - 1 - step) : step;
+        const int64_t t = p.opencl.reverse ? (N - 1 - step) : step;
         const float * pg_t = pre_gates + H4 * t;
 
         for (int64_t j = 0; j < H4; ++j) {
             gates[static_cast<size_t>(j)] =
-                p.b_hh[j] + pg_t[j] + dot_product(w_base + j * H, h.data(), H);
+                p.opencl.b_hh[j] + pg_t[j] + dot_product(w_base + j * H, h.data(), H);
         }
 
         float * out_t = output + H * t;
@@ -255,8 +255,8 @@ static void cpu_lstm_strided(
     const ggml_tensor * pre_gates,
     ggml_tensor * output) {
 
-    const int64_t H  = p.hidden;
-    const int64_t N  = p.n_steps;
+    const int64_t H  = p.opencl.hidden;
+    const int64_t N  = p.opencl.n_steps;
     const int64_t H4 = 4 * H;
 
     // Same thread_local scratch buffers as cpu_lstm_contiguous — safe because
@@ -268,15 +268,15 @@ static void cpu_lstm_strided(
     c.assign(static_cast<size_t>(H), 0.0f);
     gates.resize(static_cast<size_t>(H4));
 
-    const float * w_base = p.w_hh_rowwise ? p.w_hh_rowwise : p.w_hh_f32;
+    const float * w_base = p.w_hh_rowwise ? p.w_hh_rowwise : p.opencl.w_hh_f32;
 
     for (int64_t step = 0; step < N; ++step) {
-        const int64_t t = p.reverse ? (N - 1 - step) : step;
+        const int64_t t = p.opencl.reverse ? (N - 1 - step) : step;
 
         for (int64_t j = 0; j < H4; ++j) {
             const float pg_jt = tensor_get_f32_2d(pre_gates, j, t);
             gates[static_cast<size_t>(j)] =
-                p.b_hh[j] + pg_jt + dot_product(w_base + j * H, h.data(), H);
+                p.opencl.b_hh[j] + pg_jt + dot_product(w_base + j * H, h.data(), H);
         }
 
         for (int64_t i = 0; i < H; ++i) {
@@ -304,8 +304,8 @@ static void cpu_lstm(
     const ggml_tensor * pre_gates,
     ggml_tensor * output) {
 
-    const int64_t H  = p.hidden;
-    const int64_t N  = p.n_steps;
+    const int64_t H  = p.opencl.hidden;
+    const int64_t N  = p.opencl.n_steps;
     const int64_t H4 = 4 * H;
 
     const bool contiguous =
@@ -358,18 +358,18 @@ void lstm_fused_callback(
         // Metal path currently expects contiguous host-visible buffers.
         // If this trips, either force ggml_cont() before the custom op or add
         // a staging copy for the Metal kernel.
-        GGML_ASSERT(tensor_is_f32_2d_contiguous(pre_gates, 4 * p->hidden, p->n_steps));
-        GGML_ASSERT(tensor_is_f32_2d_contiguous(dst, p->hidden, p->n_steps));
+        GGML_ASSERT(tensor_is_f32_2d_contiguous(pre_gates, 4 * p->opencl.hidden, p->opencl.n_steps));
+        GGML_ASSERT(tensor_is_f32_2d_contiguous(dst, p->opencl.hidden, p->opencl.n_steps));
 
         metal_lstm_run(
             static_cast<MetalLstmKernelState *>(p->metal_kernel),
             p->whh_key,
             static_cast<const float *>(pre_gates->data),
-            p->b_hh,
+            p->opencl.b_hh,
             static_cast<float *>(dst->data),
-            static_cast<int>(p->hidden),
-            static_cast<int>(p->n_steps),
-            p->reverse);
+            static_cast<int>(p->opencl.hidden),
+            static_cast<int>(p->opencl.n_steps),
+            p->opencl.reverse != 0);
         return;
     }
 #endif

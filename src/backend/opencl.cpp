@@ -436,6 +436,11 @@ public:
         ggml_backend_tensor_get(tensor, data, offset, size);
     }
 
+    void preload_lstm_whh(const std::string &, const float * w_hh_f32,
+                           int H, int four_H) override {
+        ggml_backend_opencl_lstm_preload(backend_, w_hh_f32, H, four_H);
+    }
+
     ggml_backend_buffer_type_t weight_buffer_type() const override {
         GGML_ASSERT(backend_ != nullptr);
         GGML_ASSERT(cpu_backend_ != nullptr);

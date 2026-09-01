@@ -93,14 +93,17 @@ void run_lstm_fused_case(int64_t hidden, int64_t n_steps, bool reverse) {
     std::fill_n(static_cast<float *>(out->data), hidden * n_steps, -99.0f);
 
     kokopop::LstmCustomParams op_params{
-        w_hh.data(),
-        b_hh.data(),
+        {
+            kokopop::kLstmOpenclParamsMagic,
+            w_hh.data(),
+            b_hh.data(),
+            hidden,
+            n_steps,
+            reverse ? 1 : 0,
+        },
         w_rowwise.data(),
         nullptr,
         nullptr,
-        hidden,
-        n_steps,
-        reverse,
     };
 
     kokopop::lstm_fused_callback(out, nullptr, pre, 0, 1, &op_params);
@@ -124,4 +127,3 @@ TEST_CASE("lstm_fused_matches_scalar_reference_forward") {
 TEST_CASE("lstm_fused_matches_scalar_reference_reverse") {
     run_lstm_fused_case(33, 9, true);
 }
-

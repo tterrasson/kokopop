@@ -407,8 +407,8 @@ bool run_kokoro_frontend_probe(
     //   dur_hidden  — predictor.lstm output, multiplied by duration_w on host
     //                  to produce duration logits with bit-identical rounding
     // dur_hidden must be a graph output (not just an intermediate) so the
-    // predictor.lstm stays anchored in the forward set; the per-LSTM
-    // queue_zero_tensor() in lstm_direction asserts otherwise.
+    // predictor.lstm stays anchored in the forward set and its result is
+    // readable on host after graph compute.
     d          = ggml_cont(ctx, d);
     dur_hidden = ggml_cont(ctx, dur_hidden);
 

@@ -1454,20 +1454,22 @@ ggml_tensor * lstm_direction(
         : nullptr;
 
     model.lstm_custom_params.push_back({
-        it->second.data(),
-        b_it->second.data(),
+        {
+            kLstmOpenclParamsMagic,
+            it->second.data(),
+            b_it->second.data(),
+            hidden,
+            n_steps,
+            reverse ? 1 : 0,
+        },
         rowwise,
         model.backend->metal_lstm_kernel(),
         it->first.c_str(),
-        hidden,
-        n_steps,
-        reverse,
     });
 
     const LstmCustomParams * params = &model.lstm_custom_params.back();
 
     ggml_tensor * output = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, n_steps);
-    model.backend->queue_zero_tensor(output);
 
     output = ggml_map_custom2_inplace(
         ctx,
@@ -1476,6 +1478,7 @@ ggml_tensor * lstm_direction(
         lstm_fused_callback,
         1,
         const_cast<LstmCustomParams *>(params));
+    ggml_set_name(output, "kokopop_lstm_fused_v1");
 
     return output;
 }

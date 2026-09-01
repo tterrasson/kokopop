@@ -1,5 +1,34 @@
+diff --git a/include/ggml-opencl.h b/include/ggml-opencl.h
+index 6b617713..c70d25c4 100644
+--- a/include/ggml-opencl.h
++++ b/include/ggml-opencl.h
+@@ -19,6 +19,24 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_opencl_host_buffer_type
+ 
+ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_opencl_reg(void);
+ 
++// ABI for a fused H=256 LSTM carried by GGML_OP_MAP_CUSTOM2. Backends must
++// ignore custom ops whose userdata does not begin with this structure/magic.
++// The host pointers remain owned by the caller for the graph lifetime.
++#define GGML_OPENCL_LSTM_PARAMS_V1_MAGIC UINT64_C(0x4b4f4b4f4c535431)
++struct ggml_opencl_lstm_params_v1 {
++    uint64_t      magic;
++    const float * w_hh_f32; // ggml [H, 4H]: w[k + H*gate]
++    const float * b_hh;     // [4H]
++    int64_t       hidden;
++    int64_t       n_steps;
++    int32_t       reverse;
++};
++
++// Optional model-load prewarm. The pointer is also the cache identity and must
++// remain stable until the backend is freed.
++GGML_BACKEND_API void ggml_backend_opencl_lstm_preload(
++    ggml_backend_t backend, const float * w_hh_f32, int64_t hidden, int64_t four_hidden);
++
+ #ifdef  __cplusplus
+ }
+ #endif
 diff --git a/src/ggml-opencl/CMakeLists.txt b/src/ggml-opencl/CMakeLists.txt
-index 1f62ce1c..b5edc8eb 100644
+index 1f62ce1c..d5274086 100644
 --- a/src/ggml-opencl/CMakeLists.txt
 +++ b/src/ggml-opencl/CMakeLists.txt
 @@ -200,6 +200,7 @@ set(GGML_OPENCL_KERNELS
@@ -10,33 +39,40 @@ index 1f62ce1c..b5edc8eb 100644
      sqr
      sqrt
      ssm_conv
-@@ -221,6 +222,7 @@ set(GGML_OPENCL_KERNELS
+@@ -221,6 +222,9 @@ set(GGML_OPENCL_KERNELS
      repeat
      mul_mat_f16_f32
      mul_mm_f16_f32_kq_kqv
++    lstm
 +    conv1d
++    convtranspose1d
      conv2d
      conv2d_f16_f32
      flash_attn_pre_f16
 diff --git a/src/ggml-opencl/ggml-opencl.cpp b/src/ggml-opencl/ggml-opencl.cpp
-index 64f3325b..e2cb79a9 100644
+index 64f3325b..c8d7655c 100644
 --- a/src/ggml-opencl/ggml-opencl.cpp
 +++ b/src/ggml-opencl/ggml-opencl.cpp
-@@ -76,6 +76,13 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
+@@ -76,6 +76,7 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
  
  static bool ggml_cl_is_q4_0_soa(const ggml_tensor * tensor);
  static bool ggml_cl_is_q8_0_soa(const ggml_tensor * tensor);
-+// Block tile of kernel_mul_mm_f16_f32_l4_lm; keep in sync with the #defines at
-+// the top of kernels/mul_mm_f16_f32_l4_lm.cl.
-+#define MUL_MM_F16_F32_BM 32
-+#define MUL_MM_F16_F32_BN 64
-+#define MUL_MM_F16_F32_TM 8
-+#define MUL_MM_F16_F32_TN 4
 +
  static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
  
  // See https://gmplib.org/~tege/divcnst-pldi94.pdf figure 4.1.
-@@ -732,6 +739,9 @@ struct ggml_backend_opencl_context {
+@@ -725,13 +726,16 @@ struct ggml_backend_opencl_context {
+     cl_program program_mul_mm_f16_f32_l4_lm;
+     cl_program program_mul_mm_q8_0_f32_l4_lm;
+ 
+-    cl_kernel kernel_add, kernel_add_row, kernel_add_f16, kernel_add_row_f16;
+-    cl_kernel kernel_mul, kernel_mul_row, kernel_mul_f16, kernel_mul_row_f16;
+-    cl_kernel kernel_div, kernel_div_row, kernel_div_f16, kernel_div_row_f16;
+-    cl_kernel kernel_sub, kernel_sub_row, kernel_sub_f16, kernel_sub_row_f16;
++    cl_kernel kernel_add, kernel_add_flat, kernel_add_row, kernel_add_f16, kernel_add_row_f16;
++    cl_kernel kernel_mul, kernel_mul_flat, kernel_mul_row, kernel_mul_f16, kernel_mul_row_f16;
++    cl_kernel kernel_div, kernel_div_flat, kernel_div_row, kernel_div_f16, kernel_div_row_f16;
++    cl_kernel kernel_sub, kernel_sub_flat, kernel_sub_row, kernel_sub_f16, kernel_sub_row_f16;
      cl_kernel kernel_add_id;
      cl_kernel kernel_add_id_add_id_swiglu_oai;
      cl_kernel kernel_scale_f32, kernel_scale_f32_4;
@@ -46,33 +82,104 @@ index 64f3325b..e2cb79a9 100644
      cl_kernel kernel_sqr_cont_f32, kernel_sqr_cont_f32_4, kernel_sqr_cont_f16, kernel_sqr_cont_f16_4;
      cl_kernel kernel_sqrt_cont_f32, kernel_sqrt_cont_f32_4, kernel_sqrt_cont_f16, kernel_sqrt_cont_f16_4;
      cl_kernel kernel_mean_f32, kernel_mean_f32_4;
-@@ -869,6 +879,7 @@ struct ggml_backend_opencl_context {
+@@ -869,6 +873,36 @@ struct ggml_backend_opencl_context {
      cl_kernel kernel_upscale;
      cl_kernel kernel_upscale_bilinear;
      cl_kernel kernel_concat_f32, kernel_concat_f32_pack;
++    cl_kernel kernel_lstm_fused_h256;
++    struct lstm_weights_cl {
++        cl_mem weights = nullptr;
++        cl_mem bias = nullptr;
++    };
++    std::map<const float *, lstm_weights_cl> lstm_weights;
++    size_t lstm_weights_bytes = 0;
++    ggml_cl_buffer prealloc_lstm_state;
 +    cl_kernel kernel_conv_1d_f16_f32;
++    cl_kernel kernel_conv_1d_repack_f16;
++    // kernel_conv_1d reads its weights as [Cin, KW, Cout] rather than ggml's
++    // [KW, Cin, Cout], which is what lets it fetch TS_K channels in one
++    // aligned vload8. Convolution weights are model constants, so the repack
++    // is done once per tensor and kept here, keyed by device buffer and offset.
++    // It buys ~2x on the convolutions at the cost of a second copy of the
++    // convolution weights -- 97 MiB for Kokoro, whose vocoder has 80 of them.
++    std::map<std::pair<cl_mem, size_t>, cl_mem> conv_1d_repacked_weights;
++    size_t conv_1d_repacked_bytes = 0;
++    cl_kernel kernel_conv_transpose_1d_f32;
++    cl_kernel kernel_conv_transpose_1d_f16;
++    cl_kernel kernel_conv_transpose_1d_repack_f32;
++    cl_kernel kernel_conv_transpose_1d_repack_f16;
++    // Transposed-convolution weights use ggml's [KW, Cout, Cin] layout.  Keep
++    // one [Cin, KW, Coutp] copy so output-channel tiles are contiguous and can
++    // be fetched with aligned vector loads.
++    std::map<std::pair<cl_mem, size_t>, cl_mem> conv_transpose_1d_repacked_weights;
++    size_t conv_transpose_1d_repacked_bytes = 0;
++    cl_kernel kernel_mul_mm_f16_repack;
++    std::map<std::pair<cl_mem, size_t>, cl_mem> mul_mm_f16_repacked_weights;
++    size_t mul_mm_f16_repacked_bytes = 0;
      cl_kernel kernel_conv_2d_f16;
      cl_kernel kernel_conv_2d_f32;
      cl_kernel kernel_conv_2d_f16_f32;
-@@ -1334,6 +1345,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -1138,6 +1172,27 @@ struct ggml_backend_opencl_context {
+                 if (kv.second.image) { CL_CHECK(clReleaseMemObject(kv.second.image)); }
+             }
+             dequant_f16_pool.clear();
++            for (auto & kv : lstm_weights) {
++                if (kv.second.weights) { CL_CHECK(clReleaseMemObject(kv.second.weights)); }
++                if (kv.second.bias)    { CL_CHECK(clReleaseMemObject(kv.second.bias)); }
++            }
++            lstm_weights.clear();
++            lstm_weights_bytes = 0;
++            for (auto & kv : conv_1d_repacked_weights) {
++                CL_CHECK(clReleaseMemObject(kv.second));
++            }
++            conv_1d_repacked_weights.clear();
++            conv_1d_repacked_bytes = 0;
++            for (auto & kv : conv_transpose_1d_repacked_weights) {
++                CL_CHECK(clReleaseMemObject(kv.second));
++            }
++            conv_transpose_1d_repacked_weights.clear();
++            conv_transpose_1d_repacked_bytes = 0;
++            for (auto & kv : mul_mm_f16_repacked_weights) {
++                CL_CHECK(clReleaseMemObject(kv.second));
++            }
++            mul_mm_f16_repacked_weights.clear();
++            mul_mm_f16_repacked_bytes = 0;
+         }
+     }
+ };
+@@ -1333,7 +1388,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
  
          CL_CHECK((backend_ctx->kernel_add         = clCreateKernel(backend_ctx->program_add, "kernel_add", &err), err));
++        CL_CHECK((backend_ctx->kernel_add_flat    = clCreateKernel(backend_ctx->program_add, "kernel_add_flat", &err), err));
          CL_CHECK((backend_ctx->kernel_add_row     = clCreateKernel(backend_ctx->program_add, "kernel_add_row", &err), err));
 +        CL_CHECK((backend_ctx->kernel_add_col     = clCreateKernel(backend_ctx->program_add, "kernel_add_col", &err), err));
          CL_CHECK((backend_ctx->kernel_add_f16     = clCreateKernel(backend_ctx->program_add, "kernel_add_f16", &err), err));
          CL_CHECK((backend_ctx->kernel_add_row_f16 = clCreateKernel(backend_ctx->program_add, "kernel_add_row_f16", &err), err));
          GGML_LOG_CONT(".");
-@@ -2507,6 +2519,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -2306,6 +2363,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+ 
+         CL_CHECK((backend_ctx->kernel_mul_mm_f16_f32_l4_lm = clCreateKernel(backend_ctx->program_mul_mm_f16_f32_l4_lm, "kernel_mul_mm_f16_f32_l4_lm", &err), err));
++        CL_CHECK((backend_ctx->kernel_mul_mm_f16_repack = clCreateKernel(backend_ctx->program_mul_mm_f16_f32_l4_lm, "kernel_mul_mm_f16_repack", &err), err));
+         GGML_LOG_CONT(".");
+     }
+ 
+@@ -2506,7 +2564,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
  
          CL_CHECK((backend_ctx->kernel_mul         = clCreateKernel(backend_ctx->program_mul, "kernel_mul", &err), err));
++        CL_CHECK((backend_ctx->kernel_mul_flat    = clCreateKernel(backend_ctx->program_mul, "kernel_mul_flat", &err), err));
          CL_CHECK((backend_ctx->kernel_mul_row     = clCreateKernel(backend_ctx->program_mul, "kernel_mul_row", &err), err));
 +        CL_CHECK((backend_ctx->kernel_mul_col     = clCreateKernel(backend_ctx->program_mul, "kernel_mul_col", &err), err));
          CL_CHECK((backend_ctx->kernel_mul_f16     = clCreateKernel(backend_ctx->program_mul, "kernel_mul_f16", &err), err));
          CL_CHECK((backend_ctx->kernel_mul_row_f16 = clCreateKernel(backend_ctx->program_mul, "kernel_mul_row_f16", &err), err));
          GGML_LOG_CONT(".");
-@@ -2718,11 +2731,37 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -2717,12 +2777,39 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
  
          CL_CHECK((backend_ctx->kernel_div         = clCreateKernel(backend_ctx->program_div, "kernel_div", &err), err));
++        CL_CHECK((backend_ctx->kernel_div_flat    = clCreateKernel(backend_ctx->program_div, "kernel_div_flat", &err), err));
          CL_CHECK((backend_ctx->kernel_div_row     = clCreateKernel(backend_ctx->program_div, "kernel_div_row", &err), err));
 +        CL_CHECK((backend_ctx->kernel_div_col     = clCreateKernel(backend_ctx->program_div, "kernel_div_col", &err), err));
          CL_CHECK((backend_ctx->kernel_div_f16     = clCreateKernel(backend_ctx->program_div, "kernel_div_f16", &err), err));
@@ -108,10 +215,33 @@ index 64f3325b..e2cb79a9 100644
      // sqr
      {
  #ifdef GGML_OPENCL_EMBED_KERNELS
-@@ -3133,6 +3172,27 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -2797,6 +2884,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+ 
+         CL_CHECK((backend_ctx->kernel_sub         = clCreateKernel(backend_ctx->program_sub, "kernel_sub", &err), err));
++        CL_CHECK((backend_ctx->kernel_sub_flat    = clCreateKernel(backend_ctx->program_sub, "kernel_sub_flat", &err), err));
+         CL_CHECK((backend_ctx->kernel_sub_row     = clCreateKernel(backend_ctx->program_sub, "kernel_sub_row", &err), err));
+         CL_CHECK((backend_ctx->kernel_sub_f16     = clCreateKernel(backend_ctx->program_sub, "kernel_sub_f16", &err), err));
+         CL_CHECK((backend_ctx->kernel_sub_row_f16 = clCreateKernel(backend_ctx->program_sub, "kernel_sub_row_f16", &err), err));
+@@ -3133,6 +3221,66 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
          GGML_LOG_CONT(".");
      }
  
++    // fused LSTM recurrence
++    {
++#ifdef GGML_OPENCL_EMBED_KERNELS
++        const std::string kernel_src {
++            #include "lstm.cl.h"
++        };
++#else
++        const std::string kernel_src = read_file("lstm.cl");
++#endif
++        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
++        CL_CHECK((backend_ctx->kernel_lstm_fused_h256 = clCreateKernel(prog, "kernel_lstm_fused_h256", &err), err));
++        CL_CHECK(clReleaseProgram(prog));
++        GGML_LOG_CONT(".");
++    }
++
 +    // conv1d
 +    {
 +#ifdef GGML_OPENCL_EMBED_KERNELS
@@ -123,11 +253,35 @@ index 64f3325b..e2cb79a9 100644
 +#endif
 +        // Tile and workgroup shape chosen by sweep on an Adreno 630
 +        // (scripts/clbench in the droid repo): VEC=4 time steps x TS_K=16
-+        // output channels per work item, 16x4 work items per group.
++        // output channels per work item, 32x2 work items per group.
 +        const std::string opts = std::string(compile_opts) + " -DVEC=4 -DTS_K=16";
 +        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
 +
-+        CL_CHECK((backend_ctx->kernel_conv_1d_f16_f32 = clCreateKernel(prog, "kernel_conv_1d", &err), err));
++        CL_CHECK((backend_ctx->kernel_conv_1d_f16_f32     = clCreateKernel(prog, "kernel_conv_1d", &err), err));
++        CL_CHECK((backend_ctx->kernel_conv_1d_repack_f16 = clCreateKernel(prog, "kernel_conv_1d_repack_f16", &err), err));
++
++        CL_CHECK(clReleaseProgram(prog));
++        GGML_LOG_CONT(".");
++    }
++
++    // conv_transpose_1d
++    {
++#ifdef GGML_OPENCL_EMBED_KERNELS
++        const std::string kernel_src {
++            #include "convtranspose1d.cl.h"
++        };
++#else
++        const std::string kernel_src = read_file("convtranspose1d.cl");
++#endif
++        // Chosen by scripts/clbench on the Adreno 630: one work item computes
++        // four positions in one stride phase and sixteen output channels.
++        const std::string opts = std::string(compile_opts) + " -DVEC=4 -DTS_K=16";
++        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
++
++        CL_CHECK((backend_ctx->kernel_conv_transpose_1d_f32 = clCreateKernel(prog, "kernel_conv_transpose_1d_f32", &err), err));
++        CL_CHECK((backend_ctx->kernel_conv_transpose_1d_f16 = clCreateKernel(prog, "kernel_conv_transpose_1d_f16", &err), err));
++        CL_CHECK((backend_ctx->kernel_conv_transpose_1d_repack_f32 = clCreateKernel(prog, "kernel_conv_transpose_1d_repack_f32", &err), err));
++        CL_CHECK((backend_ctx->kernel_conv_transpose_1d_repack_f16 = clCreateKernel(prog, "kernel_conv_transpose_1d_repack_f16", &err), err));
 +
 +        CL_CHECK(clReleaseProgram(prog));
 +        GGML_LOG_CONT(".");
@@ -136,7 +290,48 @@ index 64f3325b..e2cb79a9 100644
      // conv2d
      {
          #ifdef GGML_OPENCL_EMBED_KERNELS
-@@ -7622,6 +7682,8 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+@@ -7524,6 +7672,20 @@ static inline bool use_flat_gemv_for_large_m_q6_K(const ggml_backend_opencl_cont
+         && tensor->ne[2] == 1 && tensor->ne[3] == 1;
+ }
+ 
++static const ggml_opencl_lstm_params_v1 * ggml_cl_lstm_params(const ggml_tensor * op) {
++    if (op == nullptr || op->op != GGML_OP_MAP_CUSTOM2 ||
++        std::strcmp(op->name, "kokopop_lstm_fused_v1") != 0) {
++        return nullptr;
++    }
++    ggml_map_custom2_op_params custom;
++    std::memcpy(&custom, op->op_params, sizeof(custom));
++    if (custom.userdata == nullptr) {
++        return nullptr;
++    }
++    const auto * p = static_cast<const ggml_opencl_lstm_params_v1 *>(custom.userdata);
++    return p->magic == GGML_OPENCL_LSTM_PARAMS_V1_MAGIC ? p : nullptr;
++}
++
+ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+     ggml_backend_opencl_device_context * dev_ctx     = (ggml_backend_opencl_device_context *)dev->context;
+     ggml_backend_opencl_context *        backend_ctx = dev_ctx->backend_ctx;
+@@ -7536,6 +7698,19 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+     switch (op->op) {
+         case GGML_OP_NONE:
+             return true;
++        case GGML_OP_MAP_CUSTOM2: {
++            const ggml_opencl_lstm_params_v1 * p = ggml_cl_lstm_params(op);
++            return p != nullptr && p->w_hh_f32 != nullptr && p->b_hh != nullptr &&
++                   p->hidden == 256 && p->n_steps > 0 && p->n_steps == op->ne[1] &&
++                   (p->reverse == 0 || p->reverse == 1) &&
++                   op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
++                   op->src[1]->type == GGML_TYPE_F32 &&
++                   op->ne[0] == 256 && op->src[0]->ne[0] == 256 &&
++                   op->src[0]->ne[1] == p->n_steps &&
++                   op->src[1]->ne[0] == 1024 && op->src[1]->ne[1] == p->n_steps &&
++                   ggml_is_contiguous(op) && ggml_is_contiguous(op->src[0]) &&
++                   ggml_is_contiguous(op->src[1]);
++        }
+         case GGML_OP_GET_ROWS:
+             switch (op->src[0]->type) {
+                 case GGML_TYPE_F32:
+@@ -7622,6 +7797,8 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16);
          case GGML_OP_ADD_ID:
              return op->src[0]->type == GGML_TYPE_F32;
@@ -145,7 +340,21 @@ index 64f3325b..e2cb79a9 100644
          case GGML_OP_SQR:
          case GGML_OP_SQRT:
              return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
-@@ -11912,6 +11974,44 @@ static void ggml_cl_set_rows(ggml_backend_t backend, const ggml_tensor * src0, c
+@@ -7693,6 +7870,13 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+             return (op->src[0]->type == GGML_TYPE_F16 && op->src[1]->type == GGML_TYPE_F16 && op->type == GGML_TYPE_F16) ||
+                    (op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32) ||
+                    (op->src[0]->type == GGML_TYPE_F16 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32);
++        case GGML_OP_CONV_TRANSPOSE_1D:
++            return (op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32) &&
++                   op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
++                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op) &&
++                   op->src[0]->ne[3] == 1 && op->src[1]->ne[3] == 1 &&
++                   ggml_get_op_params_i32(op, 0) > 0 &&
++                   ggml_get_op_params_i32(op, 1) == 0 && ggml_get_op_params_i32(op, 2) == 1;
+         case GGML_OP_SSM_CONV:
+             return (op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32);
+         case GGML_OP_SSM_SCAN: {
+@@ -11912,6 +12096,73 @@ static void ggml_cl_set_rows(ggml_backend_t backend, const ggml_tensor * src0, c
      backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
  }
  
@@ -187,13 +396,47 @@ index 64f3325b..e2cb79a9 100644
 +    backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, nullptr, dst);
 +}
 +
++static bool ggml_cl_can_binary_flat(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
++    return src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
++           ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
++           ggml_are_same_shape(src0, src1) && ggml_are_same_shape(src0, dst);
++}
++
++static void ggml_cl_binary_flat(ggml_backend_t backend, cl_kernel kernel,
++                                const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *)backend->context;
++    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
++    ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
++    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
++    const cl_ulong offset0 = extra0->offset + src0->view_offs;
++    const cl_ulong offset1 = extra1->offset + src1->view_offs;
++    const cl_ulong offsetd = extrad->offset + dst->view_offs;
++    const cl_ulong ne = ggml_nelements(dst);
++
++    CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),    &extra0->data_device));
++    CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &offset0));
++    CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),    &extra1->data_device));
++    CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_ulong), &offset1));
++    CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem),    &extrad->data_device));
++    CL_CHECK(clSetKernelArg(kernel, 5, sizeof(cl_ulong), &offsetd));
++    CL_CHECK(clSetKernelArg(kernel, 6, sizeof(cl_ulong), &ne));
++
++    size_t global_work_size[] = { (size_t)((ne + 3)/4), 1, 1 };
++    backend_ctx->enqueue_ndrange_kernel(kernel, 1, global_work_size, nullptr, dst);
++}
++
  static void ggml_cl_add(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
      GGML_ASSERT(src0);
      GGML_ASSERT(src0->extra);
-@@ -11960,6 +12060,11 @@ static void ggml_cl_add(ggml_backend_t backend, const ggml_tensor * src0, const
+@@ -11960,6 +12211,16 @@ static void ggml_cl_add(ggml_backend_t backend, const ggml_tensor * src0, const
      cl_ulong offset1 = extra1->offset + src1->view_offs;
      cl_ulong offsetd = extrad->offset + dst->view_offs;
  
++    if (ggml_cl_can_binary_flat(src0, src1, dst)) {
++        ggml_cl_binary_flat(backend, backend_ctx->kernel_add_flat, src0, src1, dst);
++        return;
++    }
++
 +    if (ggml_cl_can_bcast_col(src0, src1, dst)) {
 +        ggml_cl_bcast_col(backend, backend_ctx->kernel_add_col, src0, src1, dst);
 +        return;
@@ -202,10 +445,15 @@ index 64f3325b..e2cb79a9 100644
      cl_kernel kernel;
  
      const bool bcast_row = ggml_nelements(src1) == ne10 && ggml_is_contiguous(src1) && ne00 % 4 == 0 && ne10 % 4 == 0;
-@@ -12211,6 +12316,11 @@ static void ggml_cl_mul(ggml_backend_t backend, const ggml_tensor * src0, const
+@@ -12211,6 +12472,16 @@ static void ggml_cl_mul(ggml_backend_t backend, const ggml_tensor * src0, const
      cl_ulong offset1 = extra1->offset + src1->view_offs;
      cl_ulong offsetd = extrad->offset + dst->view_offs;
  
++    if (ggml_cl_can_binary_flat(src0, src1, dst)) {
++        ggml_cl_binary_flat(backend, backend_ctx->kernel_mul_flat, src0, src1, dst);
++        return;
++    }
++
 +    if (ggml_cl_can_bcast_col(src0, src1, dst)) {
 +        ggml_cl_bcast_col(backend, backend_ctx->kernel_mul_col, src0, src1, dst);
 +        return;
@@ -214,10 +462,15 @@ index 64f3325b..e2cb79a9 100644
      bool bcast_row = false;
      cl_kernel kernel;
  
-@@ -12344,6 +12454,11 @@ static void ggml_cl_div(ggml_backend_t backend, const ggml_tensor * src0, const
+@@ -12344,6 +12615,16 @@ static void ggml_cl_div(ggml_backend_t backend, const ggml_tensor * src0, const
      cl_ulong offset1 = extra1->offset + src1->view_offs;
      cl_ulong offsetd = extrad->offset + dst->view_offs;
  
++    if (ggml_cl_can_binary_flat(src0, src1, dst)) {
++        ggml_cl_binary_flat(backend, backend_ctx->kernel_div_flat, src0, src1, dst);
++        return;
++    }
++
 +    if (ggml_cl_can_bcast_col(src0, src1, dst)) {
 +        ggml_cl_bcast_col(backend, backend_ctx->kernel_div_col, src0, src1, dst);
 +        return;
@@ -226,7 +479,19 @@ index 64f3325b..e2cb79a9 100644
      bool bcast_row = false;
      cl_kernel kernel;
  
-@@ -12537,6 +12652,106 @@ static void ggml_cl_sub(ggml_backend_t backend, const ggml_tensor * src0, const
+@@ -12465,6 +12746,11 @@ static void ggml_cl_sub(ggml_backend_t backend, const ggml_tensor * src0, const
+     cl_ulong offset1 = extra1->offset + src1->view_offs;
+     cl_ulong offsetd = extrad->offset + dst->view_offs;
+ 
++    if (ggml_cl_can_binary_flat(src0, src1, dst)) {
++        ggml_cl_binary_flat(backend, backend_ctx->kernel_sub_flat, src0, src1, dst);
++        return;
++    }
++
+     bool bcast_row = false;
+     cl_kernel kernel;
+ 
+@@ -12537,6 +12823,106 @@ static void ggml_cl_sub(ggml_backend_t backend, const ggml_tensor * src0, const
      }
  }
  
@@ -333,7 +598,270 @@ index 64f3325b..e2cb79a9 100644
  static void ggml_cl_sqr(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
      GGML_ASSERT(src0);
      GGML_ASSERT(src0->extra);
-@@ -16157,6 +16372,45 @@ static void ggml_cl_conv_2d(ggml_backend_t backend, const ggml_tensor * src0, co
+@@ -16132,6 +16518,262 @@ static void ggml_cl_mul_mat_f16_f32_adreno_xmem(
+ }
+ #endif // GGML_OPENCL_USE_ADRENO_KERNELS
+ 
++
++// Fetch the [M, K] copy of a contiguous f16 lhs, repacking all of its batch
++// matrices on first use. The layout makes the eight output rows computed by a
++// work item contiguous and aligned, removing both local memory and barriers
++// from the hot GEMM kernel.
++static cl_mem ggml_cl_mul_mm_f16_repacked_weights(
++        ggml_backend_opencl_context * backend_ctx,
++        cl_mem src, size_t offset, int K, int M, int Mp, int batches) {
++    const auto key = std::make_pair(src, offset);
++    auto it = backend_ctx->mul_mm_f16_repacked_weights.find(key);
++    if (it != backend_ctx->mul_mm_f16_repacked_weights.end()) {
++        return it->second;
++    }
++
++    const size_t bytes = (size_t)batches * K * Mp * sizeof(cl_half);
++    cl_int err;
++    cl_mem packed = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, bytes, nullptr, &err);
++    if (err != CL_SUCCESS) {
++        return nullptr;
++    }
++
++    cl_kernel k = backend_ctx->kernel_mul_mm_f16_repack;
++    const cl_ulong off_src = offset, off_dst = 0;
++    cl_uint a = 0;
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),    &src));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &off_src));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),    &packed));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &off_dst));
++    for (int v : { K, M, Mp }) {
++        CL_CHECK(clSetKernelArg(k, a++, sizeof(int), &v));
++    }
++    size_t lws[3] = { 64, 1, 1 };
++    size_t gws[3] = { CEIL_DIV((size_t)Mp, lws[0]) * lws[0], (size_t)K, (size_t)batches };
++    CL_CHECK(clEnqueueNDRangeKernel(backend_ctx->queue, k, 3, nullptr, gws, lws, 0, nullptr, nullptr));
++
++    backend_ctx->mul_mm_f16_repacked_weights[key] = packed;
++    backend_ctx->mul_mm_f16_repacked_bytes += bytes;
++    GGML_LOG_DEBUG("ggml_opencl: GEMM weights repacked, K=%d M=%d batches=%d, %.1f MiB held\n",
++                   K, M, batches, backend_ctx->mul_mm_f16_repacked_bytes / 1024.0 / 1024.0);
++    return packed;
++}
++
++// Fetch the [Cin, KW, Cout] copy of a conv1d weight tensor, repacking it on
++// first use. Model weights never change, so one GPU transpose per tensor pays
++// for itself on the first call: it is what lets the tap body load TS_K
++// channels with an aligned vload8 instead of TS_K scattered scalar loads.
++static cl_mem ggml_cl_conv_1d_repacked_weights(
++        ggml_backend_opencl_context * backend_ctx,
++        cl_mem src, size_t offset, int Cout, int Coutp, int Cin, int KW) {
++    const auto key = std::make_pair(src, offset);
++    auto it = backend_ctx->conv_1d_repacked_weights.find(key);
++    if (it != backend_ctx->conv_1d_repacked_weights.end()) {
++        return it->second;
++    }
++
++    const size_t bytes = (size_t)Coutp * Cin * KW * sizeof(cl_half);
++    cl_int err;
++    cl_mem packed = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, bytes, nullptr, &err);
++    if (err != CL_SUCCESS) {
++        // Out of device memory: the caller falls back to the general kernel.
++        return nullptr;
++    }
++
++    cl_kernel k = backend_ctx->kernel_conv_1d_repack_f16;
++    const cl_ulong off_src = offset, off_dst = 0;
++    cl_uint a = 0;
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),   &src));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &off_src));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),   &packed));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &off_dst));
++    for (int v : { Cout, Coutp, Cin, KW }) {
++        CL_CHECK(clSetKernelArg(k, a++, sizeof(int), &v));
++    }
++    size_t lws[3] = { 64, 1, 1 };
++    size_t gws[3] = { CEIL_DIV((size_t)Coutp, lws[0]) * lws[0], (size_t)KW, (size_t)Cin };
++    CL_CHECK(clEnqueueNDRangeKernel(backend_ctx->queue, k, 3, nullptr, gws, lws, 0, nullptr, nullptr));
++
++    backend_ctx->conv_1d_repacked_weights[key] = packed;
++    backend_ctx->conv_1d_repacked_bytes += bytes;
++    GGML_LOG_DEBUG("ggml_opencl: conv1d weights repacked, %d x %d x %d, %.1f MiB held\n",
++                   Cout, Cin, KW, backend_ctx->conv_1d_repacked_bytes / 1024.0 / 1024.0);
++    return packed;
++}
++
++static cl_mem ggml_cl_conv_transpose_1d_repacked_weights(
++        ggml_backend_opencl_context * backend_ctx,
++        cl_mem src, size_t offset, ggml_type type,
++        int Cout, int Coutp, int Cin, int KW) {
++    const auto key = std::make_pair(src, offset);
++    auto it = backend_ctx->conv_transpose_1d_repacked_weights.find(key);
++    if (it != backend_ctx->conv_transpose_1d_repacked_weights.end()) {
++        return it->second;
++    }
++
++    const size_t bytes = (size_t)Coutp * Cin * KW * ggml_type_size(type);
++    cl_int err;
++    cl_mem packed;
++    CL_CHECK((packed = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, bytes, nullptr, &err), err));
++
++    cl_kernel k = type == GGML_TYPE_F16
++        ? backend_ctx->kernel_conv_transpose_1d_repack_f16
++        : backend_ctx->kernel_conv_transpose_1d_repack_f32;
++    const cl_ulong off_src = offset, off_dst = 0;
++    cl_uint a = 0;
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem), &src));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &off_src));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem), &packed));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &off_dst));
++    for (int v : { Cout, Coutp, Cin, KW }) {
++        CL_CHECK(clSetKernelArg(k, a++, sizeof(int), &v));
++    }
++    size_t lws[3] = { 64, 1, 1 };
++    size_t gws[3] = { CEIL_DIV((size_t)Coutp, lws[0])*lws[0], (size_t)KW, (size_t)Cin };
++    CL_CHECK(clEnqueueNDRangeKernel(backend_ctx->queue, k, 3, nullptr, gws, lws, 0, nullptr, nullptr));
++
++    backend_ctx->conv_transpose_1d_repacked_weights[key] = packed;
++    backend_ctx->conv_transpose_1d_repacked_bytes += bytes;
++    GGML_LOG_DEBUG("ggml_opencl: conv_transpose_1d weights repacked (%s), %d x %d x %d, %.1f MiB held\n",
++                   ggml_type_name(type), Cout, Cin, KW,
++                   backend_ctx->conv_transpose_1d_repacked_bytes / 1024.0 / 1024.0);
++    return packed;
++}
++
++static ggml_backend_opencl_context::lstm_weights_cl & ggml_cl_lstm_preload_weights(
++        ggml_backend_opencl_context * backend_ctx, const float * w_hh_f32) {
++    auto it = backend_ctx->lstm_weights.find(w_hh_f32);
++    if (it != backend_ctx->lstm_weights.end()) {
++        return it->second;
++    }
++
++    constexpr int H = 256, H4 = 1024;
++    std::vector<float> packed((size_t)H*H4);
++    for (int k = 0; k < H; ++k) {
++        for (int j = 0; j < H4; ++j) {
++            packed[(size_t)k*H4+j] = w_hh_f32[(size_t)j*H+k];
++        }
++    }
++
++    cl_int err;
++    ggml_backend_opencl_context::lstm_weights_cl entry;
++    CL_CHECK((entry.weights = clCreateBuffer(backend_ctx->context, CL_MEM_READ_ONLY,
++                                              packed.size()*sizeof(float), nullptr, &err), err));
++    CL_CHECK(clEnqueueWriteBuffer(backend_ctx->queue, entry.weights, CL_TRUE, 0,
++                                  packed.size()*sizeof(float), packed.data(), 0, nullptr, nullptr));
++
++    auto inserted = backend_ctx->lstm_weights.emplace(w_hh_f32, entry);
++    backend_ctx->lstm_weights_bytes += packed.size()*sizeof(float);
++    GGML_LOG_DEBUG("ggml_opencl: LSTM weights preloaded, %.1f MiB held\n",
++                   backend_ctx->lstm_weights_bytes/1024.0/1024.0);
++    return inserted.first->second;
++}
++
++void ggml_backend_opencl_lstm_preload(
++        ggml_backend_t backend, const float * w_hh_f32, int64_t hidden, int64_t four_hidden) {
++    if (backend == nullptr || !ggml_backend_is_opencl(backend) || w_hh_f32 == nullptr ||
++        hidden != 256 || four_hidden != 1024) {
++        return;
++    }
++    auto * backend_ctx = (ggml_backend_opencl_context *)backend->context;
++    ggml_cl_lstm_preload_weights(backend_ctx, w_hh_f32);
++}
++
++static ggml_backend_opencl_context::lstm_weights_cl & ggml_cl_lstm_weights(
++        ggml_backend_opencl_context * backend_ctx,
++        const ggml_opencl_lstm_params_v1 * p) {
++    auto & entry = ggml_cl_lstm_preload_weights(backend_ctx, p->w_hh_f32);
++    if (entry.bias == nullptr) {
++        constexpr int H4 = 1024;
++        cl_int err;
++        CL_CHECK((entry.bias = clCreateBuffer(backend_ctx->context, CL_MEM_READ_ONLY,
++                                              H4*sizeof(float), nullptr, &err), err));
++        CL_CHECK(clEnqueueWriteBuffer(backend_ctx->queue, entry.bias, CL_TRUE, 0,
++                                      H4*sizeof(float), p->b_hh, 0, nullptr, nullptr));
++        backend_ctx->lstm_weights_bytes += H4*sizeof(float);
++    }
++    return entry;
++}
++
++static void ggml_cl_lstm(ggml_backend_t backend, const ggml_tensor *, const ggml_tensor * pre_gates, ggml_tensor * dst) {
++    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *)backend->context;
++    const ggml_opencl_lstm_params_v1 * p = ggml_cl_lstm_params(dst);
++    GGML_ASSERT(p != nullptr && p->hidden == 256);
++
++    ggml_tensor_extra_cl * extra_pre = (ggml_tensor_extra_cl *)pre_gates->extra;
++    ggml_tensor_extra_cl * extra_out = (ggml_tensor_extra_cl *)dst->extra;
++    const cl_ulong off_pre = extra_pre->offset + pre_gates->view_offs;
++    const cl_ulong off_out = extra_out->offset + dst->view_offs;
++    auto & weights = ggml_cl_lstm_weights(backend_ctx, p);
++    backend_ctx->prealloc_lstm_state.allocate(backend_ctx->context, 2*256*sizeof(float));
++
++    cl_kernel k = backend_ctx->kernel_lstm_fused_h256;
++    const int n_steps = (int)p->n_steps;
++    const int reverse = p->reverse;
++    cl_uint a = 0;
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem), &extra_pre->data_device));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &off_pre));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem), &extra_out->data_device));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &off_out));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem), &weights.weights));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem), &weights.bias));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem), &backend_ctx->prealloc_lstm_state.buffer));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(int), &n_steps));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(int), &reverse));
++    size_t lws[1] = { 256 }, gws[1] = { 256 };
++    backend_ctx->enqueue_ndrange_kernel(k, 1, gws, lws, dst);
++}
++
++static void ggml_cl_conv_transpose_1d(
++        ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *)backend->context;
++    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
++    ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
++    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
++
++    const int KW = (int)src0->ne[0];
++    const int Cout = (int)src0->ne[1];
++    const int Cin = (int)src0->ne[2];
++    const int W = (int)src1->ne[0];
++    const int OW = (int)dst->ne[0];
++    const int batches = (int)src1->ne[2];
++    const int s0 = ggml_get_op_params_i32(dst, 0);
++    const int VEC = 4, TS_K = 16;
++    const int Coutp = (int)CEIL_DIV(Cout, TS_K)*TS_K;
++
++    const cl_ulong offset0 = extra0->offset + src0->view_offs;
++    const cl_ulong offset1 = extra1->offset + src1->view_offs;
++    const cl_ulong offsetd = extrad->offset + dst->view_offs;
++    cl_mem packed = ggml_cl_conv_transpose_1d_repacked_weights(
++        backend_ctx, extra0->data_device, offset0, src0->type, Cout, Coutp, Cin, KW);
++
++    cl_kernel k = src0->type == GGML_TYPE_F16
++        ? backend_ctx->kernel_conv_transpose_1d_f16
++        : backend_ctx->kernel_conv_transpose_1d_f32;
++    const cl_ulong zero = 0;
++    cl_uint a = 0;
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem), &packed));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &zero));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem), &extra1->data_device));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &offset1));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem), &extrad->data_device));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &offsetd));
++    for (int v : { Cout, Coutp, Cin, KW, W, OW, s0, batches }) {
++        CL_CHECK(clSetKernelArg(k, a++, sizeof(int), &v));
++    }
++
++    const size_t LWS0 = 16, LWS1 = 4;
++    const size_t q_count = CEIL_DIV((size_t)OW, (size_t)s0);
++    size_t lws[3] = { LWS0, LWS1, 1 };
++    size_t gws[3] = {
++        CEIL_DIV(CEIL_DIV(q_count, (size_t)VEC), LWS0)*LWS0,
++        CEIL_DIV((size_t)(Coutp/TS_K), LWS1)*LWS1,
++        (size_t)s0*batches,
++    };
++    backend_ctx->enqueue_ndrange_kernel(k, 3, gws, lws, dst);
++}
++
+ static void ggml_cl_conv_2d(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     GGML_TENSOR_BINARY_OP_LOCALS;
+     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+@@ -16157,6 +16799,55 @@ static void ggml_cl_conv_2d(ggml_backend_t backend, const ggml_tensor * src0, co
  
      const int64_t NPQ = (int64_t)N * OW * OH;
  
@@ -341,65 +869,157 @@ index 64f3325b..e2cb79a9 100644
 +    // shape kernel_conv_1d is about twice as fast as kernel_conv_2d on Adreno:
 +    // it holds the output tile in registers instead of staging both operands
 +    // through local memory, which is not a fast scratchpad on this GPU. TS_K
-+    // is baked into the program, so a Cout that is not a multiple of it keeps
-+    // the general path.
-+    if (KH == 1 && OH == 1 && H == 1 && N == 1 && (Cout % 16) == 0 &&
++    // A Cout that is not a multiple of the tile is handled by padding the
++    // repacked weights with zeros, so every shape of 1D convolution qualifies.
++    if (KH == 1 && OH == 1 && H == 1 && N == 1 &&
 +        src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F32 &&
 +        ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
 +        const int VEC = 4;
 +        const int TS_K_1D = 16;
-+        const size_t LWS0 = 16, LWS1 = 4;
++        const size_t LWS0 = 32, LWS1 = 2;
 +
-+        cl_kernel k1d = backend_ctx->kernel_conv_1d_f16_f32;
-+        const int i_Cout = (int)Cout, i_Cin = (int)Cin, i_KW = (int)KW;
-+        const int i_W = (int)W, i_OW = (int)OW;
-+        const int i_s0 = (int)s0, i_p0 = (int)p0, i_d0 = (int)d0;
++        // A failed repack (out of device memory) is not fatal: fall through to
++        // the general kernel below.
++        const int Coutp = (int)CEIL_DIV(Cout, (cl_uint)TS_K_1D) * TS_K_1D;
++        cl_mem packed = ggml_cl_conv_1d_repacked_weights(
++            backend_ctx, extra0->data_device, offset0, (int)Cout, Coutp, (int)Cin, (int)KW);
++        if (packed) {
++            cl_kernel k1d = backend_ctx->kernel_conv_1d_f16_f32;
++            const int i_Cout = (int)Cout, i_Coutp = Coutp, i_Cin = (int)Cin, i_KW = (int)KW;
++            const int i_W = (int)W, i_OW = (int)OW;
++            const int i_s0 = (int)s0, i_p0 = (int)p0, i_d0 = (int)d0;
 +
-+        cl_uint a = 0;
-+        CL_CHECK(clSetKernelArg(k1d, a++, sizeof(cl_mem),   &extra0->data_device));
-+        CL_CHECK(clSetKernelArg(k1d, a++, sizeof(cl_ulong), &offset0));
-+        CL_CHECK(clSetKernelArg(k1d, a++, sizeof(cl_mem),   &extra1->data_device));
-+        CL_CHECK(clSetKernelArg(k1d, a++, sizeof(cl_ulong), &offset1));
-+        CL_CHECK(clSetKernelArg(k1d, a++, sizeof(cl_mem),   &extrad->data_device));
-+        CL_CHECK(clSetKernelArg(k1d, a++, sizeof(cl_ulong), &offsetd));
-+        for (int v : { i_Cout, i_Cin, i_KW, i_W, i_OW, i_s0, i_p0, i_d0 }) {
-+            CL_CHECK(clSetKernelArg(k1d, a++, sizeof(int), &v));
++            cl_uint a = 0;
++            {
++                const cl_ulong zero = 0;
++                CL_CHECK(clSetKernelArg(k1d, a++, sizeof(cl_mem),   &packed));
++                CL_CHECK(clSetKernelArg(k1d, a++, sizeof(cl_ulong), &zero));
++            }
++            CL_CHECK(clSetKernelArg(k1d, a++, sizeof(cl_mem),   &extra1->data_device));
++            CL_CHECK(clSetKernelArg(k1d, a++, sizeof(cl_ulong), &offset1));
++            CL_CHECK(clSetKernelArg(k1d, a++, sizeof(cl_mem),   &extrad->data_device));
++            CL_CHECK(clSetKernelArg(k1d, a++, sizeof(cl_ulong), &offsetd));
++            for (int v : { i_Cout, i_Coutp, i_Cin, i_KW, i_W, i_OW, i_s0, i_p0, i_d0 }) {
++                CL_CHECK(clSetKernelArg(k1d, a++, sizeof(int), &v));
++            }
++
++            // Round the grid up to the workgroup; the kernel guards its own tail.
++            size_t lws1d[2] = { LWS0, LWS1 };
++            size_t gws1d[2] = {
++                CEIL_DIV((size_t)((OW + VEC - 1) / VEC), LWS0) * LWS0,
++                CEIL_DIV((size_t)(Coutp / TS_K_1D), LWS1) * LWS1,
++            };
++            backend_ctx->enqueue_ndrange_kernel(k1d, 2, gws1d, lws1d, dst);
++            return;
 +        }
-+
-+        // Round the grid up to the workgroup; the kernel guards its own tail.
-+        size_t lws1d[2] = { LWS0, LWS1 };
-+        size_t gws1d[2] = {
-+            CEIL_DIV((size_t)((OW + VEC - 1) / VEC), LWS0) * LWS0,
-+            CEIL_DIV((size_t)(Cout / TS_K_1D), LWS1) * LWS1,
-+        };
-+        backend_ctx->enqueue_ndrange_kernel(k1d, 2, gws1d, lws1d, dst);
-+        return;
 +    }
 +
      const uint32_t BS_K = 64;
      const uint32_t BS_NPQ = 64;
      const uint32_t BS_CRS = 16;
-@@ -19575,7 +19829,8 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+@@ -19574,49 +20265,32 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+                     return;
                  }
  #endif
-                 kernel = backend_ctx->kernel_mul_mm_f16_f32_l4_lm;
+-                kernel = backend_ctx->kernel_mul_mm_f16_f32_l4_lm;
 -                nth0 = 128; // calculated as (BM*BN)/(TM*TN)
-+                // Must track the BM/BN/TM/TN in mul_mm_f16_f32_l4_lm.cl.
-+                nth0 = (MUL_MM_F16_F32_BM/MUL_MM_F16_F32_TM) * (MUL_MM_F16_F32_BN/MUL_MM_F16_F32_TN);
+-
+-                int batch_stride_a = ne00*ne01;
+-                int batch_stride_b = ne10*ne11;
+-                int batch_stride_d = ne0*ne1;
+-
+-                cl_mem mem_src0 = extra0->data_device;
+-                cl_mem mem_src1 = extra1->data_device;
+-
+-                cl_ulong nb00_cont = nb00;
+-                cl_ulong nb01_cont = nb01;
+-                cl_ulong nb02_cont = nb02;
+-                cl_ulong nb03_cont = nb03;
+-
+-                cl_ulong nb10_cont = nb10;
+-                cl_ulong nb11_cont = nb11;
+-                cl_ulong nb12_cont = nb12;
+-                cl_ulong nb13_cont = nb13;
+-
+-                cl_ulong offset0_cont = offset0;
+-                cl_ulong offset1_cont = offset1;
+-
+-                if (!ggml_is_contiguous(src0)) {
+-                    backend_ctx->prealloc_src0.allocate(backend_ctx->context, ggml_nbytes(src0));
+-                    ggml_cl_copy_to_contiguous(backend, src0, backend_ctx->prealloc_src0.buffer,
+-                        nb00_cont, nb01_cont, nb02_cont, nb03_cont);
+-                    mem_src0 = backend_ctx->prealloc_src0.buffer;
+-                    offset0_cont = 0;
++                // Repacked weights are cached, so only immutable contiguous
++                // lhs tensors are eligible. Other layouts continue to the
++                // existing general path below.
++                if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) {
++                    break;
+                 }
  
-                 int batch_stride_a = ne00*ne01;
-                 int batch_stride_b = ne10*ne11;
-@@ -19633,8 +19888,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+-                if (!ggml_is_contiguous(src1)) {
+-                    backend_ctx->prealloc_src1.allocate(backend_ctx->context, ggml_nbytes(src1));
+-                    ggml_cl_copy_to_contiguous(backend, src1, backend_ctx->prealloc_src1.buffer,
+-                            nb10_cont, nb11_cont, nb12_cont, nb13_cont);
+-                    mem_src1 = backend_ctx->prealloc_src1.buffer;
+-                    offset1_cont = 0;
++                const int TM = 8, TN = 4;
++                const int Mp = (int)CEIL_DIV(ne01, TM) * TM;
++                cl_mem packed = ggml_cl_mul_mm_f16_repacked_weights(
++                    backend_ctx, extra0->data_device, offset0,
++                    (int)ne00, (int)ne01, Mp, (int)(ne02 * ne03));
++                if (packed == nullptr) {
++                    break;
+                 }
+ 
+-                CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &mem_src0));
+-                CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset0_cont));
+-                CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &mem_src1));
+-                CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &offset1_cont));
++                kernel = backend_ctx->kernel_mul_mm_f16_f32_l4_lm;
++                int batch_stride_a = ne00*Mp;
++                int batch_stride_b = ne10*ne11;
++                int batch_stride_d = ne0*ne1;
++                const cl_ulong zero = 0;
++
++                CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &packed));
++                CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &zero));
++                CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extra1->data_device));
++                CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &offset1));
+                 CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   &extrad->data_device));
+                 CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &offsetd));
+                 CL_CHECK(clSetKernelArg(kernel,  6, sizeof(int),      &ne00));
+@@ -19624,7 +20298,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+                 CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),      &ne02));
+                 CL_CHECK(clSetKernelArg(kernel,  9, sizeof(int),      &ne11));
+                 CL_CHECK(clSetKernelArg(kernel, 10, sizeof(int),      &ne12));
+-                CL_CHECK(clSetKernelArg(kernel, 11, sizeof(int),      &ne10)); // stride_a
++                CL_CHECK(clSetKernelArg(kernel, 11, sizeof(int),      &Mp));
+                 CL_CHECK(clSetKernelArg(kernel, 12, sizeof(int),      &ne10)); // stride_b
+                 CL_CHECK(clSetKernelArg(kernel, 13, sizeof(int),      &ne01)); // stride_d
+                 CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &batch_stride_a));
+@@ -19633,9 +20307,17 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                  CL_CHECK(clSetKernelArg(kernel, 17, sizeof(int),      &r2));
                  CL_CHECK(clSetKernelArg(kernel, 18, sizeof(int),      &r3));
  
 -                // 64 is block tile size BM and BN - change here when BM and BN in the kernel are changed.
 -                size_t global_work_size[] = {(size_t)(CEIL_DIV(ne01, 64)*nth0), (size_t)(CEIL_DIV(ne11, 64)), (size_t)ne12*ne13};
-+                size_t global_work_size[] = {(size_t)(CEIL_DIV(ne01, MUL_MM_F16_F32_BM)*nth0), (size_t)(CEIL_DIV(ne11, MUL_MM_F16_F32_BN)), (size_t)ne12*ne13};
-                 size_t local_work_size[] = {(size_t)nth0, 1, 1};
+-                size_t local_work_size[] = {(size_t)nth0, 1, 1};
++                // One 64-lane wave. A wider x dimension wins once M reaches
++                // 256; 16x4 avoids launching 2x too many lanes for M=128.
++                const size_t row_tiles = CEIL_DIV((size_t)ne01, (size_t)TM);
++                const size_t col_tiles = CEIL_DIV((size_t)ne11, (size_t)TN);
++                size_t local_work_size[] = { row_tiles >= 32 ? 32u : 16u,
++                                             row_tiles >= 32 ? 2u : 4u, 1u };
++                size_t global_work_size[] = {
++                    CEIL_DIV(row_tiles, local_work_size[0]) * local_work_size[0],
++                    CEIL_DIV(col_tiles, local_work_size[1]) * local_work_size[1],
++                    (size_t)ne12*ne13,
++                };
  
                  backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
-@@ -25148,6 +25402,18 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
+                 return;
+@@ -25148,6 +25830,18 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
              }
              func = ggml_cl_sub;
              break;
@@ -418,11 +1038,60 @@ index 64f3325b..e2cb79a9 100644
          case GGML_OP_SQR:
              if (!any_on_device) {
                  return false;
+@@ -25261,6 +25955,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
+             }
+             func = ggml_cl_fill;
+             break;
++        case GGML_OP_MAP_CUSTOM2:
++            if (!any_on_device || ggml_cl_lstm_params(tensor) == nullptr) {
++                return false;
++            }
++            func = ggml_cl_lstm;
++            break;
+         case GGML_OP_CLAMP:
+             if (!any_on_device) {
+                 return false;
+@@ -25315,6 +26015,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
+             }
+             func = ggml_cl_conv_2d;
+             break;
++        case GGML_OP_CONV_TRANSPOSE_1D:
++            if (!any_on_device) {
++                return false;
++            }
++            func = ggml_cl_conv_transpose_1d;
++            break;
+         case GGML_OP_SSM_CONV:
+             if (!any_on_device) {
+                 return false;
 diff --git a/src/ggml-opencl/kernels/add.cl b/src/ggml-opencl/kernels/add.cl
-index 509bf173..3e562fb3 100644
+index 509bf173..c0c9a5d4 100644
 --- a/src/ggml-opencl/kernels/add.cl
 +++ b/src/ggml-opencl/kernels/add.cl
-@@ -188,3 +188,41 @@ kernel void kernel_add_row_f16(
+@@ -61,6 +61,22 @@ kernel void kernel_add(
+     }
+ }
+ 
++kernel void kernel_add_flat(
++        global const float * src0, ulong offset0,
++        global const float * src1, ulong offset1,
++        global       float * dst,  ulong offsetd,
++        ulong ne) {
++    src0 = (global const float *)((global const char *)src0 + offset0);
++    src1 = (global const float *)((global const char *)src1 + offset1);
++    dst  = (global       float *)((global       char *)dst  + offsetd);
++    const size_t i = get_global_id(0)*4;
++    if (i + 4 <= ne) {
++        vstore4(vload4(0, src0 + i) + vload4(0, src1 + i), 0, dst + i);
++    } else {
++        for (size_t j = i; j < ne; ++j) dst[j] = src0[j] + src1[j];
++    }
++}
++
+ // assumption: src1 is a row
+ // broadcast src1 into src0
+ kernel void kernel_add_row(
+@@ -188,3 +204,41 @@ kernel void kernel_add_row_f16(
  
      dst[gid] = v0 + v1;
  }
@@ -466,10 +1135,10 @@ index 509bf173..3e562fb3 100644
 +}
 diff --git a/src/ggml-opencl/kernels/conv1d.cl b/src/ggml-opencl/kernels/conv1d.cl
 new file mode 100644
-index 00000000..57912e4c
+index 00000000..1b22e6e4
 --- /dev/null
 +++ b/src/ggml-opencl/kernels/conv1d.cl
-@@ -0,0 +1,99 @@
+@@ -0,0 +1,177 @@
 +#pragma OPENCL EXTENSION cl_khr_fp16 : enable
 +
 +// Direct 1D convolution for the Kokoro vocoder, written for Adreno.
@@ -477,15 +1146,32 @@ index 00000000..57912e4c
 +// ggml's kernel_conv_2d stages both operands through `local` memory with two
 +// barriers per K-block. That is the right shape for a desktop GPU and the
 +// wrong one here: Adreno has no fast local scratchpad, and that kernel
-+// measures ~19 GFLOPS on a device that does 473. This one holds the whole
-+// output tile in registers, issues no barrier, and lets the L1 cache do the
-+// sharing -- adjacent work items read overlapping input windows, and every
-+// work item along the time axis reads the same weights.
++// measures ~19 GFLOPS on a device that does 473. This one holds the output
++// tile in registers, issues no barrier, and lets the L1 cache do the sharing.
 +//
-+// Reads ggml's tensors as they are, no repacking:
-+//   src [W, 1, Cin] f32, knl [KW, 1, Cin, Cout] f16, dst [OW, 1, Cout] f32,
-+// first axis contiguous in each. One work item produces VEC consecutive time
-+// steps for TS_K output channels.
++// Register tiling alone still left it issue-bound rather than bandwidth-bound
++// (1.6 GB/s of an available 24), because of how many load instructions a tap
++// costs. Two changes fix that, worth 1.8x together:
++//
++//   * The weights are repacked to [Cin, KW, Cout]. In ggml's own layout the
++//     TS_K output channels one work item needs sit 2*KW*Cin bytes apart -- one
++//     load and one cache line each. Repacked they are contiguous and 32-byte
++//     aligned, so they arrive in TS_K/8 vload8s.
++//   * The input window is rotated in registers instead of re-read: consecutive
++//     taps overlap in VEC-1 samples, so the fast path costs one load and VEC-1
++//     register moves per tap rather than VEC loads.
++//
++// Twenty load instructions per 64 MADs becomes three. Do not be tempted to
++// vload the input as well: xrow + lo + kw is only 4-byte aligned, and this
++// driver scalarises a misaligned vector load into something far slower than
++// the loads it replaces (measured on the weights: 443 ms -> 1482 ms).
++//
++// Layout, first axis contiguous in each:
++//   src [W, 1, Cin] f32, knl repacked [Cin, KW, Coutp] f16, dst [OW, 1, Cout] f32.
++// The repacked weights are padded from Cout to Coutp, a multiple of TS_K, so a
++// work item always has a whole aligned tile to load; only the store is masked.
++// The fast path needs s0 == 1 and d0 == 1; strided and dilated convolutions
++// take the general path in the same kernel, still with repacked weights.
 +
 +#ifndef VEC
 +#define VEC 4           // time steps per work item
@@ -494,6 +1180,28 @@ index 00000000..57912e4c
 +#define TS_K 16         // output channels per work item
 +#endif
 +
++// One tap: TS_K weights in TS_K/8 aligned vector loads, then TS_K*VEC MADs.
++#define CONV1D_TAP(kw)                                                        \
++    do {                                                                      \
++        global const half * wp = wrow + (size_t)(kw) * Coutp;                  \
++        float w[TS_K];                                                        \
++        _Pragma("unroll")                                                     \
++        for (int k = 0; k + 8 <= TS_K; k += 8) {                              \
++            const float8 h = convert_float8(vload8(0, wp + k));               \
++            w[k+0]=h.s0; w[k+1]=h.s1; w[k+2]=h.s2; w[k+3]=h.s3;               \
++            w[k+4]=h.s4; w[k+5]=h.s5; w[k+6]=h.s6; w[k+7]=h.s7;               \
++        }                                                                     \
++        _Pragma("unroll")                                                     \
++        for (int k = (TS_K / 8) * 8; k < TS_K; ++k) w[k] = (float)wp[k];      \
++        _Pragma("unroll")                                                     \
++        for (int k = 0; k < TS_K; ++k) {                                      \
++            _Pragma("unroll")                                                 \
++            for (int v = 0; v < VEC; ++v) {                                   \
++                acc[k][v] = mad(w[k], x[v], acc[k][v]);                       \
++            }                                                                 \
++        }                                                                     \
++    } while (0)
++
 +kernel void kernel_conv_1d(
 +    global const half  * knl,
 +    ulong                off_knl,
@@ -501,7 +1209,7 @@ index 00000000..57912e4c
 +    ulong                off_src,
 +    global       float * dst,
 +    ulong                off_dst,
-+    int Cout, int Cin,
++    int Cout, int Coutp, int Cin,
 +    int KW, int W, int OW,
 +    int s0, int p0, int d0
 +) {
@@ -519,61 +1227,238 @@ index 00000000..57912e4c
 +    #pragma unroll
 +    for (int k = 0; k < TS_K; ++k) {
 +        #pragma unroll
-+        for (int v = 0; v < VEC; ++v) {
-+            acc[k][v] = 0.0f;
-+        }
++        for (int v = 0; v < VEC; ++v) acc[k][v] = 0.0f;
 +    }
 +
 +    // Interior work items skip the per-tap bounds test. Only the first and
 +    // last few of each row take the guarded path.
 +    const int lo = t0 * s0 - p0;
-+    const int hi = (t0 + VEC - 1) * s0 - p0 + (KW - 1) * d0;
-+    const bool interior = (lo >= 0) && (hi < W) && (t0 + VEC <= OW);
++    const int hi = lo + (VEC - 1) * s0 + (KW - 1) * d0;
++    const bool interior = (lo >= 0) && (hi < W);
++    const bool rolling  = interior && (s0 == 1) && (d0 == 1);
 +
 +    for (int ci = 0; ci < Cin; ++ci) {
 +        global const float * xrow = src + (size_t)ci * W;
-+        global const half  * wcol = knl + (size_t)ci * KW + (size_t)c0 * KW * Cin;
++        global const half  * wrow = knl + ((size_t)ci * KW) * Coutp + c0;
 +
++        float x[VEC];
 +        for (int kw = 0; kw < KW; ++kw) {
-+            float x[VEC];
-+            if (interior) {
-+                #pragma unroll
-+                for (int v = 0; v < VEC; ++v) {
-+                    x[v] = xrow[lo + v * s0 + kw * d0];
++            if (rolling) {
++                if (kw == 0) {
++                    #pragma unroll
++                    for (int v = 0; v < VEC; ++v) x[v] = xrow[lo + v];
++                } else {
++                    // the previous window already holds taps 1..VEC-1
++                    #pragma unroll
++                    for (int v = 0; v < VEC - 1; ++v) x[v] = x[v + 1];
++                    x[VEC - 1] = xrow[lo + kw + VEC - 1];
 +                }
++            } else if (interior) {
++                #pragma unroll
++                for (int v = 0; v < VEC; ++v) x[v] = xrow[lo + v * s0 + kw * d0];
 +            } else {
 +                #pragma unroll
 +                for (int v = 0; v < VEC; ++v) {
-+                    const int idx = (t0 + v) * s0 - p0 + kw * d0;
++                    const int idx = lo + v * s0 + kw * d0;
 +                    x[v] = (idx >= 0 && idx < W) ? xrow[idx] : 0.0f;
 +                }
 +            }
++            CONV1D_TAP(kw);
++        }
++    }
 +
++    // Two stores rather than one guarded one: a `break` on the channel tail
++    // costs the accumulator its registers (measured: 142 ms -> 607 ms), and
++    // the tail is at most one work item per row anyway.
++    if (c0 + TS_K <= Cout) {
++        #pragma unroll
++        for (int k = 0; k < TS_K; ++k) {
++            global float * out = dst + (size_t)(c0 + k) * OW;
 +            #pragma unroll
-+            for (int k = 0; k < TS_K; ++k) {
-+                const float w = (float)wcol[kw + (size_t)k * KW * Cin];
-+                #pragma unroll
-+                for (int v = 0; v < VEC; ++v) {
-+                    acc[k][v] = mad(w, x[v], acc[k][v]);
-+                }
++            for (int v = 0; v < VEC; ++v) {
++                if (t0 + v < OW) out[t0 + v] = acc[k][v];
++            }
++        }
++    } else {
++        #pragma unroll
++        for (int k = 0; k < TS_K; ++k) {
++            if (c0 + k >= Cout) continue;   // padded channel, zero weights
++            global float * out = dst + (size_t)(c0 + k) * OW;
++            #pragma unroll
++            for (int v = 0; v < VEC; ++v) {
++                if (t0 + v < OW) out[t0 + v] = acc[k][v];
 +            }
 +        }
 +    }
-+
-+    #pragma unroll
-+    for (int k = 0; k < TS_K; ++k) {
-+        global float * out = dst + (size_t)(c0 + k) * OW;
-+        #pragma unroll
-+        for (int v = 0; v < VEC; ++v) {
-+            if (t0 + v < OW) out[t0 + v] = acc[k][v];
-+        }
-+    }
 +}
++
++// Repack [KW, Cin, Cout] -> [Cin, KW, Coutp], run once per weight tensor and
++// cached. Coutp rounds Cout up to a multiple of the tile; the padding is zero,
++// so a work item can load and multiply a whole tile and simply not store the
++// channels that do not exist. One work item per output channel of one (ci, kw).
++kernel void kernel_conv_1d_repack_f16(
++    global const half * src,
++    ulong               off_src,
++    global       half * dst,
++    ulong               off_dst,
++    int Cout, int Coutp, int Cin, int KW
++) {
++    src = (global const half *)((global const char *)src + off_src);
++    dst = (global       half *)((global       char *)dst + off_dst);
++
++    const int co = (int)get_global_id(0);
++    const int kw = (int)get_global_id(1);
++    const int ci = (int)get_global_id(2);
++    if (co >= Coutp || kw >= KW || ci >= Cin) {
++        return;
++    }
++    dst[((size_t)ci * KW + kw) * Coutp + co] = co < Cout
++        ? src[(size_t)co * KW * Cin + (size_t)ci * KW + kw]
++        : (half)0.0f;
++}
+diff --git a/src/ggml-opencl/kernels/convtranspose1d.cl b/src/ggml-opencl/kernels/convtranspose1d.cl
+new file mode 100644
+index 00000000..6c49c40f
+--- /dev/null
++++ b/src/ggml-opencl/kernels/convtranspose1d.cl
+@@ -0,0 +1,109 @@
++#pragma OPENCL EXTENSION cl_khr_fp16 : enable
++
++// Output-oriented transposed 1D convolution for Adreno. Work is ordered by
++// output phase (t % stride), turning each phase into a dense row so one weight
++// vector feeds VEC adjacent input positions. Weights are repacked once from
++// ggml's [KW, Cout, Cin] layout to [Cin, KW, Coutp].
++
++#ifndef VEC
++#define VEC 4
++#endif
++#ifndef TS_K
++#define TS_K 16
++#endif
++
++#define DEFINE_CONVT_KERNEL(NAME, KTYPE, LOAD_WEIGHT8)                         \
++kernel void NAME(                                                             \
++    global const KTYPE * knl, ulong off_knl,                                  \
++    global const float * src, ulong off_src,                                  \
++    global float * dst, ulong off_dst,                                        \
++    int Cout, int Coutp, int Cin, int KW, int W, int OW, int s0, int batches) \
++{                                                                             \
++    knl = (global const KTYPE *)((global const char *)knl + off_knl);          \
++    src = (global const float *)((global const char *)src + off_src);          \
++    dst = (global float *)((global char *)dst + off_dst);                      \
++    const int q0 = (int)get_global_id(0) * VEC;                               \
++    const int c0 = (int)get_global_id(1) * TS_K;                              \
++    const int phase_plane = (int)get_global_id(2);                            \
++    const int phase = phase_plane % s0;                                       \
++    const int plane = phase_plane / s0;                                       \
++    if (phase >= OW || c0 >= Cout || plane >= batches) return;                \
++    float acc[TS_K][VEC];                                                      \
++    _Pragma("unroll")                                                        \
++    for (int k = 0; k < TS_K; ++k) {                                          \
++        _Pragma("unroll")                                                    \
++        for (int v = 0; v < VEC; ++v) acc[k][v] = 0.0f;                       \
++    }                                                                         \
++    for (int ci = 0; ci < Cin; ++ci) {                                        \
++        global const float * xrow = src + ((size_t)plane * Cin + ci) * W;     \
++        global const KTYPE * wrow = knl + (size_t)ci * KW * Coutp + c0;       \
++        int n = 0;                                                            \
++        for (int tap = phase; tap < KW; tap += s0, ++n) {                     \
++            global const KTYPE * wp = wrow + (size_t)tap * Coutp;             \
++            float w[TS_K];                                                     \
++            _Pragma("unroll")                                                \
++            for (int k = 0; k + 8 <= TS_K; k += 8) {                         \
++                const float8 h = LOAD_WEIGHT8(wp + k);                         \
++                w[k+0]=h.s0; w[k+1]=h.s1; w[k+2]=h.s2; w[k+3]=h.s3;           \
++                w[k+4]=h.s4; w[k+5]=h.s5; w[k+6]=h.s6; w[k+7]=h.s7;           \
++            }                                                                 \
++            _Pragma("unroll")                                                \
++            for (int k = (TS_K/8)*8; k < TS_K; ++k) w[k] = (float)wp[k];     \
++            float x[VEC];                                                      \
++            _Pragma("unroll")                                                \
++            for (int v = 0; v < VEC; ++v) {                                  \
++                const int it = q0 + v - n;                                    \
++                x[v] = (it >= 0 && it < W) ? xrow[it] : 0.0f;                 \
++            }                                                                 \
++            _Pragma("unroll")                                                \
++            for (int k = 0; k < TS_K; ++k) {                                  \
++                _Pragma("unroll")                                            \
++                for (int v = 0; v < VEC; ++v)                                \
++                    acc[k][v] = mad(w[k], x[v], acc[k][v]);                   \
++            }                                                                 \
++        }                                                                     \
++    }                                                                         \
++    if (c0 + TS_K <= Cout) {                                                  \
++        _Pragma("unroll")                                                    \
++        for (int k = 0; k < TS_K; ++k) {                                      \
++            global float * out = dst + ((size_t)plane*Cout + c0+k) * OW;      \
++            _Pragma("unroll")                                                \
++            for (int v = 0; v < VEC; ++v) {                                  \
++                const int t = phase + (q0 + v) * s0;                          \
++                if (t < OW) out[t] = acc[k][v];                               \
++            }                                                                 \
++        }                                                                     \
++    } else {                                                                  \
++        _Pragma("unroll")                                                    \
++        for (int k = 0; k < TS_K; ++k) if (c0+k < Cout) {                    \
++            global float * out = dst + ((size_t)plane*Cout + c0+k) * OW;      \
++            _Pragma("unroll")                                                \
++            for (int v = 0; v < VEC; ++v) {                                  \
++                const int t = phase + (q0 + v) * s0;                          \
++                if (t < OW) out[t] = acc[k][v];                               \
++            }                                                                 \
++        }                                                                     \
++    }                                                                         \
++}
++
++#define LOAD_F32_8(p) vload8(0, (p))
++#define LOAD_F16_8(p) convert_float8(vload8(0, (p)))
++DEFINE_CONVT_KERNEL(kernel_conv_transpose_1d_f32, float, LOAD_F32_8)
++DEFINE_CONVT_KERNEL(kernel_conv_transpose_1d_f16, half,  LOAD_F16_8)
++
++#define DEFINE_REPACK(NAME, TYPE)                                              \
++kernel void NAME(global const TYPE * src, ulong off_src,                      \
++                 global TYPE * dst, ulong off_dst,                            \
++                 int Cout, int Coutp, int Cin, int KW) {                      \
++    src = (global const TYPE *)((global const char *)src + off_src);           \
++    dst = (global TYPE *)((global char *)dst + off_dst);                       \
++    const int co = (int)get_global_id(0);                                     \
++    const int tap = (int)get_global_id(1);                                    \
++    const int ci = (int)get_global_id(2);                                     \
++    if (co >= Coutp || tap >= KW || ci >= Cin) return;                        \
++    dst[((size_t)ci*KW + tap)*Coutp + co] = co < Cout                         \
++        ? src[((size_t)ci*Cout + co)*KW + tap] : (TYPE)0;                     \
++}
++
++DEFINE_REPACK(kernel_conv_transpose_1d_repack_f32, float)
++DEFINE_REPACK(kernel_conv_transpose_1d_repack_f16, half)
 diff --git a/src/ggml-opencl/kernels/div.cl b/src/ggml-opencl/kernels/div.cl
-index 6d9b4ade..20cbb68a 100644
+index 6d9b4ade..b250a948 100644
 --- a/src/ggml-opencl/kernels/div.cl
 +++ b/src/ggml-opencl/kernels/div.cl
-@@ -136,3 +136,41 @@ kernel void kernel_div_row_f16(
+@@ -50,6 +50,22 @@ kernel void kernel_div(
+     }
+ }
+ 
++kernel void kernel_div_flat(
++        global const float * src0, ulong offset0,
++        global const float * src1, ulong offset1,
++        global       float * dst,  ulong offsetd,
++        ulong ne) {
++    src0 = (global const float *)((global const char *)src0 + offset0);
++    src1 = (global const float *)((global const char *)src1 + offset1);
++    dst  = (global       float *)((global       char *)dst  + offsetd);
++    const size_t i = get_global_id(0)*4;
++    if (i + 4 <= ne) {
++        vstore4(vload4(0, src0 + i) / vload4(0, src1 + i), 0, dst + i);
++    } else {
++        for (size_t j = i; j < ne; ++j) dst[j] = src0[j] / src1[j];
++    }
++}
++
+ // assumption: src1 is a row
+ // broadcast src1 into src0
+ kernel void kernel_div_row(
+@@ -136,3 +152,41 @@ kernel void kernel_div_row_f16(
      uint idx1 = gid - (gid/ne)*ne; // get_global_id(0) % ne
      dst[gid] = src0[gid] / src1[idx1];
  }
@@ -615,11 +1500,108 @@ index 6d9b4ade..20cbb68a 100644
 +        }
 +    }
 +}
+diff --git a/src/ggml-opencl/kernels/lstm.cl b/src/ggml-opencl/kernels/lstm.cl
+new file mode 100644
+index 00000000..e86c86ed
+--- /dev/null
++++ b/src/ggml-opencl/kernels/lstm.cl
+@@ -0,0 +1,68 @@
++#define H 256
++#define H4 1024
++
++static inline float sanitize_gate(float x) {
++    return clamp(isfinite(x) ? x : 0.0f, -80.0f, 80.0f);
++}
++
++static inline float sigmoid_stable(float x) {
++    if (x >= 0.0f) {
++        const float z = exp(-x);
++        return 1.0f / (1.0f + z);
++    }
++    const float z = exp(x);
++    return z / (1.0f + z);
++}
++
++kernel void kernel_lstm_fused_h256(
++    global const float * pre_gates, ulong off_pre,
++    global       float * output,   ulong off_out,
++    global const float * weights,
++    global const float * bias,
++    global       float * state,
++    int n_steps, int reverse
++) {
++    pre_gates = (global const float *)((global const char *)pre_gates + off_pre);
++    output    = (global       float *)((global       char *)output    + off_out);
++
++    const int i = (int)get_local_id(0);
++    if (get_group_id(0) != 0 || i >= H) return;
++
++    global float * h = state;
++    global float * c = state + H;
++    h[i] = 0.0f;
++    c[i] = 0.0f;
++    barrier(CLK_GLOBAL_MEM_FENCE);
++
++    for (int step = 0; step < n_steps; ++step) {
++        const int t = reverse ? n_steps - 1 - step : step;
++        global const float * pg = pre_gates + (size_t)t * H4;
++        float gi = bias[i]       + pg[i];
++        float gf = bias[H+i]     + pg[H+i];
++        float gg = bias[2*H+i]   + pg[2*H+i];
++        float go = bias[3*H+i]   + pg[3*H+i];
++
++        for (int k = 0; k < H; ++k) {
++            const float hv = h[k];
++            global const float * wk = weights + (size_t)k * H4 + i;
++            gi = mad(wk[0],   hv, gi);
++            gf = mad(wk[H],   hv, gf);
++            gg = mad(wk[2*H], hv, gg);
++            go = mad(wk[3*H], hv, go);
++        }
++
++        barrier(CLK_GLOBAL_MEM_FENCE);
++        gi = sigmoid_stable(sanitize_gate(gi));
++        gf = sigmoid_stable(sanitize_gate(gf));
++        gg = tanh(sanitize_gate(gg));
++        go = sigmoid_stable(sanitize_gate(go));
++        const float c_raw = gf*c[i] + gi*gg;
++        const float c_new = clamp(isfinite(c_raw) ? c_raw : 0.0f, -50.0f, 50.0f);
++        const float h_raw = go*tanh(c_new);
++        const float h_new = isfinite(h_raw) ? h_raw : 0.0f;
++        c[i] = c_new;
++        h[i] = h_new;
++        output[(size_t)t*H + i] = h_new;
++        barrier(CLK_GLOBAL_MEM_FENCE);
++    }
++}
 diff --git a/src/ggml-opencl/kernels/mul.cl b/src/ggml-opencl/kernels/mul.cl
-index b12a5921..869076e2 100644
+index b12a5921..29e91b34 100644
 --- a/src/ggml-opencl/kernels/mul.cl
 +++ b/src/ggml-opencl/kernels/mul.cl
-@@ -150,3 +150,41 @@ kernel void kernel_mul_row_f16(
+@@ -57,6 +57,22 @@ kernel void kernel_mul(
+     }
+ }
+ 
++kernel void kernel_mul_flat(
++        global const float * src0, ulong offset0,
++        global const float * src1, ulong offset1,
++        global       float * dst,  ulong offsetd,
++        ulong ne) {
++    src0 = (global const float *)((global const char *)src0 + offset0);
++    src1 = (global const float *)((global const char *)src1 + offset1);
++    dst  = (global       float *)((global       char *)dst  + offsetd);
++    const size_t i = get_global_id(0)*4;
++    if (i + 4 <= ne) {
++        vstore4(vload4(0, src0 + i) * vload4(0, src1 + i), 0, dst + i);
++    } else {
++        for (size_t j = i; j < ne; ++j) dst[j] = src0[j] * src1[j];
++    }
++}
++
+ // assumption: src1 is a row
+ // broadcast src1 into src0
+ kernel void kernel_mul_row(
+@@ -150,3 +166,41 @@ kernel void kernel_mul_row_f16(
      uint idx1 = gid - (gid/ne)*ne; // get_global_id(0) % ne
      dst[gid] = src0[gid] * src1[idx1];
  }
@@ -662,73 +1644,230 @@ index b12a5921..869076e2 100644
 +    }
 +}
 diff --git a/src/ggml-opencl/kernels/mul_mm_f16_f32_l4_lm.cl b/src/ggml-opencl/kernels/mul_mm_f16_f32_l4_lm.cl
-index 6982f8f5..9f607c7c 100644
+index 6982f8f5..129932f4 100644
 --- a/src/ggml-opencl/kernels/mul_mm_f16_f32_l4_lm.cl
 +++ b/src/ggml-opencl/kernels/mul_mm_f16_f32_l4_lm.cl
-@@ -3,11 +3,17 @@
- #define LOAD_VEC_A 4
- #define LOAD_VEC_B 4
+@@ -1,146 +1,100 @@
+ #pragma OPENCL EXTENSION cl_khr_fp16 : enable
+ 
+-#define LOAD_VEC_A 4
+-#define LOAD_VEC_B 4
++// Adreno register-tiled f16 x f32 GEMM. The constant lhs is repacked once from
++// ggml's [K, M] layout to [M, K] so the eight output rows handled by one work
++// item are one aligned half8 load. There is no local memory and no barrier:
++// Adreno's L1 cache shares repeated reads more efficiently than explicit
++// staging (45-62 GFLOPS on Adreno 630, versus 7-10 for the local-memory path).
  
 -#define BM 64
-+// Tile tuned on an Adreno 630 (see scripts/clbench in the droid repo). Two
-+// things matter on this GPU and both point away from the 64/64/16/4/8 default:
-+//   - (BM/TM)*(BN/TN) == 64 makes a workgroup exactly one wave, so the two
-+//     barriers per K-block cost nothing;
-+//   - BK = 32 halves the number of barriers for the same amount of work.
-+// Measured over the four Kokoro GEMM shapes: 449 ms -> 79 ms.
-+#define BM 32
- #define BN 64
+-#define BN 64
 -#define BK 16
 -#define TM 4
 -#define TN 8
-+#define BK 32
 +#define TM 8
 +#define TN 4
  
  kernel void kernel_mul_mm_f16_f32_l4_lm(
-     global half4 * src0,
-@@ -73,6 +79,7 @@ kernel void kernel_mul_mm_f16_f32_l4_lm(
-     half  cache_a[TM];
-     float cache_b[TN];
+-    global half4 * src0,
+-    ulong offset0,
+-    global float4 * src1,
+-    ulong offset1,
+-    global float * dst,
+-    ulong offsetd,
+-
+-    int ne00,
+-    int ne01,
+-    int ne02,
+-    int ne11,
+-    int ne12,
+-
+-    int stride_a,
++    global const half  * lhs,
++    ulong                offset0,
++    global const float * rhs,
++    ulong                offset1,
++    global       float * dst,
++    ulong                offsetd,
++    int K, int M, int ne02, int N, int ne12,
++    int Mp,
+     int stride_b,
+     int stride_d,
+-
+     int batch_stride_a,
+     int batch_stride_b,
+     int batch_stride_d,
+-
+     int r2,
+     int r3
+ ) {
+-    src0 = (global half4*)((global char*)src0 + offset0);
+-    src1 = (global float4*)((global char*)src1 + offset1);
+-    dst = (global float*)((global char*)dst + offsetd);
+-
+-    local half  buf_a[BM * BK];
+-    local float buf_b[BN * BK];
+-
+-    const int batch_idx = get_global_id(2);
++    lhs = (global const half  *)((global const char *)lhs + offset0);
++    rhs = (global const float *)((global const char *)rhs + offset1);
++    dst = (global       float *)((global       char *)dst + offsetd);
  
++    const int batch_idx = (int)get_global_id(2);
+     const int i13 = batch_idx / ne12;
+     const int i12 = batch_idx % ne12;
+-
+-    const int i03 = i13 / r3;
+-    const int i02 = i12 / r2;
+-
+-    const int batch_idx_a = i03 * ne02 + i02;
+-
+-    const int ir = get_group_id(0);
+-    const int ic = get_group_id(1);
+-
+-    const int tid = get_local_id(0);
+-    const int th_r  = tid % (BM / TM);
+-    const int th_c  = tid / (BM / TM);
+-
+-    const int loadr_a = get_local_id(0) % (BK / LOAD_VEC_A);
+-    const int loadc_a = get_local_id(0) / (BK / LOAD_VEC_A);
+-    const int loadr_b = get_local_id(0) % (BK / LOAD_VEC_B);
+-    const int loadc_b = get_local_id(0) / (BK / LOAD_VEC_B);
+-
+-    const int loadstride_a = get_local_size(0) * LOAD_VEC_A / BK;
+-    const int loadstride_b = get_local_size(0) * LOAD_VEC_B / BK;
+-
+-    int pos_a = (batch_idx_a * batch_stride_a + ir * BM * stride_a) / LOAD_VEC_A;
+-    int pos_b = (batch_idx   * batch_stride_b + ic * BN * stride_b) / LOAD_VEC_B;
+-
+-    float sums[TM * TN];
+-    half  cache_a[TM];
+-    float cache_b[TN];
+-
+-    for (int i = 0; i < TM * TN; i++) {
+-        sums[i] = 0.0f;
++    const int batch_idx_a = (i13 / r3) * ne02 + i12 / r2;
++    const int m0 = (int)get_global_id(0) * TM;
++    const int n0 = (int)get_global_id(1) * TN;
++    if (m0 >= M || n0 >= N) return;
++
++    lhs += (size_t)batch_idx_a * batch_stride_a;
++    rhs += (size_t)batch_idx * batch_stride_b;
++    dst += (size_t)batch_idx * batch_stride_d;
++
++    float acc[TN][TM];
 +    #pragma unroll
-     for (int i = 0; i < TM * TN; i++) {
-         sums[i] = 0.0f;
-     }
-@@ -113,15 +120,23 @@ kernel void kernel_mul_mm_f16_f32_l4_lm(
-         pos_a += BK / LOAD_VEC_A;
-         pos_b += BK / LOAD_VEC_B;
- 
-+        // Without the unroll pragmas the Adreno compiler keeps sums[]/cache_*[]
-+        // in scratch memory (CL_KERNEL_PRIVATE_MEM_SIZE = 472 bytes), turning
-+        // every accumulate into a global load-store pair and capping the kernel
-+        // at ~9 GFLOPS on a device that does 473.
-         for (int i = 0; i < BK; i++) {
-+            #pragma unroll
-             for (int j = 0; j < TM; j++) {
-                 cache_a[j] = buf_a[(i) * BM + th_r * TM + j];
-             }
-+            #pragma unroll
-             for (int j = 0; j < TN; j++) {
-                 cache_b[j] = buf_b[(i) * BN + th_c * TN + j];
-             }
- 
-+            #pragma unroll
-             for (int cc = 0; cc < TN; cc++) {
-+                #pragma unroll
-                 for (int cr = 0; cr < TM; cr++) {
-                     const int sums_idx = cc*TM + cr;
-                     sums[sums_idx] = mad(convert_float(cache_a[cr]), cache_b[cc], sums[sums_idx]);
-@@ -136,7 +151,9 @@ kernel void kernel_mul_mm_f16_f32_l4_lm(
- 
-     const int offsets = batch_idx * batch_stride_d;
- 
-+    #pragma unroll
-     for (int cc = 0; cc < TN; cc++) {
++    for (int n = 0; n < TN; ++n) {
 +        #pragma unroll
-         for (int cr = 0; cr < TM; cr++) {
-             if (dr + cr < ne01 && dc + cc < ne11) {
-                 dst[offsets + (dc + cc) * stride_d + dr + cr] = sums[cc * TM + cr];
++        for (int m = 0; m < TM; ++m) acc[n][m] = 0.0f;
+     }
+ 
+-    for (int block = 0; block < ne00; block += BK) {
+-        for (int l = 0; l < BM; l += loadstride_a) {
+-            if (ir*BM + loadc_a + l < ne01) {
+-                const int idx = pos_a + (loadc_a + l) * stride_a / LOAD_VEC_A + loadr_a;
+-                buf_a[(loadr_a * LOAD_VEC_A + 0) * BM + loadc_a + l] = src0[idx].s0;
+-                buf_a[(loadr_a * LOAD_VEC_A + 1) * BM + loadc_a + l] = src0[idx].s1;
+-                buf_a[(loadr_a * LOAD_VEC_A + 2) * BM + loadc_a + l] = src0[idx].s2;
+-                buf_a[(loadr_a * LOAD_VEC_A + 3) * BM + loadc_a + l] = src0[idx].s3;
+-            } else {
+-                buf_a[(loadr_a * LOAD_VEC_A + 0) * BM + loadc_a + l] = 0.0h;
+-                buf_a[(loadr_a * LOAD_VEC_A + 1) * BM + loadc_a + l] = 0.0h;
+-                buf_a[(loadr_a * LOAD_VEC_A + 2) * BM + loadc_a + l] = 0.0h;
+-                buf_a[(loadr_a * LOAD_VEC_A + 3) * BM + loadc_a + l] = 0.0h;
++    for (int k = 0; k < K; ++k) {
++        const float8 a = convert_float8(vload8(0, lhs + (size_t)k * Mp + m0));
++        const float av[TM] = { a.s0, a.s1, a.s2, a.s3, a.s4, a.s5, a.s6, a.s7 };
++        #pragma unroll
++        for (int n = 0; n < TN; ++n) {
++            const float b = n0 + n < N ? rhs[(size_t)(n0 + n) * stride_b + k] : 0.0f;
++            #pragma unroll
++            for (int m = 0; m < TM; ++m) {
++                acc[n][m] = mad(av[m], b, acc[n][m]);
+             }
+         }
+-
+-        for (int l = 0; l < BN; l += loadstride_b) {
+-            if (ic*BN + loadc_b + l < ne11) {
+-                const int idx = pos_b + (loadc_b + l) * stride_b / LOAD_VEC_B + loadr_b;
+-                buf_b[(loadr_b * LOAD_VEC_B + 0) * BN + loadc_b + l] = src1[idx].s0;
+-                buf_b[(loadr_b * LOAD_VEC_B + 1) * BN + loadc_b + l] = src1[idx].s1;
+-                buf_b[(loadr_b * LOAD_VEC_B + 2) * BN + loadc_b + l] = src1[idx].s2;
+-                buf_b[(loadr_b * LOAD_VEC_B + 3) * BN + loadc_b + l] = src1[idx].s3;
+-            } else {
+-                buf_b[(loadr_b * LOAD_VEC_B + 0) * BN + loadc_b + l] = 0.0h;
+-                buf_b[(loadr_b * LOAD_VEC_B + 1) * BN + loadc_b + l] = 0.0h;
+-                buf_b[(loadr_b * LOAD_VEC_B + 2) * BN + loadc_b + l] = 0.0h;
+-                buf_b[(loadr_b * LOAD_VEC_B + 3) * BN + loadc_b + l] = 0.0h;
+-            }
+-        }
+-
+-        barrier(CLK_LOCAL_MEM_FENCE);
+-
+-        pos_a += BK / LOAD_VEC_A;
+-        pos_b += BK / LOAD_VEC_B;
+-
+-        for (int i = 0; i < BK; i++) {
+-            for (int j = 0; j < TM; j++) {
+-                cache_a[j] = buf_a[(i) * BM + th_r * TM + j];
+-            }
+-            for (int j = 0; j < TN; j++) {
+-                cache_b[j] = buf_b[(i) * BN + th_c * TN + j];
+-            }
+-
+-            for (int cc = 0; cc < TN; cc++) {
+-                for (int cr = 0; cr < TM; cr++) {
+-                    const int sums_idx = cc*TM + cr;
+-                    sums[sums_idx] = mad(convert_float(cache_a[cr]), cache_b[cc], sums[sums_idx]);
+-                }
+-            }
+-        }
+-        barrier(CLK_LOCAL_MEM_FENCE);
+     }
+ 
+-    const int dr = ir * BM + th_r * TM;
+-    const int dc = ic * BN + th_c * TN;
+-
+-    const int offsets = batch_idx * batch_stride_d;
+-
+-    for (int cc = 0; cc < TN; cc++) {
+-        for (int cr = 0; cr < TM; cr++) {
+-            if (dr + cr < ne01 && dc + cc < ne11) {
+-                dst[offsets + (dc + cc) * stride_d + dr + cr] = sums[cc * TM + cr];
++    #pragma unroll
++    for (int n = 0; n < TN; ++n) {
++        if (n0 + n >= N) continue;
++        global float * out = dst + (size_t)(n0 + n) * stride_d + m0;
++        if (m0 + TM <= M) {
++            #pragma unroll
++            for (int m = 0; m < TM; ++m) out[m] = acc[n][m];
++        } else {
++            #pragma unroll
++            for (int m = 0; m < TM; ++m) {
++                if (m0 + m < M) out[m] = acc[n][m];
+             }
+         }
+     }
+ }
++
++// Repack each lhs matrix [K, M] -> [M, K], padding M to Mp. Model weights are
++// immutable, so the backend runs this once and caches the result.
++kernel void kernel_mul_mm_f16_repack(
++    global const half * src,
++    ulong               off_src,
++    global       half * dst,
++    ulong               off_dst,
++    int K, int M, int Mp
++) {
++    src = (global const half *)((global const char *)src + off_src);
++    dst = (global       half *)((global       char *)dst + off_dst);
++
++    const int m = (int)get_global_id(0);
++    const int k = (int)get_global_id(1);
++    const int b = (int)get_global_id(2);
++    if (m >= Mp || k >= K) return;
++    dst[((size_t)b * K + k) * Mp + m] = m < M
++        ? src[((size_t)b * M + m) * K + k]
++        : (half)0.0f;
++}
 diff --git a/src/ggml-opencl/kernels/sin.cl b/src/ggml-opencl/kernels/sin.cl
 new file mode 100644
 index 00000000..5b3f6f09
@@ -847,3 +1986,30 @@ index 00000000..5b3f6f09
 +    uint gid = get_global_id(0);
 +    dst[gid] = convert_half4(cos(convert_float4(src0[gid])));
 +}
+diff --git a/src/ggml-opencl/kernels/sub.cl b/src/ggml-opencl/kernels/sub.cl
+index 423ed595..d1729ab9 100644
+--- a/src/ggml-opencl/kernels/sub.cl
++++ b/src/ggml-opencl/kernels/sub.cl
+@@ -50,6 +50,22 @@ kernel void kernel_sub(
+     }
+ }
+ 
++kernel void kernel_sub_flat(
++        global const float * src0, ulong offset0,
++        global const float * src1, ulong offset1,
++        global       float * dst,  ulong offsetd,
++        ulong ne) {
++    src0 = (global const float *)((global const char *)src0 + offset0);
++    src1 = (global const float *)((global const char *)src1 + offset1);
++    dst  = (global       float *)((global       char *)dst  + offsetd);
++    const size_t i = get_global_id(0)*4;
++    if (i + 4 <= ne) {
++        vstore4(vload4(0, src0 + i) - vload4(0, src1 + i), 0, dst + i);
++    } else {
++        for (size_t j = i; j < ne; ++j) dst[j] = src0[j] - src1[j];
++    }
++}
++
+ // assumption: src1 is a row
+ // broadcast src1 into src0
+ kernel void kernel_sub_row(
