@@ -1,0 +1,849 @@
+diff --git a/src/ggml-opencl/CMakeLists.txt b/src/ggml-opencl/CMakeLists.txt
+index 1f62ce1c..b5edc8eb 100644
+--- a/src/ggml-opencl/CMakeLists.txt
++++ b/src/ggml-opencl/CMakeLists.txt
+@@ -200,6 +200,7 @@ set(GGML_OPENCL_KERNELS
+     softmax_4_f16
+     softmax_f32
+     softmax_f16
++    sin
+     sqr
+     sqrt
+     ssm_conv
+@@ -221,6 +222,7 @@ set(GGML_OPENCL_KERNELS
+     repeat
+     mul_mat_f16_f32
+     mul_mm_f16_f32_kq_kqv
++    conv1d
+     conv2d
+     conv2d_f16_f32
+     flash_attn_pre_f16
+diff --git a/src/ggml-opencl/ggml-opencl.cpp b/src/ggml-opencl/ggml-opencl.cpp
+index 64f3325b..e2cb79a9 100644
+--- a/src/ggml-opencl/ggml-opencl.cpp
++++ b/src/ggml-opencl/ggml-opencl.cpp
+@@ -76,6 +76,13 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
+ 
+ static bool ggml_cl_is_q4_0_soa(const ggml_tensor * tensor);
+ static bool ggml_cl_is_q8_0_soa(const ggml_tensor * tensor);
++// Block tile of kernel_mul_mm_f16_f32_l4_lm; keep in sync with the #defines at
++// the top of kernels/mul_mm_f16_f32_l4_lm.cl.
++#define MUL_MM_F16_F32_BM 32
++#define MUL_MM_F16_F32_BN 64
++#define MUL_MM_F16_F32_TM 8
++#define MUL_MM_F16_F32_TN 4
++
+ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+ 
+ // See https://gmplib.org/~tege/divcnst-pldi94.pdf figure 4.1.
+@@ -732,6 +739,9 @@ struct ggml_backend_opencl_context {
+     cl_kernel kernel_add_id;
+     cl_kernel kernel_add_id_add_id_swiglu_oai;
+     cl_kernel kernel_scale_f32, kernel_scale_f32_4;
++    cl_kernel kernel_add_col, kernel_mul_col, kernel_div_col;
++    cl_kernel kernel_sin_cont_f32, kernel_sin_cont_f32_4, kernel_sin_cont_f16, kernel_sin_cont_f16_4;
++    cl_kernel kernel_cos_cont_f32, kernel_cos_cont_f32_4, kernel_cos_cont_f16, kernel_cos_cont_f16_4;
+     cl_kernel kernel_sqr_cont_f32, kernel_sqr_cont_f32_4, kernel_sqr_cont_f16, kernel_sqr_cont_f16_4;
+     cl_kernel kernel_sqrt_cont_f32, kernel_sqrt_cont_f32_4, kernel_sqrt_cont_f16, kernel_sqrt_cont_f16_4;
+     cl_kernel kernel_mean_f32, kernel_mean_f32_4;
+@@ -869,6 +879,7 @@ struct ggml_backend_opencl_context {
+     cl_kernel kernel_upscale;
+     cl_kernel kernel_upscale_bilinear;
+     cl_kernel kernel_concat_f32, kernel_concat_f32_pack;
++    cl_kernel kernel_conv_1d_f16_f32;
+     cl_kernel kernel_conv_2d_f16;
+     cl_kernel kernel_conv_2d_f32;
+     cl_kernel kernel_conv_2d_f16_f32;
+@@ -1334,6 +1345,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+ 
+         CL_CHECK((backend_ctx->kernel_add         = clCreateKernel(backend_ctx->program_add, "kernel_add", &err), err));
+         CL_CHECK((backend_ctx->kernel_add_row     = clCreateKernel(backend_ctx->program_add, "kernel_add_row", &err), err));
++        CL_CHECK((backend_ctx->kernel_add_col     = clCreateKernel(backend_ctx->program_add, "kernel_add_col", &err), err));
+         CL_CHECK((backend_ctx->kernel_add_f16     = clCreateKernel(backend_ctx->program_add, "kernel_add_f16", &err), err));
+         CL_CHECK((backend_ctx->kernel_add_row_f16 = clCreateKernel(backend_ctx->program_add, "kernel_add_row_f16", &err), err));
+         GGML_LOG_CONT(".");
+@@ -2507,6 +2519,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+ 
+         CL_CHECK((backend_ctx->kernel_mul         = clCreateKernel(backend_ctx->program_mul, "kernel_mul", &err), err));
+         CL_CHECK((backend_ctx->kernel_mul_row     = clCreateKernel(backend_ctx->program_mul, "kernel_mul_row", &err), err));
++        CL_CHECK((backend_ctx->kernel_mul_col     = clCreateKernel(backend_ctx->program_mul, "kernel_mul_col", &err), err));
+         CL_CHECK((backend_ctx->kernel_mul_f16     = clCreateKernel(backend_ctx->program_mul, "kernel_mul_f16", &err), err));
+         CL_CHECK((backend_ctx->kernel_mul_row_f16 = clCreateKernel(backend_ctx->program_mul, "kernel_mul_row_f16", &err), err));
+         GGML_LOG_CONT(".");
+@@ -2718,11 +2731,37 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+ 
+         CL_CHECK((backend_ctx->kernel_div         = clCreateKernel(backend_ctx->program_div, "kernel_div", &err), err));
+         CL_CHECK((backend_ctx->kernel_div_row     = clCreateKernel(backend_ctx->program_div, "kernel_div_row", &err), err));
++        CL_CHECK((backend_ctx->kernel_div_col     = clCreateKernel(backend_ctx->program_div, "kernel_div_col", &err), err));
+         CL_CHECK((backend_ctx->kernel_div_f16     = clCreateKernel(backend_ctx->program_div, "kernel_div_f16", &err), err));
+         CL_CHECK((backend_ctx->kernel_div_row_f16 = clCreateKernel(backend_ctx->program_div, "kernel_div_row_f16", &err), err));
+         GGML_LOG_CONT(".");
+     }
+ 
++    // sin / cos
++    {
++#ifdef GGML_OPENCL_EMBED_KERNELS
++        const std::string kernel_src {
++            #include "sin.cl.h"
++        };
++#else
++        const std::string kernel_src = read_file("sin.cl");
++#endif
++        cl_program prog =
++            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
++
++        CL_CHECK((backend_ctx->kernel_sin_cont_f32   = clCreateKernel(prog, "kernel_sin_cont_f32", &err), err));
++        CL_CHECK((backend_ctx->kernel_sin_cont_f32_4 = clCreateKernel(prog, "kernel_sin_cont_f32_4", &err), err));
++        CL_CHECK((backend_ctx->kernel_sin_cont_f16   = clCreateKernel(prog, "kernel_sin_cont_f16", &err), err));
++        CL_CHECK((backend_ctx->kernel_sin_cont_f16_4 = clCreateKernel(prog, "kernel_sin_cont_f16_4", &err), err));
++        CL_CHECK((backend_ctx->kernel_cos_cont_f32   = clCreateKernel(prog, "kernel_cos_cont_f32", &err), err));
++        CL_CHECK((backend_ctx->kernel_cos_cont_f32_4 = clCreateKernel(prog, "kernel_cos_cont_f32_4", &err), err));
++        CL_CHECK((backend_ctx->kernel_cos_cont_f16   = clCreateKernel(prog, "kernel_cos_cont_f16", &err), err));
++        CL_CHECK((backend_ctx->kernel_cos_cont_f16_4 = clCreateKernel(prog, "kernel_cos_cont_f16_4", &err), err));
++
++        CL_CHECK(clReleaseProgram(prog));
++        GGML_LOG_CONT(".");
++    }
++
+     // sqr
+     {
+ #ifdef GGML_OPENCL_EMBED_KERNELS
+@@ -3133,6 +3172,27 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+         GGML_LOG_CONT(".");
+     }
+ 
++    // conv1d
++    {
++#ifdef GGML_OPENCL_EMBED_KERNELS
++        const std::string kernel_src {
++            #include "conv1d.cl.h"
++        };
++#else
++        const std::string kernel_src = read_file("conv1d.cl");
++#endif
++        // Tile and workgroup shape chosen by sweep on an Adreno 630
++        // (scripts/clbench in the droid repo): VEC=4 time steps x TS_K=16
++        // output channels per work item, 16x4 work items per group.
++        const std::string opts = std::string(compile_opts) + " -DVEC=4 -DTS_K=16";
++        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
++
++        CL_CHECK((backend_ctx->kernel_conv_1d_f16_f32 = clCreateKernel(prog, "kernel_conv_1d", &err), err));
++
++        CL_CHECK(clReleaseProgram(prog));
++        GGML_LOG_CONT(".");
++    }
++
+     // conv2d
+     {
+         #ifdef GGML_OPENCL_EMBED_KERNELS
+@@ -7622,6 +7682,8 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+                    (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16);
+         case GGML_OP_ADD_ID:
+             return op->src[0]->type == GGML_TYPE_F32;
++        case GGML_OP_SIN:
++        case GGML_OP_COS:
+         case GGML_OP_SQR:
+         case GGML_OP_SQRT:
+             return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
+@@ -11912,6 +11974,44 @@ static void ggml_cl_set_rows(ggml_backend_t backend, const ggml_tensor * src0, c
+     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+ }
+ 
++// True when src1 holds exactly one f32 scalar per row of src0 -- ggml's
++// broadcast along dim 0. kernel_<op>_col handles that case as a contiguous
++// float4 stream instead of the generic per-element `i0 % ne10` walk.
++static bool ggml_cl_can_bcast_col(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
++    return src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
++           src1->ne[0] == 1 &&
++           ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
++           ggml_are_same_shape(src0, dst) &&
++           ggml_nelements(src1) == src0->ne[1]*src0->ne[2]*src0->ne[3];
++}
++
++static void ggml_cl_bcast_col(ggml_backend_t backend, cl_kernel kernel,
++                              const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *)backend->context;
++
++    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
++    ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
++    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
++
++    cl_ulong offset0 = extra0->offset + src0->view_offs;
++    cl_ulong offset1 = extra1->offset + src1->view_offs;
++    cl_ulong offsetd = extrad->offset + dst->view_offs;
++
++    const int ne00 = (int)src0->ne[0];
++    const size_t nrows = (size_t)(src0->ne[1]*src0->ne[2]*src0->ne[3]);
++
++    CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra0->data_device));
++    CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &offset0));
++    CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extra1->data_device));
++    CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_ulong), &offset1));
++    CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem),   &extrad->data_device));
++    CL_CHECK(clSetKernelArg(kernel, 5, sizeof(cl_ulong), &offsetd));
++    CL_CHECK(clSetKernelArg(kernel, 6, sizeof(int),      &ne00));
++
++    size_t global_work_size[] = { (size_t)((ne00 + 3)/4), nrows, 1 };
++    backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, nullptr, dst);
++}
++
+ static void ggml_cl_add(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     GGML_ASSERT(src0);
+     GGML_ASSERT(src0->extra);
+@@ -11960,6 +12060,11 @@ static void ggml_cl_add(ggml_backend_t backend, const ggml_tensor * src0, const
+     cl_ulong offset1 = extra1->offset + src1->view_offs;
+     cl_ulong offsetd = extrad->offset + dst->view_offs;
+ 
++    if (ggml_cl_can_bcast_col(src0, src1, dst)) {
++        ggml_cl_bcast_col(backend, backend_ctx->kernel_add_col, src0, src1, dst);
++        return;
++    }
++
+     cl_kernel kernel;
+ 
+     const bool bcast_row = ggml_nelements(src1) == ne10 && ggml_is_contiguous(src1) && ne00 % 4 == 0 && ne10 % 4 == 0;
+@@ -12211,6 +12316,11 @@ static void ggml_cl_mul(ggml_backend_t backend, const ggml_tensor * src0, const
+     cl_ulong offset1 = extra1->offset + src1->view_offs;
+     cl_ulong offsetd = extrad->offset + dst->view_offs;
+ 
++    if (ggml_cl_can_bcast_col(src0, src1, dst)) {
++        ggml_cl_bcast_col(backend, backend_ctx->kernel_mul_col, src0, src1, dst);
++        return;
++    }
++
+     bool bcast_row = false;
+     cl_kernel kernel;
+ 
+@@ -12344,6 +12454,11 @@ static void ggml_cl_div(ggml_backend_t backend, const ggml_tensor * src0, const
+     cl_ulong offset1 = extra1->offset + src1->view_offs;
+     cl_ulong offsetd = extrad->offset + dst->view_offs;
+ 
++    if (ggml_cl_can_bcast_col(src0, src1, dst)) {
++        ggml_cl_bcast_col(backend, backend_ctx->kernel_div_col, src0, src1, dst);
++        return;
++    }
++
+     bool bcast_row = false;
+     cl_kernel kernel;
+ 
+@@ -12537,6 +12652,106 @@ static void ggml_cl_sub(ggml_backend_t backend, const ggml_tensor * src0, const
+     }
+ }
+ 
++static void ggml_cl_sin(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++    GGML_ASSERT(src0);
++    GGML_ASSERT(src0->extra);
++    GGML_ASSERT(dst);
++    GGML_ASSERT(dst->extra);
++    UNUSED(src1);
++
++    ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
++
++    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
++    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
++
++    cl_ulong offset0 = extra0->offset + src0->view_offs;
++    cl_ulong offsetd = extrad->offset + dst->view_offs;
++
++    cl_kernel kernel;
++
++    // Currently assumes src0 is contiguous
++    int n = ggml_nelements(dst);
++    if (n % 4 == 0) {
++        if (src0->type == GGML_TYPE_F32) {
++            kernel = backend_ctx->kernel_sin_cont_f32_4;
++        } else {
++            kernel = backend_ctx->kernel_sin_cont_f16_4;
++        }
++        n /= 4;
++    } else {
++        if (src0->type == GGML_TYPE_F32) {
++            kernel = backend_ctx->kernel_sin_cont_f32;
++        } else {
++            kernel = backend_ctx->kernel_sin_cont_f16;
++        }
++    }
++
++    CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra0->data_device));
++    CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &offset0));
++    CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extrad->data_device));
++    CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_ulong), &offsetd));
++
++    size_t global_work_size[] = {(size_t)n, 1, 1};
++    size_t local_work_size[] = {64, 1, 1};
++
++    size_t * local_work_size_ptr = local_work_size;
++    if (n % 64 != 0 && !backend_ctx->non_uniform_workgroups) {
++        local_work_size_ptr = nullptr;
++    }
++
++    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size_ptr, dst);
++}
++
++static void ggml_cl_cos(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++    GGML_ASSERT(src0);
++    GGML_ASSERT(src0->extra);
++    GGML_ASSERT(dst);
++    GGML_ASSERT(dst->extra);
++    UNUSED(src1);
++
++    ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
++
++    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
++    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
++
++    cl_ulong offset0 = extra0->offset + src0->view_offs;
++    cl_ulong offsetd = extrad->offset + dst->view_offs;
++
++    cl_kernel kernel;
++
++    // Currently assumes src0 is contiguous
++    int n = ggml_nelements(dst);
++    if (n % 4 == 0) {
++        if (src0->type == GGML_TYPE_F32) {
++            kernel = backend_ctx->kernel_cos_cont_f32_4;
++        } else {
++            kernel = backend_ctx->kernel_cos_cont_f16_4;
++        }
++        n /= 4;
++    } else {
++        if (src0->type == GGML_TYPE_F32) {
++            kernel = backend_ctx->kernel_cos_cont_f32;
++        } else {
++            kernel = backend_ctx->kernel_cos_cont_f16;
++        }
++    }
++
++    CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra0->data_device));
++    CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &offset0));
++    CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extrad->data_device));
++    CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_ulong), &offsetd));
++
++    size_t global_work_size[] = {(size_t)n, 1, 1};
++    size_t local_work_size[] = {64, 1, 1};
++
++    size_t * local_work_size_ptr = local_work_size;
++    if (n % 64 != 0 && !backend_ctx->non_uniform_workgroups) {
++        local_work_size_ptr = nullptr;
++    }
++
++    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size_ptr, dst);
++}
++
+ static void ggml_cl_sqr(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     GGML_ASSERT(src0);
+     GGML_ASSERT(src0->extra);
+@@ -16157,6 +16372,45 @@ static void ggml_cl_conv_2d(ggml_backend_t backend, const ggml_tensor * src0, co
+ 
+     const int64_t NPQ = (int64_t)N * OW * OH;
+ 
++    // A 1D convolution reaches here as a 2D one with KH = OH = H = 1. For that
++    // shape kernel_conv_1d is about twice as fast as kernel_conv_2d on Adreno:
++    // it holds the output tile in registers instead of staging both operands
++    // through local memory, which is not a fast scratchpad on this GPU. TS_K
++    // is baked into the program, so a Cout that is not a multiple of it keeps
++    // the general path.
++    if (KH == 1 && OH == 1 && H == 1 && N == 1 && (Cout % 16) == 0 &&
++        src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F32 &&
++        ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
++        const int VEC = 4;
++        const int TS_K_1D = 16;
++        const size_t LWS0 = 16, LWS1 = 4;
++
++        cl_kernel k1d = backend_ctx->kernel_conv_1d_f16_f32;
++        const int i_Cout = (int)Cout, i_Cin = (int)Cin, i_KW = (int)KW;
++        const int i_W = (int)W, i_OW = (int)OW;
++        const int i_s0 = (int)s0, i_p0 = (int)p0, i_d0 = (int)d0;
++
++        cl_uint a = 0;
++        CL_CHECK(clSetKernelArg(k1d, a++, sizeof(cl_mem),   &extra0->data_device));
++        CL_CHECK(clSetKernelArg(k1d, a++, sizeof(cl_ulong), &offset0));
++        CL_CHECK(clSetKernelArg(k1d, a++, sizeof(cl_mem),   &extra1->data_device));
++        CL_CHECK(clSetKernelArg(k1d, a++, sizeof(cl_ulong), &offset1));
++        CL_CHECK(clSetKernelArg(k1d, a++, sizeof(cl_mem),   &extrad->data_device));
++        CL_CHECK(clSetKernelArg(k1d, a++, sizeof(cl_ulong), &offsetd));
++        for (int v : { i_Cout, i_Cin, i_KW, i_W, i_OW, i_s0, i_p0, i_d0 }) {
++            CL_CHECK(clSetKernelArg(k1d, a++, sizeof(int), &v));
++        }
++
++        // Round the grid up to the workgroup; the kernel guards its own tail.
++        size_t lws1d[2] = { LWS0, LWS1 };
++        size_t gws1d[2] = {
++            CEIL_DIV((size_t)((OW + VEC - 1) / VEC), LWS0) * LWS0,
++            CEIL_DIV((size_t)(Cout / TS_K_1D), LWS1) * LWS1,
++        };
++        backend_ctx->enqueue_ndrange_kernel(k1d, 2, gws1d, lws1d, dst);
++        return;
++    }
++
+     const uint32_t BS_K = 64;
+     const uint32_t BS_NPQ = 64;
+     const uint32_t BS_CRS = 16;
+@@ -19575,7 +19829,8 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+                 }
+ #endif
+                 kernel = backend_ctx->kernel_mul_mm_f16_f32_l4_lm;
+-                nth0 = 128; // calculated as (BM*BN)/(TM*TN)
++                // Must track the BM/BN/TM/TN in mul_mm_f16_f32_l4_lm.cl.
++                nth0 = (MUL_MM_F16_F32_BM/MUL_MM_F16_F32_TM) * (MUL_MM_F16_F32_BN/MUL_MM_F16_F32_TN);
+ 
+                 int batch_stride_a = ne00*ne01;
+                 int batch_stride_b = ne10*ne11;
+@@ -19633,8 +19888,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+                 CL_CHECK(clSetKernelArg(kernel, 17, sizeof(int),      &r2));
+                 CL_CHECK(clSetKernelArg(kernel, 18, sizeof(int),      &r3));
+ 
+-                // 64 is block tile size BM and BN - change here when BM and BN in the kernel are changed.
+-                size_t global_work_size[] = {(size_t)(CEIL_DIV(ne01, 64)*nth0), (size_t)(CEIL_DIV(ne11, 64)), (size_t)ne12*ne13};
++                size_t global_work_size[] = {(size_t)(CEIL_DIV(ne01, MUL_MM_F16_F32_BM)*nth0), (size_t)(CEIL_DIV(ne11, MUL_MM_F16_F32_BN)), (size_t)ne12*ne13};
+                 size_t local_work_size[] = {(size_t)nth0, 1, 1};
+ 
+                 backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+@@ -25148,6 +25402,18 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
+             }
+             func = ggml_cl_sub;
+             break;
++        case GGML_OP_SIN:
++            if (!any_on_device) {
++                return false;
++            }
++            func = ggml_cl_sin;
++            break;
++        case GGML_OP_COS:
++            if (!any_on_device) {
++                return false;
++            }
++            func = ggml_cl_cos;
++            break;
+         case GGML_OP_SQR:
+             if (!any_on_device) {
+                 return false;
+diff --git a/src/ggml-opencl/kernels/add.cl b/src/ggml-opencl/kernels/add.cl
+index 509bf173..3e562fb3 100644
+--- a/src/ggml-opencl/kernels/add.cl
++++ b/src/ggml-opencl/kernels/add.cl
+@@ -188,3 +188,41 @@ kernel void kernel_add_row_f16(
+ 
+     dst[gid] = v0 + v1;
+ }
++
++// src1 broadcasts along dim 0: one scalar per row of src0. The generic kernel
++// handles this correctly but reads src1 with an `i0 % ne10` per element and
++// works one scalar at a time, which measured ~5x off memory bandwidth on
++// Adreno. Kokoro leans on this shape heavily -- every AdaIN scale and every
++// conv bias is a [1, C] operand over a [T, C] tensor, and those rows are odd
++// lengths (15961, 2660), so the tail is handled rather than required away.
++kernel void kernel_add_col(
++        global float * src0,
++        ulong  offset0,
++        global float * src1,
++        ulong  offset1,
++        global float * dst,
++        ulong  offsetd,
++        int    ne00
++) {
++    src0 = (global float*)((global char*)src0 + offset0);
++    src1 = (global float*)((global char*)src1 + offset1);
++    dst  = (global float*)((global char*)dst  + offsetd);
++
++    const int i0 = get_global_id(0)*4;
++    const int i1 = get_global_id(1);
++    if (i0 >= ne00) {
++        return;
++    }
++
++    const float s = src1[i1];
++    global float * a = src0 + (size_t)i1*ne00;
++    global float * d = dst  + (size_t)i1*ne00;
++
++    if (i0 + 4 <= ne00) {
++        vstore4(vload4(0, a + i0) + s, 0, d + i0);
++    } else {
++        for (int j = i0; j < ne00; ++j) {
++            d[j] = a[j] + s;
++        }
++    }
++}
+diff --git a/src/ggml-opencl/kernels/conv1d.cl b/src/ggml-opencl/kernels/conv1d.cl
+new file mode 100644
+index 00000000..57912e4c
+--- /dev/null
++++ b/src/ggml-opencl/kernels/conv1d.cl
+@@ -0,0 +1,99 @@
++#pragma OPENCL EXTENSION cl_khr_fp16 : enable
++
++// Direct 1D convolution for the Kokoro vocoder, written for Adreno.
++//
++// ggml's kernel_conv_2d stages both operands through `local` memory with two
++// barriers per K-block. That is the right shape for a desktop GPU and the
++// wrong one here: Adreno has no fast local scratchpad, and that kernel
++// measures ~19 GFLOPS on a device that does 473. This one holds the whole
++// output tile in registers, issues no barrier, and lets the L1 cache do the
++// sharing -- adjacent work items read overlapping input windows, and every
++// work item along the time axis reads the same weights.
++//
++// Reads ggml's tensors as they are, no repacking:
++//   src [W, 1, Cin] f32, knl [KW, 1, Cin, Cout] f16, dst [OW, 1, Cout] f32,
++// first axis contiguous in each. One work item produces VEC consecutive time
++// steps for TS_K output channels.
++
++#ifndef VEC
++#define VEC 4           // time steps per work item
++#endif
++#ifndef TS_K
++#define TS_K 16         // output channels per work item
++#endif
++
++kernel void kernel_conv_1d(
++    global const half  * knl,
++    ulong                off_knl,
++    global const float * src,
++    ulong                off_src,
++    global       float * dst,
++    ulong                off_dst,
++    int Cout, int Cin,
++    int KW, int W, int OW,
++    int s0, int p0, int d0
++) {
++    knl = (global const half  *)((global const char *)knl + off_knl);
++    src = (global const float *)((global const char *)src + off_src);
++    dst = (global       float *)((global       char *)dst + off_dst);
++
++    const int t0 = (int)get_global_id(0) * VEC;
++    const int c0 = (int)get_global_id(1) * TS_K;
++    if (t0 >= OW || c0 >= Cout) {
++        return;
++    }
++
++    float acc[TS_K][VEC];
++    #pragma unroll
++    for (int k = 0; k < TS_K; ++k) {
++        #pragma unroll
++        for (int v = 0; v < VEC; ++v) {
++            acc[k][v] = 0.0f;
++        }
++    }
++
++    // Interior work items skip the per-tap bounds test. Only the first and
++    // last few of each row take the guarded path.
++    const int lo = t0 * s0 - p0;
++    const int hi = (t0 + VEC - 1) * s0 - p0 + (KW - 1) * d0;
++    const bool interior = (lo >= 0) && (hi < W) && (t0 + VEC <= OW);
++
++    for (int ci = 0; ci < Cin; ++ci) {
++        global const float * xrow = src + (size_t)ci * W;
++        global const half  * wcol = knl + (size_t)ci * KW + (size_t)c0 * KW * Cin;
++
++        for (int kw = 0; kw < KW; ++kw) {
++            float x[VEC];
++            if (interior) {
++                #pragma unroll
++                for (int v = 0; v < VEC; ++v) {
++                    x[v] = xrow[lo + v * s0 + kw * d0];
++                }
++            } else {
++                #pragma unroll
++                for (int v = 0; v < VEC; ++v) {
++                    const int idx = (t0 + v) * s0 - p0 + kw * d0;
++                    x[v] = (idx >= 0 && idx < W) ? xrow[idx] : 0.0f;
++                }
++            }
++
++            #pragma unroll
++            for (int k = 0; k < TS_K; ++k) {
++                const float w = (float)wcol[kw + (size_t)k * KW * Cin];
++                #pragma unroll
++                for (int v = 0; v < VEC; ++v) {
++                    acc[k][v] = mad(w, x[v], acc[k][v]);
++                }
++            }
++        }
++    }
++
++    #pragma unroll
++    for (int k = 0; k < TS_K; ++k) {
++        global float * out = dst + (size_t)(c0 + k) * OW;
++        #pragma unroll
++        for (int v = 0; v < VEC; ++v) {
++            if (t0 + v < OW) out[t0 + v] = acc[k][v];
++        }
++    }
++}
+diff --git a/src/ggml-opencl/kernels/div.cl b/src/ggml-opencl/kernels/div.cl
+index 6d9b4ade..20cbb68a 100644
+--- a/src/ggml-opencl/kernels/div.cl
++++ b/src/ggml-opencl/kernels/div.cl
+@@ -136,3 +136,41 @@ kernel void kernel_div_row_f16(
+     uint idx1 = gid - (gid/ne)*ne; // get_global_id(0) % ne
+     dst[gid] = src0[gid] / src1[idx1];
+ }
++
++// src1 broadcasts along dim 0: one scalar per row of src0. The generic kernel
++// handles this correctly but reads src1 with an `i0 % ne10` per element and
++// works one scalar at a time, which measured ~5x off memory bandwidth on
++// Adreno. Kokoro leans on this shape heavily -- every AdaIN scale and every
++// conv bias is a [1, C] operand over a [T, C] tensor, and those rows are odd
++// lengths (15961, 2660), so the tail is handled rather than required away.
++kernel void kernel_div_col(
++        global float * src0,
++        ulong  offset0,
++        global float * src1,
++        ulong  offset1,
++        global float * dst,
++        ulong  offsetd,
++        int    ne00
++) {
++    src0 = (global float*)((global char*)src0 + offset0);
++    src1 = (global float*)((global char*)src1 + offset1);
++    dst  = (global float*)((global char*)dst  + offsetd);
++
++    const int i0 = get_global_id(0)*4;
++    const int i1 = get_global_id(1);
++    if (i0 >= ne00) {
++        return;
++    }
++
++    const float s = src1[i1];
++    global float * a = src0 + (size_t)i1*ne00;
++    global float * d = dst  + (size_t)i1*ne00;
++
++    if (i0 + 4 <= ne00) {
++        vstore4(vload4(0, a + i0) / s, 0, d + i0);
++    } else {
++        for (int j = i0; j < ne00; ++j) {
++            d[j] = a[j] / s;
++        }
++    }
++}
+diff --git a/src/ggml-opencl/kernels/mul.cl b/src/ggml-opencl/kernels/mul.cl
+index b12a5921..869076e2 100644
+--- a/src/ggml-opencl/kernels/mul.cl
++++ b/src/ggml-opencl/kernels/mul.cl
+@@ -150,3 +150,41 @@ kernel void kernel_mul_row_f16(
+     uint idx1 = gid - (gid/ne)*ne; // get_global_id(0) % ne
+     dst[gid] = src0[gid] * src1[idx1];
+ }
++
++// src1 broadcasts along dim 0: one scalar per row of src0. The generic kernel
++// handles this correctly but reads src1 with an `i0 % ne10` per element and
++// works one scalar at a time, which measured ~5x off memory bandwidth on
++// Adreno. Kokoro leans on this shape heavily -- every AdaIN scale and every
++// conv bias is a [1, C] operand over a [T, C] tensor, and those rows are odd
++// lengths (15961, 2660), so the tail is handled rather than required away.
++kernel void kernel_mul_col(
++        global float * src0,
++        ulong  offset0,
++        global float * src1,
++        ulong  offset1,
++        global float * dst,
++        ulong  offsetd,
++        int    ne00
++) {
++    src0 = (global float*)((global char*)src0 + offset0);
++    src1 = (global float*)((global char*)src1 + offset1);
++    dst  = (global float*)((global char*)dst  + offsetd);
++
++    const int i0 = get_global_id(0)*4;
++    const int i1 = get_global_id(1);
++    if (i0 >= ne00) {
++        return;
++    }
++
++    const float s = src1[i1];
++    global float * a = src0 + (size_t)i1*ne00;
++    global float * d = dst  + (size_t)i1*ne00;
++
++    if (i0 + 4 <= ne00) {
++        vstore4(vload4(0, a + i0) * s, 0, d + i0);
++    } else {
++        for (int j = i0; j < ne00; ++j) {
++            d[j] = a[j] * s;
++        }
++    }
++}
+diff --git a/src/ggml-opencl/kernels/mul_mm_f16_f32_l4_lm.cl b/src/ggml-opencl/kernels/mul_mm_f16_f32_l4_lm.cl
+index 6982f8f5..9f607c7c 100644
+--- a/src/ggml-opencl/kernels/mul_mm_f16_f32_l4_lm.cl
++++ b/src/ggml-opencl/kernels/mul_mm_f16_f32_l4_lm.cl
+@@ -3,11 +3,17 @@
+ #define LOAD_VEC_A 4
+ #define LOAD_VEC_B 4
+ 
+-#define BM 64
++// Tile tuned on an Adreno 630 (see scripts/clbench in the droid repo). Two
++// things matter on this GPU and both point away from the 64/64/16/4/8 default:
++//   - (BM/TM)*(BN/TN) == 64 makes a workgroup exactly one wave, so the two
++//     barriers per K-block cost nothing;
++//   - BK = 32 halves the number of barriers for the same amount of work.
++// Measured over the four Kokoro GEMM shapes: 449 ms -> 79 ms.
++#define BM 32
+ #define BN 64
+-#define BK 16
+-#define TM 4
+-#define TN 8
++#define BK 32
++#define TM 8
++#define TN 4
+ 
+ kernel void kernel_mul_mm_f16_f32_l4_lm(
+     global half4 * src0,
+@@ -73,6 +79,7 @@ kernel void kernel_mul_mm_f16_f32_l4_lm(
+     half  cache_a[TM];
+     float cache_b[TN];
+ 
++    #pragma unroll
+     for (int i = 0; i < TM * TN; i++) {
+         sums[i] = 0.0f;
+     }
+@@ -113,15 +120,23 @@ kernel void kernel_mul_mm_f16_f32_l4_lm(
+         pos_a += BK / LOAD_VEC_A;
+         pos_b += BK / LOAD_VEC_B;
+ 
++        // Without the unroll pragmas the Adreno compiler keeps sums[]/cache_*[]
++        // in scratch memory (CL_KERNEL_PRIVATE_MEM_SIZE = 472 bytes), turning
++        // every accumulate into a global load-store pair and capping the kernel
++        // at ~9 GFLOPS on a device that does 473.
+         for (int i = 0; i < BK; i++) {
++            #pragma unroll
+             for (int j = 0; j < TM; j++) {
+                 cache_a[j] = buf_a[(i) * BM + th_r * TM + j];
+             }
++            #pragma unroll
+             for (int j = 0; j < TN; j++) {
+                 cache_b[j] = buf_b[(i) * BN + th_c * TN + j];
+             }
+ 
++            #pragma unroll
+             for (int cc = 0; cc < TN; cc++) {
++                #pragma unroll
+                 for (int cr = 0; cr < TM; cr++) {
+                     const int sums_idx = cc*TM + cr;
+                     sums[sums_idx] = mad(convert_float(cache_a[cr]), cache_b[cc], sums[sums_idx]);
+@@ -136,7 +151,9 @@ kernel void kernel_mul_mm_f16_f32_l4_lm(
+ 
+     const int offsets = batch_idx * batch_stride_d;
+ 
++    #pragma unroll
+     for (int cc = 0; cc < TN; cc++) {
++        #pragma unroll
+         for (int cr = 0; cr < TM; cr++) {
+             if (dr + cr < ne01 && dc + cc < ne11) {
+                 dst[offsets + (dc + cc) * stride_d + dr + cr] = sums[cc * TM + cr];
+diff --git a/src/ggml-opencl/kernels/sin.cl b/src/ggml-opencl/kernels/sin.cl
+new file mode 100644
+index 00000000..5b3f6f09
+--- /dev/null
++++ b/src/ggml-opencl/kernels/sin.cl
+@@ -0,0 +1,112 @@
++#pragma OPENCL EXTENSION cl_khr_fp16 : enable
++
++//------------------------------------------------------------------------------
++// sin / cos
++//
++// Contiguous-only, mirroring sqr.cl: ggml_cl_sin/ggml_cl_cos take the flat
++// element index, so a non-contiguous src0 is rejected in supports_op.
++//------------------------------------------------------------------------------
++
++kernel void kernel_sin_cont_f32(
++    global float * src0,
++    ulong          offset0,
++    global float * dst,
++    ulong          offsetd
++) {
++    src0 = (global float*)((global char*)src0 + offset0);
++    dst  = (global float*)((global char*)dst + offsetd);
++
++    uint gid = get_global_id(0);
++    dst[gid] = sin(src0[gid]);
++}
++
++kernel void kernel_sin_cont_f32_4(
++    global float4 * src0,
++    ulong           offset0,
++    global float4 * dst,
++    ulong           offsetd
++) {
++    src0 = (global float4*)((global char*)src0 + offset0);
++    dst  = (global float4*)((global char*)dst + offsetd);
++
++    uint gid = get_global_id(0);
++    dst[gid] = sin(src0[gid]);
++}
++
++kernel void kernel_sin_cont_f16(
++    global half * src0,
++    ulong         offset0,
++    global half * dst,
++    ulong         offsetd
++) {
++    src0 = (global half*)((global char*)src0 + offset0);
++    dst  = (global half*)((global char*)dst + offsetd);
++
++    uint gid = get_global_id(0);
++    dst[gid] = (half)sin((float)src0[gid]);
++}
++
++kernel void kernel_sin_cont_f16_4(
++    global half4 * src0,
++    ulong          offset0,
++    global half4 * dst,
++    ulong          offsetd
++) {
++    src0 = (global half4*)((global char*)src0 + offset0);
++    dst  = (global half4*)((global char*)dst + offsetd);
++
++    uint gid = get_global_id(0);
++    dst[gid] = convert_half4(sin(convert_float4(src0[gid])));
++}
++
++kernel void kernel_cos_cont_f32(
++    global float * src0,
++    ulong          offset0,
++    global float * dst,
++    ulong          offsetd
++) {
++    src0 = (global float*)((global char*)src0 + offset0);
++    dst  = (global float*)((global char*)dst + offsetd);
++
++    uint gid = get_global_id(0);
++    dst[gid] = cos(src0[gid]);
++}
++
++kernel void kernel_cos_cont_f32_4(
++    global float4 * src0,
++    ulong           offset0,
++    global float4 * dst,
++    ulong           offsetd
++) {
++    src0 = (global float4*)((global char*)src0 + offset0);
++    dst  = (global float4*)((global char*)dst + offsetd);
++
++    uint gid = get_global_id(0);
++    dst[gid] = cos(src0[gid]);
++}
++
++kernel void kernel_cos_cont_f16(
++    global half * src0,
++    ulong         offset0,
++    global half * dst,
++    ulong         offsetd
++) {
++    src0 = (global half*)((global char*)src0 + offset0);
++    dst  = (global half*)((global char*)dst + offsetd);
++
++    uint gid = get_global_id(0);
++    dst[gid] = (half)cos((float)src0[gid]);
++}
++
++kernel void kernel_cos_cont_f16_4(
++    global half4 * src0,
++    ulong          offset0,
++    global half4 * dst,
++    ulong          offsetd
++) {
++    src0 = (global half4*)((global char*)src0 + offset0);
++    dst  = (global half4*)((global char*)dst + offsetd);
++
++    uint gid = get_global_id(0);
++    dst[gid] = convert_half4(cos(convert_float4(src0[gid])));
++}

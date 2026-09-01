@@ -44,8 +44,13 @@ FetchContent_Declare(
   # Note: Fix 3 (scalar NORM kernel) is merged upstream in GGML a056a26, and
   #       Fix 5 (CUDA IM2COL grid-dim Y overflow) in GGML 0ce7ad3; both patches
   #       have been dropped.
+  # Fix 6: Adreno-targeted ggml-opencl work (SIN/COS kernels, a conv1d kernel,
+  #         a dim-0 broadcast path for add/mul/div and a retiled f16 GEMM).
+  #         Worth 26.6 s -> 7.8 s on a Kokoro utterance on a Snapdragon 845.
   PATCH_COMMAND
     ${CMAKE_COMMAND} -DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/patches/ggml-conv-transpose-1d-simd.patch -P ${CMAKE_CURRENT_SOURCE_DIR}/tools/apply_patch_if_needed.cmake
+    COMMAND
+    ${CMAKE_COMMAND} -DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/patches/ggml-opencl-adreno.patch -P ${CMAKE_CURRENT_SOURCE_DIR}/tools/apply_patch_if_needed.cmake
 )
 if(KOKOPOP_ENABLE_CUDA)
   set(GGML_CUDA ON CACHE BOOL "" FORCE)

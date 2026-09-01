@@ -510,11 +510,16 @@ static ggml_tensor * snake1d_impl(
         return ggml_map_custom2(ctx, x, alpha_2d, snake1d_fused_callback, GGML_N_TASKS_MAX, nullptr);
     }
 
-    ggml_tensor * a  = ggml_repeat(ctx, alpha_2d, x);
-    ggml_tensor * xa = ggml_mul(ctx, x, a);
+    // No ggml_repeat of alpha: mul/div already broadcast a [1, C] operand over
+    // [T, C], and materialising the repeat turns three of these nodes into
+    // full-size two-operand elementwise ops. On an Adreno 630 the broadcast
+    // form of the same MUL measured 1.5 ms against 58 ms for the repeated one.
+    // ggml_sqr rather than mul(s, s) for the square, for the same reason: it
+    // is a one-operand contiguous kernel.
+    ggml_tensor * xa = ggml_mul(ctx, x, alpha_2d);
     ggml_tensor * s  = ggml_sin(ctx, xa);
-    ggml_tensor * s2 = ggml_mul(ctx, s, s);
-    return ggml_add(ctx, x, ggml_div(ctx, s2, a));
+    ggml_tensor * s2 = ggml_sqr(ctx, s);
+    return ggml_add(ctx, x, ggml_div(ctx, s2, alpha_2d));
 }
 
 // ---------------------------------------------------------------------------

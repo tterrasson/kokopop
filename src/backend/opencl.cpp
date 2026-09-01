@@ -1,3 +1,11 @@
+// This translation unit is only compiled when the OpenCL backend is enabled
+// (see CMakeLists.txt). Define the flag defensively so that tooling which
+// indexes this file without the target's compile definitions still sees the
+// declaration in opencl.h rather than the inline no-op stub.
+#ifndef KOKOPOP_HAS_OPENCL
+#define KOKOPOP_HAS_OPENCL
+#endif
+
 #include "backend.h"
 #include "opencl.h"
 
@@ -26,7 +34,7 @@ class OpenCLBackend final : public Backend {
     uint64_t sched_signature_ = 0;
     bool env_log_sched_ = false;
     bool env_op_trace_ = false;
-    bool env_pin_ = true;
+    bool env_pin_ = false;
     std::vector<PendingInit> pending_inits_;
     std::vector<ggml_tensor *> cpu_assignments_;
 
@@ -150,9 +158,23 @@ class OpenCLBackend final : public Backend {
 
         const char * backend_name = backend != nullptr ? ggml_backend_name(backend) : "?";
 
+        // Source shapes matter as much as the destination one: a MUL that is
+        // 30x off memory bandwidth is a broadcast pattern the kernel handles
+        // badly, and that is only visible in src1's ne.
+        char srcs[128] = {};
+        int  pos = 0;
+        for (int i = 0; tensor != nullptr && i < GGML_MAX_SRC && tensor->src[i] != nullptr; ++i) {
+            const ggml_tensor * s = tensor->src[i];
+            pos += std::snprintf(srcs + pos, sizeof(srcs) - pos, " s%d=%s[%lld,%lld,%lld,%lld]",
+                                 i, ggml_type_name(s->type),
+                                 (long long) s->ne[0], (long long) s->ne[1],
+                                 (long long) s->ne[2], (long long) s->ne[3]);
+            if (pos >= (int) sizeof(srcs) - 1) break;
+        }
+
         std::fprintf(
             stderr,
-            "[op %-6s] %8lld us %-20s %-32s shape=[%lld,%lld,%lld,%lld]\n",
+            "[op %-6s] %8lld us %-20s %-32s shape=[%lld,%lld,%lld,%lld]%s\n",
             backend_name,
             (long long) dt_us,
             op_name,
@@ -160,7 +182,8 @@ class OpenCLBackend final : public Backend {
             static_cast<long long>(tensor != nullptr ? tensor->ne[0] : 0),
             static_cast<long long>(tensor != nullptr ? tensor->ne[1] : 0),
             static_cast<long long>(tensor != nullptr ? tensor->ne[2] : 0),
-            static_cast<long long>(tensor != nullptr ? tensor->ne[3] : 0));
+            static_cast<long long>(tensor != nullptr ? tensor->ne[3] : 0),
+            srcs);
 
         std::fflush(stderr);
         return true;
@@ -171,8 +194,12 @@ public:
         try {
             env_log_sched_ = std::getenv("KOKOPOP_OPENCL_LOG_SCHED") != nullptr;
             env_op_trace_ = std::getenv("KOKOPOP_OPENCL_OP_TRACE") != nullptr;
+            // Off by default here, unlike Vulkan: on an Adreno 630 the pins
+            // cost 0.76 s per utterance in extra splits, and running the norms
+            // on the GPU instead measured 59.6 dB SNR against the pinned
+            // output is inaudible. KOKOPOP_OPENCL_PIN_NORM=1 restores them.
             const char * pin = std::getenv("KOKOPOP_OPENCL_PIN_NORM");
-            env_pin_ = pin == nullptr || std::strcmp(pin, "0") != 0;
+            env_pin_ = pin != nullptr && std::strcmp(pin, "0") != 0;
 
             // ggml-opencl exposes no device enumeration (no get_device_count /
             // _description / _memory): there is exactly one implicit device and
@@ -290,8 +317,9 @@ public:
         // scheduler two splits, i.e. two device<->host round trips. On the
         // Kokoro generator the pins are isolated NORMs interleaved every ~28
         // GPU ops, which is most of the 100+ splits measured on an Adreno 630.
-        // KOKOPOP_OPENCL_PIN_NORM=0 drops the pinning to trade fp16 drift for
-        // a contiguous graph; keep it on unless the voice is verified by ear.
+        // Measured on this device: the pinned and unpinned outputs differ by
+        // 59.6 dB SNR, so the pinning is off by default and
+        // KOKOPOP_OPENCL_PIN_NORM=1 brings it back.
         if (!env_pin_) {
             return;
         }
