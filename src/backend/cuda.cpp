@@ -1,3 +1,11 @@
+// This translation unit is only compiled when the CUDA backend is enabled
+// (see CMakeLists.txt). Define the flag defensively so that tooling which
+// indexes this file without the target's compile definitions still sees the
+// declaration in cuda.h rather than the inline no-op stub.
+#ifndef KOKOPOP_HAS_CUDA
+#define KOKOPOP_HAS_CUDA
+#endif
+
 #include "backend.h"
 #include "cuda.h"
 
