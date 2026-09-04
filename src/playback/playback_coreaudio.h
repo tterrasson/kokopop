@@ -41,7 +41,7 @@ private:
     bool running_ = false;
     bool done_ = false;       // no more write() calls will happen
     bool drained_ = false;    // callback confirmed all data has been enqueued
-    bool stopped_ = false;    // stop() has fully completed
+    bool stopped_ = true;     // stop() has fully completed, or never started
 
     int sample_rate_ = 24000;
     int buffer_size_samples_ = 0;

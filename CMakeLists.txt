@@ -513,6 +513,16 @@ if(KOKOPOP_BUILD_TESTS)
   target_link_libraries(kokopop_tests PRIVATE kokopop doctest::doctest ggml yyjson)
   include(${doctest_SOURCE_DIR}/scripts/cmake/doctest.cmake)
   doctest_discover_tests(kokopop_tests)
+
+  # Exercise the real playback implementation with a deterministic AudioQueue
+  # device, without requiring macOS or emitting sound during the test suite.
+  add_executable(kokopop_playback_tests
+    tests/test_playback_coreaudio.cpp
+    src/playback/playback_coreaudio.cpp)
+  target_include_directories(kokopop_playback_tests PRIVATE tests/mocks src)
+  target_link_libraries(kokopop_playback_tests PRIVATE doctest::doctest Threads::Threads)
+  add_test(NAME kokopop_playback_tests COMMAND kokopop_playback_tests)
+  set_tests_properties(kokopop_playback_tests PROPERTIES TIMEOUT 15)
 endif()
 
 option(KOKOPOP_BUILD_BENCH "Build kokopop benchmarks (requires kokoro.gguf)" OFF)

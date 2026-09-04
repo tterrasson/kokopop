@@ -1,5 +1,8 @@
 #include "playback_coreaudio.h"
 
+#include <algorithm>
+#include <chrono>
+#include <cstdarg>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -42,7 +45,7 @@ bool CoreAudioPlayback::start(int sample_rate) {
     buffer_size_samples_ = (sample_rate * BUFFER_DURATION_MS) / 1000;
     pb_log("start: sr=%d buf_samples=%d\n", sample_rate, buffer_size_samples_);
 
-    AudioStreamBasicDescription format;
+    AudioStreamBasicDescription format{};
     format.mSampleRate = sample_rate;
     format.mFormatID = kAudioFormatLinearPCM;
     format.mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
@@ -68,6 +71,8 @@ bool CoreAudioPlayback::start(int sample_rate) {
             pb_log("AudioQueueAllocateBuffer[%d] failed\n", i);
             AudioQueueDispose(queue_, true);
             queue_ = nullptr;
+            buffers_.clear();
+            packet_descs_.clear();
             return false;
         }
         buffers_.push_back(buf);
@@ -81,9 +86,11 @@ bool CoreAudioPlayback::start(int sample_rate) {
     stopped_ = false;
 
     // Prime buffers (silence — real data hasn't arrived yet)
-    std::lock_guard<std::mutex> lock(data_mutex_);
-    for (auto & buf : buffers_) {
-        fill_and_enqueue(buf);
+    {
+        std::lock_guard<std::mutex> lock(data_mutex_);
+        for (auto & buf : buffers_) {
+            fill_and_enqueue(buf);
+        }
     }
 
     status = AudioQueueStart(queue_, nullptr);
@@ -91,6 +98,10 @@ bool CoreAudioPlayback::start(int sample_rate) {
         pb_log("AudioQueueStart failed: 0x%08x\n", status);
         AudioQueueDispose(queue_, true);
         queue_ = nullptr;
+        buffers_.clear();
+        packet_descs_.clear();
+        running_ = false;
+        stopped_ = true;
         return false;
     }
     pb_log("AudioQueueStart OK\n");
@@ -101,6 +112,7 @@ void CoreAudioPlayback::write(const float * samples, size_t n) {
     if (!queue_ || !samples || n == 0) return;
 
     std::lock_guard<std::mutex> lock(data_mutex_);
+    if (done_) return;
     data_queue_.emplace(samples, samples + n);
     pb_log("write: +%zu samples (total queued chunks: %zu)\n", n, data_queue_.size());
     data_cv_.notify_one();
@@ -127,12 +139,26 @@ void CoreAudioPlayback::stop() {
     }
     pb_log("stop: all data drained from queue\n");
 
-    // Now stop the queue synchronously.
-    // Callbacks will still fire for currently-playing buffers, but we've
-    // already released data_mutex_ so they can run.
+    // Enqueued is not played: an immediate stop discards up to three buffers.
+    // Stop asynchronously and wait for playback to finish before disposal.
+    // Keep the mutex released: AudioQueueStop can invoke callbacks.
     if (queue_) {
-        pb_log("stop: AudioQueueStop (sync)\n");
-        AudioQueueStop(queue_, true);  // blocks until queue fully stops
+        const OSStatus status = AudioQueueStop(queue_, false);
+        if (status == noErr) {
+            UInt32 is_running = 1;
+            while (is_running) {
+                UInt32 size = sizeof(is_running);
+                const OSStatus result = AudioQueueGetProperty(
+                    queue_, kAudioQueueProperty_IsRunning, &is_running, &size);
+                if (result != noErr) {
+                    pb_log("AudioQueueGetProperty(IsRunning) failed: 0x%08x\n", result);
+                    break;
+                }
+                if (is_running) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+        } else {
+            pb_log("AudioQueueStop failed: 0x%08x\n", status);
+        }
 
         pb_log("stop: AudioQueueDispose\n");
         AudioQueueDispose(queue_, true);
@@ -168,25 +194,14 @@ void CoreAudioPlayback::callback(void * userData,
     {
         std::lock_guard<std::mutex> lock(self->data_mutex_);
 
-        bool has_data = !self->data_queue_.empty();
-        bool still_playing = self->running_ && self->queue_ != nullptr;
-        pb_log("callback: running=%d done=%d has_data=%d\n",
-               self->running_, self->done_, has_data);
-
-        if (still_playing || has_data) {
+        if (self->running_ && self->queue_ && !self->drained_) {
             self->fill_and_enqueue(buffer);
-        } else {
-            // No more data and queue is stopping — enqueue silence
-            std::memset(buffer->mAudioData, 0, self->buffer_size_samples_ * 2);
-            buffer->mAudioDataByteSize = self->buffer_size_samples_ * 2;
-            if (self->queue_) {
-                AudioQueueEnqueueBuffer(self->queue_, buffer, 0, nullptr);
-            }
         }
 
         // Signal drained when: done_ is set AND all data has been consumed
         if (self->done_ && self->data_queue_.empty() && !self->drained_) {
             self->drained_ = true;
+            self->running_ = false;
             pb_log("callback: signaling drained (all data enqueued)\n");
             self->drain_cv_.notify_one();
         }
