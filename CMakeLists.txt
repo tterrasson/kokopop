@@ -230,6 +230,11 @@ set(_kokopop_arch_sources
   src/arch/sanotts/sano_noise.cpp
   src/arch/sanotts/sano_tokenizer.cpp
   src/arch/sanotts/sano_frontend_text.cpp
+  src/arch/sanotts/sano_graph.cpp
+  src/arch/sanotts/sano_arch.cpp
+  src/arch/sanotts/sano_frontend.cpp
+  src/arch/sanotts/sano_piperlite.cpp
+  src/arch/sanotts/sano_vocos.cpp
   src/arch/kokoro/kokoro_arch.cpp
   src/arch/kokoro/kokoro.cpp
   src/arch/kokoro/diffusion_sampler.cpp

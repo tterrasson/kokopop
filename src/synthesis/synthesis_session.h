@@ -39,7 +39,11 @@ public:
 
     bool done() const { return _done; }
     int chunks_total() const { return _chunks_total; }
-    int sample_rate() const { return _model.sample_rate(); }
+    /// The rate of *this session's* voice. A model may carry voices at
+    /// different rates (a sanoTTS pack mixes 22050 and 24000 Hz), so the
+    /// model-level accessor which answers for the default voice is the
+    /// wrong one for anything that has resolved a voice.
+    int sample_rate() const { return _model.sample_rate(_options.voice); }
 
 private:
     ChunkConfig selected_config() const;

@@ -42,7 +42,7 @@ std::shared_ptr<RequestContext> SynthesisScheduler::submit(
     ctx->chunk_config = chunk_config_override;
     ctx->has_chunk_config = has_chunk_config_override;
     ctx->diffusion = diffusion;
-    ctx->sample_rate = _model.sample_rate();
+    ctx->sample_rate = _model.sample_rate(voice);
 
     {
         std::lock_guard<std::mutex> lock(_queue_mutex);

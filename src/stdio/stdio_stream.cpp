@@ -50,10 +50,10 @@ StdioStreamer::StdioStreamer(
     , _speed(speed)
     , _mode(mode)
     , _out_path(out_path)
-    , _sample_rate(model.sample_rate())
+    , _sample_rate(model.sample_rate(voice))
 {
     _wav_accum.path = out_path;
-    _wav_accum.sample_rate = model.sample_rate();
+    _wav_accum.sample_rate = _sample_rate;
 }
 
 StdioStreamer::~StdioStreamer() {

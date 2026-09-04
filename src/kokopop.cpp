@@ -230,7 +230,7 @@ int kokopop_synthesize_text(
     if (combined.empty()) {
         return fail(KOKOPOP_ERROR_INFERENCE, "synthesis produced no audio");
     }
-    if (!allocate_audio_from_vector(combined, model->impl->sample_rate(), *out_audio)) {
+    if (!allocate_audio_from_vector(combined, session.sample_rate(), *out_audio)) {
         return fail(KOKOPOP_ERROR_INFERENCE, "failed to allocate output audio");
     }
     return KOKOPOP_OK;

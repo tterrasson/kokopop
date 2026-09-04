@@ -1,6 +1,7 @@
 #include "model/arch.h"
 
 #include "arch/kokoro/kokoro_arch.h"
+#include "arch/sanotts/sano_arch.h"
 #include "model/gguf_util.h"
 
 #include <gguf.h>
@@ -47,9 +48,7 @@ std::unique_ptr<ModelArch> create_arch(gguf_context * meta, std::string & error)
         case Arch::Kokoro:
             return std::make_unique<KokoroArch>();
         case Arch::SanoTTS:
-            error = "GGUF declares kokopop.arch=\"sanotts\", which this build "
-                    "does not implement yet";
-            return nullptr;
+            return std::make_unique<SanoArch>();
         case Arch::Unknown:
             break;
     }
@@ -57,7 +56,7 @@ std::unique_ptr<ModelArch> create_arch(gguf_context * meta, std::string & error)
     std::string declared;
     if (gguf_get_str(meta, "kokopop.arch", declared)) {
         error = "GGUF declares an unknown kokopop.arch=\"" + declared
-              + "\"; known architectures: kokoro-82m";
+              + "\"; known architectures: kokoro-82m, sanotts";
     } else {
         error = "GGUF has neither kokopop.arch nor kokopop.kokoro.version; "
                 "it is not a kokopop model";

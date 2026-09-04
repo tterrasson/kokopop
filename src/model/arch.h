@@ -108,6 +108,16 @@ struct SynthesisExtras {
     /// Stable index of this chunk within the utterance. Folded into the
     /// per-chunk seed so that consecutive chunks do not reuse the same noise.
     uint32_t chunk_index = 0;
+
+    /// sanoTTS only — per-token frame counts, replacing the duration model's
+    /// prediction. Empty means "predict them".
+    ///
+    /// This exists so that the decoder can be gated against a golden fixture
+    /// on its own: the fixtures ship `(ids, durations, PCM)` triplets, and
+    /// their durations were rendered by an upstream revision whose duration
+    /// model kokopop does not reproduce token for token. Without an override,
+    /// a decoder regression and a duration difference are indistinguishable.
+    std::vector<int32_t> dur_override;
 };
 
 /// One architecture's implementation of the model contract.

@@ -146,14 +146,15 @@ bool SynthesisSession::next(size_t max_chunks, size_t queued_requests,
             one_chunk_plan.diffusion = _options.diffusion;
 
             const auto start = std::chrono::steady_clock::now();
-            audio = infer_chunk(_model, one_chunk_plan, 0, _prev_tail, out_tail, error);
+            audio = infer_chunk(_model, one_chunk_plan, 0, _prev_tail, out_tail, error,
+                                chunk_index);
             const auto end = std::chrono::steady_clock::now();
 
             if (!audio.empty()) {
                 const double generation_ms =
                     std::chrono::duration<double, std::milli>(end - start).count();
                 const double audio_ms = static_cast<double>(audio.size()) /
-                    static_cast<double>(_model.sample_rate()) * 1000.0;
+                    static_cast<double>(sample_rate()) * 1000.0;
                 const bool first_chunk_oversized =
                     (chunk_index == 0 && _plan.config.first_chunk_target_max_tokens > 0);
                 if (!first_chunk_oversized) {

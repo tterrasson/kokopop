@@ -4,6 +4,7 @@
 #include "arch/kokoro/kokoro.h"
 #include "synthesis/chunker/chunker.h"
 
+#include <cstdint>
 #include <string>
 
 namespace kokopop {
@@ -25,10 +26,14 @@ bool synthesize_phonemes(
 /// carries the sequence that was budgeted, and re-tokenizing its phoneme string
 /// here could yield a different one. `chunk.phonemes` is still read, for the
 /// code-point count that picks Kokoro's style row.
+///
+/// `chunk_index` is the chunk's position in the utterance; it seeds sanoTTS's
+/// per-chunk noise, so two chunks with identical ids still decode differently.
 bool synthesize_chunk(
     Model & model, const Chunk & chunk,
     const std::string & voice, float speed,
     const KokoroDiffusionOptions & diffusion,
+    uint32_t chunk_index,
     kokopop_audio & out, std::string & error);
 
 } // namespace kokopop

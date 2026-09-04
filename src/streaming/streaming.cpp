@@ -92,7 +92,8 @@ std::vector<float> infer_chunk(
     int chunk_idx,
     const std::vector<float> & prev_tail,
     std::vector<float> & out_tail,
-    std::string & error)
+    std::string & error,
+    int seq_index)
 {
     if (chunk_idx < 0 || chunk_idx >= static_cast<int>(plan.chunks.size())) {
         error = "chunk index out of range";
@@ -116,7 +117,9 @@ std::vector<float> infer_chunk(
     }
 
     kokopop_audio raw{};
-    if (!synthesize_chunk(model, chunk, plan.voice, plan.speed, plan.diffusion, raw, error)) {
+    const int noise_index = seq_index >= 0 ? seq_index : chunk_idx;
+    if (!synthesize_chunk(model, chunk, plan.voice, plan.speed, plan.diffusion,
+                          static_cast<uint32_t>(noise_index), raw, error)) {
         return {};
     }
 
@@ -133,13 +136,13 @@ std::vector<float> infer_chunk(
 
     std::fprintf(stderr, "[kokopop] chunk[%d] synthesized: %zu samples (%.1fms)\n",
                 chunk_idx + 1, raw_audio.size(),
-                (double)raw_audio.size() / model.sample_rate() * 1000.0);
+                (double)raw_audio.size() / model.sample_rate(plan.voice) * 1000.0);
 
     // --- Post-process ---
     auto processed = postprocess_chunk_audio(
         raw_audio, chunk, chunk_idx,
         static_cast<int>(plan.chunks.size()),
-        plan.config, model.sample_rate());
+        plan.config, model.sample_rate(plan.voice));
 
     // --- Crossfade with previous chunk ---
     if (!prev_tail.empty() && !processed.empty()) {
@@ -147,13 +150,13 @@ std::vector<float> infer_chunk(
             prev_tail, processed,
             chunk.boundary_after,
             plan.config.crossfade_ms,
-            model.sample_rate());
+            model.sample_rate(plan.voice));
         processed = std::move(crossed);
     }
 
     // --- Save tail for next crossfade ---
     out_tail.clear();
-    const int crossfade_samples = (plan.config.crossfade_ms * model.sample_rate()) / 1000;
+    const int crossfade_samples = (plan.config.crossfade_ms * model.sample_rate(plan.voice)) / 1000;
     if (!processed.empty() && crossfade_samples > 0) {
         size_t tail_start = processed.size() > static_cast<size_t>(crossfade_samples)
             ? processed.size() - crossfade_samples
@@ -222,7 +225,7 @@ StreamHandle stream_synthesize(
             // stop-on-cancel responsive: at most one chunk of inference is
             // running ahead when the callback returns false.
             const int n_chunks    = static_cast<int>(plan.chunks.size());
-            const int sample_rate = model->sample_rate();
+            const int sample_rate = model->sample_rate(plan.voice);
 
             struct RawResult {
                 std::vector<float> samples;
@@ -239,7 +242,8 @@ StreamHandle stream_synthesize(
 
                 kokopop_audio raw{};
                 if (!synthesize_chunk(*model, chunk,
-                                      plan.voice, plan.speed, plan.diffusion, raw, r.error)) {
+                                      plan.voice, plan.speed, plan.diffusion,
+                                      static_cast<uint32_t>(idx), raw, r.error)) {
                     return r;
                 }
                 if (raw.n_samples > 0 && raw.samples != nullptr) {
@@ -377,7 +381,7 @@ void IncrementalStreamer::flush() {
 
         std::vector<float> out_tail;
         auto processed = infer_chunk(
-            model_, plan, i, prev_tail, out_tail, error);
+            model_, plan, i, prev_tail, out_tail, error, chunk_counter_);
 
         if (processed.empty()) {
             std::fprintf(stderr, "[kokopop] WARNING chunk[%d]: %s — skipping\n",

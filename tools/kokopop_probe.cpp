@@ -3,6 +3,7 @@
 #include "core/error.h"
 #include "core/utf8.h"
 #include "arch/kokoro/kokoro.h"
+#include "arch/sanotts/sano_arch.h"
 #include "model/model.h"
 #include "synthesis/phonemizer.h"
 
@@ -126,6 +127,65 @@ int64_t utf8_codepoint_count(const std::string & text) {
     return off == text.size() ? count : static_cast<int64_t>(text.size());
 }
 
+/// sanoTTS probe: the same idea as the Kokoro path, over the stages this
+/// architecture actually has. Both frontends are voice-owned here, so the
+/// phonemizer and the tokenizer come from the arch rather than from the
+/// Kokoro-specific globals above.
+int probe_sanotts(kokopop::Model & model, const Options & options) {
+    kokopop::SanoArch * arch = kokopop::sano_arch(model);
+    const kokopop::VoiceDesc * voice = options.voice.empty()
+        ? arch->default_voice()
+        : arch->find_voice(options.voice);
+    if (voice == nullptr) {
+        std::fprintf(stderr, "unknown voice: %s\n", options.voice.c_str());
+        return 1;
+    }
+
+    std::string error;
+    std::string phonemes = options.phonemes;
+    if (phonemes.empty() && !arch->phonemize(options.text, *voice, phonemes, error)) {
+        std::fprintf(stderr, "phonemize failed: %s\n", error.c_str());
+        return 1;
+    }
+
+    std::vector<uint32_t> ids;
+    if (!arch->tokenize(phonemes, *voice, ids, error)) {
+        std::fprintf(stderr, "tokenize failed: %s\n", error.c_str());
+        return 1;
+    }
+
+    kokopop::SynthesisExtras extras;
+    kokopop::SanoProbe probe;
+    if (!arch->run(ids, *voice, 1.0f, extras, probe, error)) {
+        std::fprintf(stderr, "sanoTTS synthesis failed: %s\n", error.c_str());
+        return 1;
+    }
+
+    const Stats latent_stats = stats(probe.latent);
+    const Stats audio_stats = stats(probe.audio);
+
+    std::printf("arch=%s\n", arch->name());
+    std::printf("voice=%s\n", voice->name.c_str());
+    std::printf("frontend=%s\n",
+                voice->frontend == kokopop::FrontendKind::Piper ? "piper" : "misaki");
+    std::printf("decoder=%s\n",
+                voice->decoder == kokopop::DecoderKind::PiperLite ? "piperlite" : "vocos");
+    std::printf("sample_rate=%d\n", voice->sample_rate);
+    std::printf("length_scale=%.6f\n", static_cast<double>(voice->length_scale));
+    std::printf("phonemes=%s\n", phonemes.c_str());
+    std::printf("token_count=%zu\n", ids.size());
+    std::printf("frames=%lld\n", static_cast<long long>(probe.frames));
+    std::printf("audio_samples=%zu\n", probe.audio.size());
+    print_int_list("durations", std::vector<int>(probe.durations.begin(),
+                                                 probe.durations.end()));
+    std::printf("latent_mean=%.6f\n", latent_stats.mean);
+    std::printf("latent_rms=%.6f\n", latent_stats.rms);
+    std::printf("audio_mean=%.6f\n", audio_stats.mean);
+    std::printf("audio_rms=%.6f\n", audio_stats.rms);
+    std::printf("audio_peak=%.6f\n", audio_stats.peak);
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -151,6 +211,10 @@ int main(int argc, char ** argv) {
     if (model == nullptr) {
         std::fprintf(stderr, "failed to access model implementation\n");
         return 1;
+    }
+
+    if (model->arch != nullptr && model->arch->arch() == kokopop::Arch::SanoTTS) {
+        return probe_sanotts(*model, options);
     }
 
     std::string phonemes = options.phonemes;

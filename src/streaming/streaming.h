@@ -115,6 +115,11 @@ SynthesisPlan prepare_synthesis(
 ///                Pass empty vector for the first chunk.
 ///   out_tail   — output: tail samples from this chunk for the next crossfade.
 ///                Only populated if crossfade_ms > 0.
+///   seq_index  — position of the chunk in the whole utterance, used to seed
+///                sanoTTS's per-chunk noise. Callers that hand over a plan
+///                holding a single chunk at a time (adaptative, incremental)
+///                must pass their own running counter, otherwise every chunk
+///                would seed as chunk 0. -1 means "use chunk_idx".
 ///
 /// Returns the processed audio samples on success, empty vector on error.
 std::vector<float> infer_chunk(
@@ -123,7 +128,8 @@ std::vector<float> infer_chunk(
     int chunk_idx,
     const std::vector<float> & prev_tail,
     std::vector<float> & out_tail,
-    std::string & error);
+    std::string & error,
+    int seq_index = -1);
 
 // ---------------------------------------------------------------------------
 // Full streaming synthesis (backward-compatible wrapper)
