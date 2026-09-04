@@ -849,6 +849,53 @@ Run `kokopop_rt` to get a detailed per-chunk real-time factor breakdown:
   --seed 1234 2>/dev/null
 ```
 
+**Hardware:** MacBook Air M5, **Backend:** CPU, **Threads:** 8
+
+```
+~/w/n/kokopop ❯❯❯ ./build/kokopop_rt \
+  --model models/sanotts-en.gguf \
+  --voice heart \
+  --backend cpu \
+  --threads 8 \
+  --seed 1234 2>/dev/null
+
+  Backend:     CPU
+  Voice:       heart
+  Threads:     8
+  Sample Rate: 24000 Hz
+  Sentences:   10 → 15 chunk(s) (936 tokens)
+
+  Model load time:    8.2 ms
+  Prepare time:      15.7 ms (chunking + phonemization)
+
+  ┌──────┬────────┬────────────┬──────────┬──────────┬──────────┐
+  │ Chunk│ Tokens │  Gen Time  │ Duration │    RT    │ Samples  │
+  ├──────┼────────┼────────────┼──────────┼──────────┼──────────┤
+  │     1│       4│      4.8ms │     0.49s│   101.79x│     11712│
+  │     2│      66│     16.4ms │     4.22s│   256.55x│    101248│
+  │     3│      47│     10.8ms │     2.88s│   266.53x│     69040│
+  │     4│      65│     17.9ms │     4.77s│   266.37x│    114536│
+  │     5│      69│     16.8ms │     4.39s│   261.94x│    105344│
+  │     6│      68│     15.9ms │     4.33s│   272.67x│    103808│
+  │     7│      70│     20.1ms │     4.70s│   234.00x│    112768│
+  │     8│      71│     17.3ms │     4.74s│   274.49x│    113792│
+  │     9│      64│     14.5ms │     3.99s│   275.57x│     95872│
+  │    10│      70│     17.2ms │     4.91s│   285.08x│    117936│
+  │    11│      51│     11.7ms │     3.23s│   276.36x│     77488│
+  │    12│      74│     17.7ms │     4.91s│   276.87x│    117888│
+  │    13│      67│     16.8ms │     4.02s│   239.59x│     96384│
+  │    14│      78│     16.6ms │     4.73s│   285.44x│    113584│
+  │    15│      72│     14.8ms │     3.98s│   268.95x│     95608│
+  └──────┴────────┴────────────┴──────────┴──────────┴──────────┘
+
+  Total Generation:   229.2 ms
+  Total Audio:        60.29 s  (1447008 samples @ 24000 Hz)
+  Overall RT:        263.02x
+  TTFB warm-start:      4.8 ms (1st chunk inference)
+  TTFB cold-start:     28.7 ms (load + prepare + 1st chunk)
+  → 263.0x faster than real-time
+```
+
 **Hardware:** MacBook Pro M1, **Backend:** CPU, **Threads:** 4
 
 ```
