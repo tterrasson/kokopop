@@ -12,9 +12,9 @@ namespace kokopop {
 // ---------------------------------------------------------------------------
 enum class Boundary {
     None = 0,
-    ClauseWeak,      // comma, em-dash, parenthetical
+    ClauseWeak,      // comma, em dash, parenthetical
     ClauseStrong,    // semicolon, colon
-    Sentence,        // . ! ? …
+    Sentence,        // . ! ? ...
     Newline,         // single \n
     Paragraph        // double \n
 };
@@ -33,10 +33,8 @@ struct ChunkConfig {
     int first_chunk_target_max_tokens = 100;
     bool allow_short_first_chunk = true;
 
-    // Tokens of overshoot allowed past `target_tokens` while searching for a
-    // stronger boundary. Lets the chunker prefer a sentence end over a comma
-    // even if it means a slightly larger chunk. Capped by target_max_tokens
-    // and hard_max_tokens regardless.
+    // Tokens allowed past the controller target while looking for a stronger
+    // boundary. Still capped by target_max_tokens and hard_max_tokens.
     int target_overshoot_tokens = 24;
 
     // Pause durations (ms) per boundary type
@@ -52,35 +50,38 @@ struct ChunkConfig {
     int max_silence_trim_ms = 120;
 };
 
-/// Default "adaptative" config — fast first audio, dynamic chunk sizing
+/// Default "adaptative" config: fast first audio, dynamic chunk sizing
 ChunkConfig make_adaptative_config();
 
-/// Default "long-form" config — larger chunks, better prosody
+/// Default "long-form" config: larger chunks, better prosody
 ChunkConfig make_long_form_config();
 
-/// Merge `overrides` into `base`: only non-default fields in overrides
-/// replace the corresponding fields in base.  This lets a client send a
-/// partial ChunkConfig that patches the preset.
+/// Merge `overrides` into `base`: only fields that differ from the ChunkConfig
+/// defaults replace the base value, so a client can send a partial config.
 ChunkConfig merge_chunk_config(ChunkConfig base, ChunkConfig overrides);
 
 // ---------------------------------------------------------------------------
-// Unit — a text fragment with phonemes and tokens (pre-chunking)
+// Unit: a text fragment with its phonemes (pre-chunking)
 // ---------------------------------------------------------------------------
 struct Unit {
     std::string text;
     std::string phonemes;
-    std::vector<uint32_t> tokens;
+    /// Token count of `phonemes` tokenized alone, framing included. Used as the
+    /// budget estimate when assembling chunks.
     int n_tokens = 0;
     Boundary boundary_after = Boundary::None;
 };
 
 // ---------------------------------------------------------------------------
-// Chunk — a group of units ready for inference
+// Chunk: a group of units ready for inference
 // ---------------------------------------------------------------------------
 struct Chunk {
     std::string text;
     std::string phonemes;
+    /// `phonemes` tokenized once, framing included. This is the exact sequence
+    /// passed to inference.
     std::vector<uint32_t> tokens;
+    /// `tokens.size()` once the chunk is built.
     int n_tokens = 0;
     Boundary boundary_after = Boundary::None;
     bool is_first = false;
@@ -88,70 +89,75 @@ struct Chunk {
 };
 
 // ---------------------------------------------------------------------------
-// Main pipeline: text → chunks ready for inference
+// Main pipeline: text -> chunks ready for inference
 //
-// This function:
-//   1. Normalizes the text (unicode, whitespace, protections)
-//   2. Splits into candidate units (paragraphs → sentences → clauses)
-//   3. Phonemizes each unit and tokenizes
-//   4. Force-splits oversized units (> hard_max_tokens)
-//   5. Assembles units into chunks respecting token budgets
-//   6. Rebalances tiny chunks
+//   1. Normalize the text
+//   2. Split into candidate units (paragraphs -> sentences -> clauses)
+//   3. Phonemize and tokenize each unit, splitting those above target_max_tokens
+//   4. Assemble units into chunks within the token budget
+//   5. Rebalance tiny chunks
+//   6. Trim boundary punctuation and tokenize each chunk once
 //
-// The caller is expected to pass `tokenize_fn` which converts a phoneme
-// string into token ids (using the model's tokenizer).
+// Both closures are bound by the caller to the resolved voice: the phonemizer
+// and tokenizer belong to the architecture, so the chunker has no voice
+// parameter. Budgets are counted in final ids, framing included.
 // ---------------------------------------------------------------------------
+using PhonemizeFn = std::function<bool(const std::string & text,
+                                       std::string & phonemes,
+                                       std::string & error)>;
 using TokenizeFn = std::function<bool(const std::string & phonemes,
                                        std::vector<uint32_t> & ids,
                                        std::string & error)>;
 
 std::vector<Chunk> chunk_text(
     const std::string & text,
-    const std::string & voice,
     const ChunkConfig & config,
-    TokenizeFn tokenize_fn,
+    const PhonemizeFn & phonemize_fn,
+    const TokenizeFn & tokenize_fn,
     std::string & error);
 
-/// Prepare natural text units for adaptative chunking. The returned units are
-/// already phonemized/tokenized and split on natural pauses where possible.
+/// Steps 1 to 3 only: units for adaptative chunking, split on natural pauses.
 std::vector<Unit> prepare_chunk_units(
     const std::string & text,
-    const std::string & voice,
     const ChunkConfig & config,
-    TokenizeFn tokenize_fn,
+    const PhonemizeFn & phonemize_fn,
+    const TokenizeFn & tokenize_fn,
     std::string & error);
 
-/// Build the next adaptative chunk from prepared units. `next_unit` is advanced
-/// past consumed units. The caller decides `target_tokens` from live timings.
+/// Build the next adaptative chunk from prepared units and advance `next_unit`.
+/// The caller picks `target_tokens` from live timings. `tokenize_fn` must be
+/// the closure the units were built with. Returns an empty chunk when the
+/// units are exhausted, or on failure with `error` set.
 Chunk build_adaptative_chunk(
     const std::vector<Unit> & units,
     size_t & next_unit,
     const ChunkConfig & config,
     int target_tokens,
-    bool is_first);
+    bool is_first,
+    const TokenizeFn & tokenize_fn,
+    std::string & error);
 
 /// Per-request live controller for adaptative chunk sizing.
 ///
-/// Closed-loop control on the audio buffer ahead of playback (`lead_ms`):
-///   lead_ms = Σ audio_ms_i  −  Σ generation_ms_i (chunks 2..N)
-/// The first chunk's generation does not count: the client only starts
-/// playing once it has been delivered.
+/// Closed-loop control on the audio buffered ahead of playback:
+///   lead_ms = sum(audio_ms) - sum(generation_ms of chunks 2..N) - first_gen_ms
+/// The first chunk's generation is the TTFB cost: playback starts after it.
 ///
-/// A dynamic cap `growth_max_tokens` is adjusted AIMD-style after every chunk:
-///   - lead_ms <  safety_floor_ms  → multiplicative shrink (×shrink_factor)
-///   - lead_ms ≥  comfort_lead_ms  → additive grow (+grow_step_tokens)
-///   - in between                  → half-speed grow (+grow_step_tokens/2)
+/// `growth_max_tokens` is adjusted AIMD-style after every chunk:
+///   lead < safety_floor_ms, or rtf > 1   : multiplicative shrink
+///   lead >= comfort_lead_ms and rtf < 0.9: additive grow
+///   lead >= comfort_lead_ms otherwise    : half-step grow
 struct AdaptativeChunkController {
     // Cost model
     double target_generation_ms = 700.0;
     double ms_per_token_ewma = 0.0;
     int min_tokens = 32;
-    int max_tokens = 220;            // hard absolute ceiling (soft_max_tokens)
+    int max_tokens = 220;            // absolute ceiling (soft_max_tokens)
 
     // Closed-loop state
     double cumulative_audio_ms = 0.0;
     double cumulative_gen_ms_after_first = 0.0;
-    double first_gen_ms = 0.0;       // gen time of the first observed chunk (initial TTFB cost)
+    double first_gen_ms = 0.0;
     bool first_observed = false;
     int growth_max_tokens = 80;      // dynamic cap, starts at target_max_tokens
 
@@ -170,17 +176,19 @@ struct AdaptativeChunkController {
 // Memory management helpers
 // ---------------------------------------------------------------------------
 
-/// Free the internal data of a chunk after it has been inferred.
-/// This releases the phonemes string and tokens vector to reduce memory
-/// usage during long streaming sessions.  The n_tokens and boundary_after
-/// fields are preserved for diagnostic purposes.
-///
-/// Call this AFTER infer_chunk() has completed for the given chunk.
+/// Release a chunk's phonemes and tokens after inference. `n_tokens` and
+/// `boundary_after` are kept for diagnostics.
 void clear_chunk_data(Chunk & chunk);
 
 // ---------------------------------------------------------------------------
 // Boundary helpers
 // ---------------------------------------------------------------------------
+
+/// Strip trailing punctuation and spaces from a phoneme string. Applied to
+/// intermediate chunks before tokenizing: boundary punctuation destabilises the
+/// model, and the pause is re-added by audio post-processing.
+void trim_trailing_chunk_punctuation(std::string & phonemes);
+
 bool is_strong_boundary(Boundary b);
 bool is_reasonable_boundary(Boundary b);
 
