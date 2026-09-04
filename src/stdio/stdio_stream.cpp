@@ -50,10 +50,10 @@ StdioStreamer::StdioStreamer(
     , _speed(speed)
     , _mode(mode)
     , _out_path(out_path)
-    , _sample_rate(model.sample_rate)
+    , _sample_rate(model.sample_rate())
 {
     _wav_accum.path = out_path;
-    _wav_accum.sample_rate = model.sample_rate;
+    _wav_accum.sample_rate = model.sample_rate();
 }
 
 StdioStreamer::~StdioStreamer() {
@@ -161,7 +161,9 @@ void StdioStreamer::_process_line(const std::string & raw_line) {
 
     // Extract fields using yyjson
     // Note: strings from yyjson are owned by the doc, so copy them before freeing
-    std::string text_str = yyjson_get_str(yyjson_obj_get(root, "text"));
+    // yyjson_get_str returns null for a missing or non-string key, and std::string(nullptr) is undefined
+    const char * text_ptr = yyjson_get_str(yyjson_obj_get(root, "text"));
+    std::string text_str = text_ptr != nullptr ? std::string(text_ptr) : std::string();
     bool flush = yyjson_obj_get(root, "flush")
                  && !yyjson_is_null(yyjson_obj_get(root, "flush"))
                  && yyjson_get_bool(yyjson_obj_get(root, "flush"));
