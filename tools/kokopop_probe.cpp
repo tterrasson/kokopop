@@ -2,7 +2,7 @@
 
 #include "core/error.h"
 #include "core/utf8.h"
-#include "inference/kokoro.h"
+#include "arch/kokoro/kokoro.h"
 #include "model/model.h"
 #include "synthesis/phonemizer.h"
 

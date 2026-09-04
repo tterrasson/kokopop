@@ -322,11 +322,11 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    const int sample_rate = model->sample_rate;
+    const int sample_rate = model->sample_rate();
     const char * backend_name = kokopop::backend_display_name(kokopop_model_backend(model_handle));
 
     // ---- Resolve voice (auto-select first available if not specified) ----
-    std::string voice = kokopop::resolve_voice_name(opts.voice, model->voices);
+    std::string voice = kokopop::resolve_voice_name(opts.voice, *model);
     if (opts.voice.empty()) {
         std::fprintf(stderr, "[kokopop_rt] Auto-selected voice: %s\n", voice.c_str());
     }

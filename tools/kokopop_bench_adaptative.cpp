@@ -190,7 +190,7 @@ int main(int argc, char ** argv) {
         return 4;
     }
     std::fprintf(stderr, "[bench] Model loaded, sample_rate=%d, threads=%d\n\n",
-                 model->sample_rate, threads);
+                 model->sample_rate(), threads);
 
     // ---- Benchmark loop ----
     for (int run = 0; run < n_runs; ++run) {
@@ -228,7 +228,7 @@ int main(int argc, char ** argv) {
                 chunk.chunk_index,
                 0,  // tokens unknown from audio alone — scheduler logs them
                 static_cast<int>(chunk.samples.size()),
-                static_cast<double>(chunk.samples.size()) / model->sample_rate * 1000.0
+                static_cast<double>(chunk.samples.size()) / model->sample_rate() * 1000.0
             };
 
             if (results.empty()) {

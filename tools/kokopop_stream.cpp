@@ -120,7 +120,7 @@ using kokopop::json_error;
 // ---------------------------------------------------------------------------
 
 static bool handle_health(kokopop::Model * model, kokopop::HttpRequest & /*req*/, kokopop::HttpResponse & res) {
-    std::string json = "{\"status\":\"ready\",\"sample_rate\":" + std::to_string(model->sample_rate) + "}";
+    std::string json = "{\"status\":\"ready\",\"sample_rate\":" + std::to_string(model->sample_rate()) + "}";
     res.set_json_string(json);
     return true; // keep-alive
 }
@@ -395,7 +395,7 @@ int main(int argc, char ** argv) {
     }
 
     std::fprintf(stderr, "[kokopop] Model loaded, sample_rate=%d, threads=%d\n",
-                model->sample_rate, threads);
+                model->sample_rate(), threads);
 
     if (http_mode) {
         std::fprintf(stderr, "[kokopop] Starting HTTP server (async) on %s:%d\n", http_bind.c_str(), http_port);
