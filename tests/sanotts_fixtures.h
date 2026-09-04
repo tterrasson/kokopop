@@ -172,7 +172,13 @@ struct SanoModel {
         options.n_threads = 1;
         options.backend = backend;
         std::string error;
-        if (!kokopop::load_model_from_gguf(path, &options, model, error)) {
+        const bool ok = kokopop::load_model_from_gguf(path, &options, model, error);
+        // Missing optional data may skip. A present CPU model failing to load
+        // is a regression, and must not turn a broken decoder test green.
+        if (backend == KOKOPOP_BACKEND_CPU) {
+            REQUIRE_MESSAGE(ok, path << ": " << error);
+        }
+        if (!ok) {
             why = path + ": " + error;
             return false;
         }

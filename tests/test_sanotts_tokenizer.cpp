@@ -255,6 +255,43 @@ TEST_CASE("sanotts_nfd_table_validates_its_structure") {
     CHECK_FALSE(empty.present());
 }
 
+TEST_CASE("sanotts_nfd_rejects_orphan_arrays_and_invalid_unicode") {
+    std::string error;
+    sano::NfdTable table;
+    const uint32_t cp[] = {0xD800};
+    const uint32_t offsets[] = {0, 1};
+    const uint32_t values[] = {0x61};
+    table.n_ccc_classes = 1;
+    CHECK_FALSE(table.validate(error));
+    table.n_ccc_classes = 0;
+    table.n_offsets = 2;
+    CHECK_FALSE(table.validate(error));
+    table.codepoints = cp;
+    table.offsets = offsets;
+    table.values = values;
+    table.count = table.n_values = 1;
+    CHECK_FALSE(table.validate(error));
+    table.codepoints = values;
+    table.values = cp;
+    CHECK_FALSE(table.validate(error));
+}
+
+TEST_CASE("sanotts_special_ids_must_exist_even_in_sparse_tables") {
+    std::string error;
+    auto table = piper_table();
+    table.bos_id = 8;
+    CHECK_FALSE(table.validate(error));
+    table = piper_table();
+    table.pad_id = 8;
+    CHECK_FALSE(table.validate(error));
+    table = piper_table();
+    table.fallback_id = 8;
+    CHECK_FALSE(table.validate(error));
+    table = piper_table();
+    table.pad_id = -2;
+    CHECK_FALSE(table.validate(error));
+}
+
 // With no table, nothing decomposes — which is wrong for real input but must
 // not crash or mis-map.
 TEST_CASE("sanotts_piper_without_an_nfd_table_maps_code_points_directly") {

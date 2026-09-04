@@ -80,7 +80,7 @@ void check_backend_matches_cpu(int backend) {
         return;
     }
 
-    for (const char * voice : {"amy", "heart"}) {
+    for (const char * voice : {"amy", "kristin", "heart", "heartnano"}) {
         kokopop::SanoProbe reference;
         kokopop::SanoProbe candidate;
         REQUIRE_MESSAGE(render(*cpu_model, voice, reference, error), error);

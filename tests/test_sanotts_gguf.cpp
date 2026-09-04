@@ -72,6 +72,86 @@ bool load(const std::string & path, std::unique_ptr<kokopop::Model> & model,
 
 } // namespace
 
+TEST_CASE("sanotts_gguf_rejects_malformed_metadata_types_and_special_ids") {
+    const auto path = kokopop::test::sanotts_model_path("heart");
+    if (path.empty()) {
+        MESSAGE("skipped: " << kokopop::test::sanotts_model_hint("heart"));
+        return;
+    }
+    std::unique_ptr<kokopop::Model> model;
+    std::string error;
+    REQUIRE_MESSAGE(load(path, model, error), error);
+    auto * arch = kokopop::sano_arch(*model);
+    auto * meta = model->gguf_ctx;
+    SUBCASE("wrong scalar type") {
+        gguf_set_val_str(meta, "kokopop.sanotts.version", "1");
+    }
+    SUBCASE("wrong array element type") {
+        const char * strings[] = {"a"};
+        gguf_set_arr_str(meta, "kokopop.sanotts.nfd_codepoints", strings, 1);
+    }
+    SUBCASE("missing NFD array") {
+        gguf_remove_key(meta, "kokopop.sanotts.nfd_values");
+    }
+    SUBCASE("special id outside embeddings") {
+        gguf_set_val_u32(meta, "kokopop.sanotts.voice.0.bos_id", 999);
+    }
+    SUBCASE("wrong operator selector type") {
+        gguf_set_val_str(meta, "kokopop.sanotts.voice.0.dec.norm_type", "0");
+    }
+    SUBCASE("F16 bias unsupported by F32 addition") {
+        auto * tensor = arch->voice_weights[0].dur.input_proj_b;
+        const auto type = tensor->type;
+        tensor->type = GGML_TYPE_F16;
+        CHECK_FALSE(arch->load(*model, error));
+        CHECK(error.find("F32") != std::string::npos);
+        tensor->type = type;
+        return;
+    }
+    SUBCASE("unsupported quantized tensor") {
+        auto * tensor = arch->voice_weights[0].dur.embedding;
+        const auto type = tensor->type;
+        tensor->type = GGML_TYPE_Q8_0;
+        CHECK_FALSE(arch->load(*model, error));
+        CHECK(error.find("F32 or F16") != std::string::npos);
+        tensor->type = type;
+        return;
+    }
+    CHECK_FALSE(arch->load(*model, error));
+    CHECK_FALSE(error.empty());
+}
+
+TEST_CASE("sanotts_duration_override_cannot_bypass_token_budget") {
+    kokopop::test::SanoModel loaded;
+    std::string error;
+    if (!loaded.load("heart", error)) {
+        MESSAGE("skipped: " << error);
+        return;
+    }
+    const auto & voice = *loaded.arch->default_voice();
+    const std::vector<uint32_t> ids(static_cast<size_t>(voice.max_tokens) + 1, 1);
+    kokopop::SynthesisExtras extras;
+    extras.dur_override.assign(ids.size(), 1);
+    kokopop::SanoProbe probe;
+    CHECK_FALSE(loaded.arch->run(ids, voice, 1.0f, extras, probe, error));
+    CHECK(error.find("limit") != std::string::npos);
+    CHECK(probe.audio.empty());
+}
+
+TEST_CASE("sanotts_gguf_cannot_silently_disable_a_learned_post_filter") {
+    kokopop::test::SanoModel loaded;
+    std::string error;
+    if (!loaded.load("mixed", error)) {
+        MESSAGE("skipped: " << error);
+        return;
+    }
+    REQUIRE_EQ(loaded.arch->voices()[1].name, "kristin");
+    gguf_set_val_u32(loaded.model->gguf_ctx,
+                    "kokopop.sanotts.voice.1.dec.post_filter_channels", 0);
+    CHECK_FALSE(loaded.arch->load(*loaded.model, error));
+    CHECK(error.find("post-filter") != std::string::npos);
+}
+
 TEST_CASE("sanotts_gguf_loads_and_exposes_its_voices") {
     const std::string path = kokopop::test::sanotts_model_path("mixed");
     if (path.empty()) {

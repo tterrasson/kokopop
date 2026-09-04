@@ -63,12 +63,6 @@ struct VoiceMeta {
         return true;
     }
 
-    void u32_or(const std::string & suffix, uint32_t fallback, uint32_t & out) const {
-        if (!gguf_get_u32(ctx, (prefix + suffix).c_str(), out)) {
-            out = fallback;
-        }
-    }
-
     bool f32(const std::string & suffix, float & out, std::string & error) const {
         if (!gguf_get_f32(ctx, (prefix + suffix).c_str(), out)) {
             error = "missing " + where(suffix);
@@ -134,6 +128,14 @@ public:
         : _model(model), _prefix(std::move(prefix)), _voice(std::move(voice)),
           _error(error) {}
 
+    bool has_prefix(const std::string & suffix) const {
+        const std::string prefix = _prefix + suffix;
+        for (const auto & entry : _model.tensors) {
+            if (entry.first.compare(0, prefix.size(), prefix) == 0) return true;
+        }
+        return false;
+    }
+
     ggml_tensor * get(const std::string & suffix, int64_t ne0, int64_t ne1 = 1,
                       int64_t ne2 = 1) {
         if (!_error.empty()) {
@@ -143,6 +145,11 @@ public:
         ggml_tensor * tensor = _model.tensor(name);
         if (tensor == nullptr) {
             _error = "voice " + _voice + ": missing tensor " + name;
+            return nullptr;
+        }
+        if (tensor->type != GGML_TYPE_F32 && tensor->type != GGML_TYPE_F16) {
+            _error = "voice " + _voice + ": tensor " + name
+                   + " must be stored as F32 or F16";
             return nullptr;
         }
         if (tensor->ne[0] != ne0 || tensor->ne[1] != ne1 ||
@@ -209,10 +216,10 @@ bool load_res_blocks(TensorLoader & loader, Backend & backend,
         SanoResBlock block;
         block.kernel = static_cast<int32_t>(kernel);
         block.net0_w = loader.get(base + "net0.weight", flat, ch);
-        block.net0_b = loader.get(base + "net0.bias", ch);
+        block.net0_b = loader.get_f32(base + "net0.bias", ch);
         block.net2_w = loader.get(base + "net2.weight", flat, ch);
-        block.net2_b = loader.get(base + "net2.bias", ch);
-        ggml_tensor * scale = loader.get(base + "scale", 1);
+        block.net2_b = loader.get_f32(base + "net2.bias", ch);
+        ggml_tensor * scale = loader.get_f32(base + "scale", 1);
         if (!error.empty()) {
             return false;
         }
@@ -327,11 +334,14 @@ ChunkConfig SanoArch::adjust_chunk_config(ChunkConfig cfg,
 namespace {
 
 bool load_nfd(gguf_context * meta, SanoArch & arch, std::string & error) {
-    gguf_get_u32_array(meta, "kokopop.sanotts.nfd_codepoints", arch.nfd_codepoints);
-    gguf_get_u32_array(meta, "kokopop.sanotts.nfd_offsets", arch.nfd_offsets);
-    gguf_get_u32_array(meta, "kokopop.sanotts.nfd_values", arch.nfd_values);
-    gguf_get_u32_array(meta, "kokopop.sanotts.nfd_ccc_codepoints", arch.nfd_ccc_codepoints);
-    gguf_get_u32_array(meta, "kokopop.sanotts.nfd_ccc_classes", arch.nfd_ccc_classes);
+    if (!gguf_get_u32_array(meta, "kokopop.sanotts.nfd_codepoints", arch.nfd_codepoints) ||
+        !gguf_get_u32_array(meta, "kokopop.sanotts.nfd_offsets", arch.nfd_offsets) ||
+        !gguf_get_u32_array(meta, "kokopop.sanotts.nfd_values", arch.nfd_values) ||
+        !gguf_get_u32_array(meta, "kokopop.sanotts.nfd_ccc_codepoints", arch.nfd_ccc_codepoints) ||
+        !gguf_get_u32_array(meta, "kokopop.sanotts.nfd_ccc_classes", arch.nfd_ccc_classes)) {
+        error = "kokopop.sanotts.nfd_*: missing or incorrectly typed array";
+        return false;
+    }
 
     arch.nfd.codepoints = arch.nfd_codepoints.data();
     arch.nfd.offsets = arch.nfd_offsets.data();
@@ -432,7 +442,7 @@ bool load_duration(const VoiceMeta & meta, TensorLoader & loader, Backend & back
     const int64_t hidden = static_cast<int64_t>(w.hidden);
     w.embedding    = loader.get("dur.embedding.weight", hidden, w.vocab);
     w.input_proj_w = loader.get("dur.input_proj.weight", hidden + 3, hidden);
-    w.input_proj_b = loader.get("dur.input_proj.bias", hidden);
+    w.input_proj_b = loader.get_f32("dur.input_proj.bias", hidden);
     if (!error.empty()) {
         return false;
     }
@@ -470,9 +480,9 @@ bool load_acoustic(const VoiceMeta & meta, TensorLoader & loader, Backend & back
     const int64_t hidden = static_cast<int64_t>(w.hidden);
     w.embedding     = loader.get("ac.embedding.weight", hidden, w.vocab);
     w.token_proj_w  = loader.get("ac.token_input_proj.weight", hidden + 2, hidden);
-    w.token_proj_b  = loader.get("ac.token_input_proj.bias", hidden);
+    w.token_proj_b  = loader.get_f32("ac.token_input_proj.bias", hidden);
     w.frame_proj_w  = loader.get("ac.frame_input_proj.weight", hidden + 3, hidden);
-    w.frame_proj_b  = loader.get("ac.frame_input_proj.bias", hidden);
+    w.frame_proj_b  = loader.get_f32("ac.frame_input_proj.bias", hidden);
     if (!error.empty()) {
         return false;
     }
@@ -483,7 +493,7 @@ bool load_acoustic(const VoiceMeta & meta, TensorLoader & loader, Backend & back
         return false;
     }
     w.output_w = loader.get("ac.output.weight", hidden, w.out_channels);
-    w.output_b = loader.get("ac.output.bias", w.out_channels);
+    w.output_b = loader.get_f32("ac.output.bias", w.out_channels);
     return error.empty();
 }
 
@@ -511,7 +521,7 @@ bool load_piperlite(const VoiceMeta & meta, TensorLoader & loader, Backend & bac
 
     const int64_t latent = static_cast<int64_t>(latent_channels);
     w.pre_w = loader.get("dec.pre.weight", latent * w.pre_kernel, w.channels[0]);
-    w.pre_b = loader.get("dec.pre.bias", w.channels[0]);
+    w.pre_b = loader.get_f32("dec.pre.bias", w.channels[0]);
 
     for (size_t s = 0; s < 3; ++s) {
         SanoPiperStage & stage = w.stages[s];
@@ -523,7 +533,7 @@ bool load_piperlite(const VoiceMeta & meta, TensorLoader & loader, Backend & bac
         const int64_t out_ch = static_cast<int64_t>(w.channels[s + 1]);
         const std::string up = "dec.up" + std::to_string(s) + ".";
         stage.up_w = loader.get(up + "weight", stage.up_kernel, out_ch, in_ch);
-        stage.up_b = loader.get(up + "bias", out_ch);
+        stage.up_b = loader.get_f32(up + "bias", out_ch);
 
         std::vector<uint32_t> branches;
         if (!gguf_get_u32_array(meta.ctx,
@@ -554,27 +564,32 @@ bool load_piperlite(const VoiceMeta & meta, TensorLoader & loader, Backend & bac
             const std::string base = bank + std::to_string(branch) + ".";
             const int64_t flat = out_ch * entry.kernel;
             entry.conv1_w = loader.get(base + "conv1.weight", flat, out_ch);
-            entry.conv1_b = loader.get(base + "conv1.bias", out_ch);
+            entry.conv1_b = loader.get_f32(base + "conv1.bias", out_ch);
             entry.conv2_w = loader.get(base + "conv2.weight", flat, out_ch);
-            entry.conv2_b = loader.get(base + "conv2.bias", out_ch);
+            entry.conv2_b = loader.get_f32(base + "conv2.bias", out_ch);
         }
     }
 
     const int64_t last = static_cast<int64_t>(w.channels[3]);
     w.post_w = loader.get("dec.post.weight", last * w.post_kernel, 1);
-    w.post_b = loader.get("dec.post.bias", 1);
+    w.post_b = loader.get_f32("dec.post.bias", 1);
     if (!error.empty()) {
         return false;
     }
 
-    meta.u32_or("dec.post_filter_channels", 0, w.post_filter_channels);
+    if (!meta.u32("dec.post_filter_channels", w.post_filter_channels, error)) return false;
     if (w.post_filter_channels == 0) {
+        if (loader.has_prefix("dec.post_filter.")) {
+            error = meta.where("dec.post_filter_channels")
+                  + " disables a post-filter whose tensors are present";
+            return false;
+        }
         return true;
     }
 
-    meta.u32_or("dec.post_filter_layers", 0, w.post_filter_layers);
-    meta.u32_or("dec.post_filter_kernel", 9, w.post_filter_kernel);
-    meta.u32_or("dec.post_filter_unit_kernel", 3, w.post_filter_unit_kernel);
+    if (!meta.u32("dec.post_filter_layers", w.post_filter_layers, error) ||
+        !meta.u32("dec.post_filter_kernel", w.post_filter_kernel, error) ||
+        !meta.u32("dec.post_filter_unit_kernel", w.post_filter_unit_kernel, error)) return false;
     if (!meta.f32("dec.post_filter_scale", w.post_filter_scale, error)) {
         return false;
     }
@@ -593,9 +608,9 @@ bool load_piperlite(const VoiceMeta & meta, TensorLoader & loader, Backend & bac
     const int64_t pfk = static_cast<int64_t>(w.post_filter_kernel);
     const int64_t unit_k = static_cast<int64_t>(w.post_filter_unit_kernel);
     w.post_filter_in_w  = loader.get("dec.post_filter.in_conv.weight", pfk, pf);
-    w.post_filter_in_b  = loader.get("dec.post_filter.in_conv.bias", pf);
+    w.post_filter_in_b  = loader.get_f32("dec.post_filter.in_conv.bias", pf);
     w.post_filter_out_w = loader.get("dec.post_filter.out_conv.weight", pf * pfk, 1);
-    w.post_filter_out_b = loader.get("dec.post_filter.out_conv.bias", 1);
+    w.post_filter_out_b = loader.get_f32("dec.post_filter.out_conv.bias", 1);
 
     w.post_filter_units.clear();
     w.post_filter_units.reserve(w.post_filter_layers);
@@ -607,10 +622,10 @@ bool load_piperlite(const VoiceMeta & meta, TensorLoader & loader, Backend & bac
         // and leaves the second at 1.
         unit.dilation1 = static_cast<int32_t>(1 + layer);
         unit.conv1_w = loader.get(base + "conv1.weight", pf * unit_k, pf);
-        unit.conv1_b = loader.get(base + "conv1.bias", pf);
+        unit.conv1_b = loader.get_f32(base + "conv1.bias", pf);
         unit.conv2_w = loader.get(base + "conv2.weight", pf * unit_k, pf);
-        unit.conv2_b = loader.get(base + "conv2.bias", pf);
-        ggml_tensor * scale = loader.get(base + "scale", 1);
+        unit.conv2_b = loader.get_f32(base + "conv2.bias", pf);
+        ggml_tensor * scale = loader.get_f32(base + "scale", 1);
         if (!error.empty()) {
             return false;
         }
@@ -641,8 +656,8 @@ bool load_vocos(const VoiceMeta & meta, TensorLoader & loader, uint32_t mels,
 
     uint32_t norm_type = 0;
     uint32_t act_type = 0;
-    meta.u32_or("dec.norm_type", 0, norm_type);
-    meta.u32_or("dec.act_type", 0, act_type);
+    if (!meta.u32("dec.norm_type", norm_type, error) ||
+        !meta.u32("dec.act_type", act_type, error)) return false;
     if (norm_type != 0 || act_type != 0) {
         // DyT normalisation and ReLU are the E13 arm. No shipped voice uses
         // them, so running them as LayerNorm/GELU would be a silent
@@ -692,10 +707,10 @@ bool load_vocos(const VoiceMeta & meta, TensorLoader & loader, uint32_t mels,
     const int64_t hidden = static_cast<int64_t>(w.pw_hidden);
     w.embed_w = loader.get("dec.embed.weight",
                            static_cast<int64_t>(w.mels) * w.embed_kernel, dim);
-    w.embed_b = loader.get("dec.embed.bias", dim);
+    w.embed_b = loader.get_f32("dec.embed.bias", dim);
     w.noise_w = loader.get("dec.noise.weight",
                            static_cast<int64_t>(w.noise_ch) * w.embed_kernel, dim);
-    w.noise_b = loader.get("dec.noise.bias", dim);
+    w.noise_b = loader.get_f32("dec.noise.bias", dim);
     w.norm_w  = loader.get_f32("dec.norm.weight", dim);
     w.norm_b  = loader.get_f32("dec.norm.bias", dim);
 
@@ -704,14 +719,14 @@ bool load_vocos(const VoiceMeta & meta, TensorLoader & loader, uint32_t mels,
     for (uint32_t i = 0; i < w.blocks; ++i) {
         const std::string base = "dec.blocks." + std::to_string(i) + ".";
         SanoVocosBlock block;
-        block.dw_w   = loader.get(base + "dw.weight", w.dw_kernel, dim);
-        block.dw_b   = loader.get(base + "dw.bias", dim);
+        block.dw_w   = loader.get_f32(base + "dw.weight", w.dw_kernel, dim);
+        block.dw_b   = loader.get_f32(base + "dw.bias", dim);
         block.norm_w = loader.get_f32(base + "norm.weight", dim);
         block.norm_b = loader.get_f32(base + "norm.bias", dim);
         block.pw0_w  = loader.get(base + "pw0.weight", dim, hidden);
-        block.pw0_b  = loader.get(base + "pw0.bias", hidden);
+        block.pw0_b  = loader.get_f32(base + "pw0.bias", hidden);
         block.pw1_w  = loader.get(base + "pw1.weight", hidden, dim);
-        block.pw1_b  = loader.get(base + "pw1.bias", dim);
+        block.pw1_b  = loader.get_f32(base + "pw1.bias", dim);
         block.gamma  = loader.get_f32(base + "gamma", dim);
         if (!error.empty()) {
             return false;
@@ -852,6 +867,11 @@ bool SanoArch::load(Model & base_model, std::string & error) {
             return false;
         }
         voice.tokens.max_tokens = max_tokens;
+        const uint32_t framing_min = voice.desc.frontend == FrontendKind::Piper ? 5 : 3;
+        if (max_tokens < framing_min) {
+            error = info.where("max_tokens") + " cannot fit framing and one phoneme";
+            return false;
+        }
 
         TensorLoader loader(base_model, info.prefix, declared, error);
         if (!load_duration(info, loader, *backend, voice.dur, error) ||
@@ -860,6 +880,18 @@ bool SanoArch::load(Model & base_model, std::string & error) {
         }
         if (voice.dur.max_tokens != max_tokens) {
             error = info.where("dur.max_tokens") + " disagrees with max_tokens";
+            return false;
+        }
+        const uint32_t vocab = std::min(voice.dur.vocab, voice.ac.vocab);
+        if (voice.tokens.bos_id >= vocab || voice.tokens.eos_id >= vocab ||
+            (voice.tokens.pad_id >= 0 && static_cast<uint32_t>(voice.tokens.pad_id) >= vocab) ||
+            (voice.tokens.fallback_id >= 0 && static_cast<uint32_t>(voice.tokens.fallback_id) >= vocab)) {
+            error = info.where("token_ids") + ": special ids must fit both embedding vocabularies";
+            return false;
+        }
+        if (voice.desc.frontend == FrontendKind::Piper &&
+            (voice.tokens.pad_id < 0 || !nfd.present())) {
+            error = "voice " + declared + ": Piper requires a PAD id and an NFD table";
             return false;
         }
 
@@ -989,6 +1021,11 @@ bool SanoArch::run(const std::vector<uint32_t> & ids, const VoiceDesc & desc,
     }
     if (ids.empty()) {
         error = "sanoTTS synthesis: empty token sequence";
+        return false;
+    }
+    if (ids.size() > voice->dur.max_tokens) {
+        error = "sanoTTS synthesis: token sequence exceeds the voice's limit of "
+              + std::to_string(voice->dur.max_tokens);
         return false;
     }
     if (!(speed > 0.0f) || !std::isfinite(speed)) {

@@ -92,8 +92,12 @@ std::string_view rstrip(std::string_view text) {
 // ---------------------------------------------------------------------------
 
 bool NfdTable::validate(std::string & error) const {
+    if (ccc_count != n_ccc_classes) {
+        error = "NFD combining-class arrays have different lengths";
+        return false;
+    }
     if (count == 0) {
-        if (n_values != 0) {
+        if (n_values != 0 || n_offsets != 0 || ccc_count != 0) {
             error = "NFD table has decomposition values but no code points";
             return false;
         }
@@ -131,14 +135,14 @@ bool NfdTable::validate(std::string & error) const {
             error = "NFD table code points must be sorted and unique";
             return false;
         }
-        if (codepoints[i] > 0x10FFFF) {
-            error = "NFD table contains a code point above U+10FFFF";
+        if (codepoints[i] > 0x10FFFF || (codepoints[i] >= 0xD800 && codepoints[i] <= 0xDFFF)) {
+            error = "NFD table contains an invalid Unicode scalar";
             return false;
         }
     }
     for (size_t i = 0; i < n_values; ++i) {
-        if (values[i] > 0x10FFFF) {
-            error = "NFD table decomposes to a code point above U+10FFFF";
+        if (values[i] > 0x10FFFF || (values[i] >= 0xD800 && values[i] <= 0xDFFF)) {
+            error = "NFD table decomposes to an invalid Unicode scalar";
             return false;
         }
     }
@@ -153,6 +157,11 @@ bool NfdTable::validate(std::string & error) const {
             return false;
         }
         for (size_t i = 0; i < ccc_count; ++i) {
+            if (ccc_codepoints[i] > 0x10FFFF ||
+                (ccc_codepoints[i] >= 0xD800 && ccc_codepoints[i] <= 0xDFFF)) {
+                error = "NFD combining-class table contains an invalid Unicode scalar";
+                return false;
+            }
             if (i > 0 && ccc_codepoints[i] <= ccc_codepoints[i - 1]) {
                 error = "NFD combining-class code points must be sorted and unique";
                 return false;
@@ -233,11 +242,16 @@ bool TokenTable::validate(std::string & error) const {
         return false;
     }
 
-    uint32_t highest = 0;
-    for (const auto & entry : to_id) {
-        highest = std::max(highest, entry.second);
+    const auto contains_id = [this](uint32_t id) {
+        return std::any_of(to_id.begin(), to_id.end(), [id](const auto & entry) {
+            return entry.second == id;
+        });
+    };
+    if (pad_id < -1 || fallback_id < -1) {
+        error = "voice PAD/fallback id must be -1 or non-negative";
+        return false;
     }
-    if (bos_id > highest || eos_id > highest) {
+    if (!contains_id(bos_id) || !contains_id(eos_id)) {
         error = "voice BOS/EOS id is outside its own token table";
         return false;
     }
@@ -246,7 +260,7 @@ bool TokenTable::validate(std::string & error) const {
         return false;
     }
     if (pad_id >= 0) {
-        if (static_cast<uint32_t>(pad_id) > highest) {
+        if (!contains_id(static_cast<uint32_t>(pad_id))) {
             error = "voice PAD id is outside its own token table";
             return false;
         }
@@ -256,7 +270,7 @@ bool TokenTable::validate(std::string & error) const {
             return false;
         }
     }
-    if (fallback_id >= 0 && static_cast<uint32_t>(fallback_id) > highest) {
+    if (fallback_id >= 0 && !contains_id(static_cast<uint32_t>(fallback_id))) {
         error = "voice fallback id is outside its own token table";
         return false;
     }

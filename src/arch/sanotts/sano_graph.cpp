@@ -46,7 +46,9 @@ ggml_tensor * sano_conv1d(ggml_context * ctx, ggml_tensor * weight,
                                        dilation, 0, false, GGML_TYPE_F32);
     const int64_t out_len = im2col->ne[1];
 
-    ggml_tensor * flat = ggml_cont(ctx, ggml_reshape_2d(ctx, im2col, im2col->ne[0], out_len));
+    // im2col already produces contiguous storage. Reshape is a view; copying
+    // it would duplicate the largest activation in every convolution.
+    ggml_tensor * flat = ggml_reshape_2d(ctx, im2col, im2col->ne[0], out_len);
     ggml_tensor * out  = ggml_mul_mat(ctx, weight, flat);   // [out_ch, out_len]
     ggml_mul_mat_set_prec(out, GGML_PREC_F32);
 

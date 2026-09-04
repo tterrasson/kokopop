@@ -11,6 +11,7 @@
 #include "test_wav.cpp"
 #include "test_tokenizer.cpp"
 #include "test_backend.cpp"
+#include "test_parse_integer.cpp"
 #include "test_kokoro_real.cpp"
 #include "test_mock_synthesis.cpp"
 #include "test_text_normalizer.cpp"

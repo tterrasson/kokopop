@@ -2,9 +2,35 @@ from __future__ import annotations
 
 import array
 import struct
+from pathlib import Path
 
 import kokopop
 import pytest
+
+
+def test_sanotts_real_mixed_rates_and_noise_seed():
+    path = Path(__file__).resolve().parents[2] / "models" / "sanotts-mixed.gguf"
+    if not path.is_file():
+        pytest.skip("convert models/sanotts-mixed.gguf to run the integration test")
+    model = kokopop.Model(str(path), n_threads=1, backend="cpu")
+    assert model.arch == "sanotts"
+    assert model.voices == ("amy", "kristin", "heart", "heartnano")
+
+    def render(voice, seed):
+        chunks = list(model.stream("Hello, this is a test.", voice=voice,
+                                   noise_seed=seed, mode="adaptative"))
+        assert chunks and chunks[-1].is_final
+        rate = 22050 if voice in ("amy", "kristin") else 24000
+        assert model.voice_sample_rate(voice) == rate
+        assert all(chunk.sample_rate == rate for chunk in chunks)
+        return b"".join(memoryview(chunk).tobytes() for chunk in chunks)
+
+    for voice in model.voices:
+        first = render(voice, 0)
+        assert first
+        assert first == render(voice, 0)
+        if voice in ("heart", "heartnano"):
+            assert first != render(voice, 2**64 - 1)
 
 
 def _put_u32(out: bytearray, value: int) -> None:

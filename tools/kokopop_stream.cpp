@@ -2,6 +2,7 @@
 #include "yyjson.h"
 
 #include "core/backend_names.h"
+#include "core/parse_integer.h"
 
 #include "streaming/streaming.h"
 #include "stdio/stdio_stream.h"
@@ -344,7 +345,10 @@ int main(int argc, char ** argv) {
             } else if (std::strcmp(argv[i], "--seed") == 0) {
                 const char * v = arg_value(i, argc, argv);
                 if (!v) { usage(argv[0]); return 2; }
-                noise_seed = std::stoull(v);
+                if (!kokopop::parse_u64(v, noise_seed)) {
+                    std::fprintf(stderr, "error: --seed must be an unsigned 64-bit integer\n");
+                    return 2;
+                }
                 has_noise_seed = true;
             } else if (std::strcmp(argv[i], "--http") == 0) {
                 http_mode = true;

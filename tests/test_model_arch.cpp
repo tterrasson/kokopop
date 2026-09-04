@@ -2,6 +2,7 @@
 
 #include "arch/kokoro/kokoro_arch.h"
 #include "model/arch.h"
+#include "model/gguf_util.h"
 
 #include <ggml.h>
 #include <gguf.h>
@@ -12,6 +13,39 @@
 #include <vector>
 
 using kokopop::Arch;
+
+
+TEST_CASE("gguf_typed_readers_reject_wrong_types_without_aborting") {
+    auto * meta = gguf_init_empty();
+    REQUIRE(meta != nullptr);
+    gguf_set_val_str(meta, "scalar", "wrong type");
+    gguf_set_val_u32(meta, "number", 7);
+    const uint32_t data[] = {1, 2};
+    gguf_set_arr_data(meta, "numbers", GGUF_TYPE_UINT32, data, 2);
+    const char * strings[] = {"a", "b"};
+    gguf_set_arr_str(meta, "strings", strings, 2);
+    uint32_t u = 0;
+    int32_t i = 0;
+    bool b = false;
+    float f = 0;
+    std::string s;
+    std::vector<uint32_t> us;
+    std::vector<std::string> ss;
+    CHECK_FALSE(kokopop::gguf_get_u32(meta, "scalar", u));
+    CHECK_FALSE(kokopop::gguf_get_i32(meta, "scalar", i));
+    CHECK_FALSE(kokopop::gguf_get_bool(meta, "scalar", b));
+    CHECK_FALSE(kokopop::gguf_get_f32(meta, "scalar", f));
+    CHECK_FALSE(kokopop::gguf_get_str(meta, "number", s));
+    CHECK_FALSE(kokopop::gguf_get_str_array(meta, "scalar", ss));
+    CHECK_FALSE(kokopop::gguf_get_str_array(meta, "numbers", ss));
+    CHECK_FALSE(kokopop::gguf_get_u32_array(meta, "number", us));
+    CHECK_FALSE(kokopop::gguf_get_u32_array(meta, "strings", us));
+    CHECK(kokopop::gguf_get_u32_array(meta, "numbers", us));
+    CHECK_EQ(us, std::vector<uint32_t>{1, 2});
+    CHECK(kokopop::gguf_get_str_array(meta, "strings", ss));
+    CHECK_EQ(ss, std::vector<std::string>{"a", "b"});
+    gguf_free(meta);
+}
 
 // ---------------------------------------------------------------------------
 // Architecture detection

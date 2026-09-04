@@ -106,9 +106,14 @@ inline std::string write_mock_gguf() {
 }
 
 inline std::string real_model_path() {
+    // Select a language-specific model for a targeted integration run.
+    const char * override_path = std::getenv("KOKOPOP_TEST_MODEL");
+    if (override_path != nullptr && *override_path != '\0') return override_path;
     const char * candidates[] = {
         "models/kokoro-md.gguf",
         "../models/kokoro-md.gguf",
+        "models/kokoro.gguf",
+        "../models/kokoro.gguf",
     };
     for (const char * path : candidates) {
         std::ifstream in(path, std::ios::binary);
