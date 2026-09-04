@@ -24,7 +24,13 @@ namespace kokopop {
 // KOKOPOP_BACKEND_VULKAN → Vulkan, fail if unavailable
 // KOKOPOP_BACKEND_OPENCL → OpenCL, fail if unavailable
 std::unique_ptr<Backend> create_backend(
-    [[maybe_unused]] int32_t requested, int32_t n_threads, [[maybe_unused]] std::string & error) {
+    [[maybe_unused]] int32_t requested, int32_t n_threads, Arch arch_hint,
+    [[maybe_unused]] std::string & error) {
+
+    // AUTO + sanoTTS -> CPU, for now.
+    if (requested == KOKOPOP_BACKEND_AUTO && arch_hint == Arch::SanoTTS) {
+        requested = KOKOPOP_BACKEND_CPU;
+    }
 
 #ifdef KOKOPOP_HAS_CUDA
     if (requested == KOKOPOP_BACKEND_AUTO || requested == KOKOPOP_BACKEND_CUDA) {
