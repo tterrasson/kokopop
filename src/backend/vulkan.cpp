@@ -406,34 +406,8 @@ public:
         return KOKOPOP_BACKEND_VULKAN;
     }
 
-    size_t generation_context_bytes(int64_t total_frames, int64_t n_tokens) const override {
-        const size_t frames = static_cast<size_t>(std::max<int64_t>(1, total_frames));
-        const size_t tokens = static_cast<size_t>(std::max<int64_t>(1, n_tokens));
 
-        const size_t mask_bytes = frames * tokens * sizeof(float);
-        const size_t pred_bytes = 512ULL * tokens * sizeof(float);
-        const size_t lstm_work  = frames * 4096ULL * sizeof(float);
-        const size_t overhead   = backend_mib(64);
 
-        return mask_bytes + pred_bytes + lstm_work + overhead;
-    }
-
-    size_t generator_context_bytes(int64_t decoder_len) const override {
-        const size_t dec = static_cast<size_t>(std::max<int64_t>(1, decoder_len));
-        const size_t out_frames = dec * 60;
-
-        const size_t decoder_tensor  = 64ULL * dec * sizeof(float);
-        const size_t harmonic_tensor = 22ULL * (out_frames + 1) * sizeof(float);
-        const size_t post_tensor     = out_frames * sizeof(float);
-        const size_t conv_work       = 256ULL * out_frames * sizeof(float) * 3;
-        const size_t overhead        = backend_mib(16);
-
-        return decoder_tensor + harmonic_tensor + post_tensor + conv_work + overhead;
-    }
-
-    size_t frontend_context_bytes() const override {
-        return backend_mib(16);
-    }
 };
 
 } // anonymous namespace

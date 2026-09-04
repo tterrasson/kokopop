@@ -1,5 +1,6 @@
 #include "kokoro.h"
 
+#include "audio/istft.h"
 #include "core/constants.h"
 
 #ifdef KOKOPOP_HAS_METAL
@@ -71,7 +72,7 @@ static const StftTwiddles & stft_twiddles() {
 
 ggml_tensor * depthwise_pool_upsample(
     ggml_context * ctx,
-    Model & model,
+    KokoroArch & model,
     ggml_tensor * x,
     const std::string & prefix,
     std::string & error) {
@@ -117,7 +118,7 @@ ggml_tensor * depthwise_pool_upsample(
 // ---------------------------------------------------------------------------
 
 static bool fill_harmonic_stft(
-    Model & model,
+    KokoroArch & model,
     const std::vector<float> & f0,
     int64_t target_frames,
     std::vector<float> & har_data,
@@ -420,7 +421,7 @@ static bool fill_harmonic_stft(
     return true;
 }
 
-CpuTensor cpu_harmonic_stft(Model & model, const std::vector<float> & f0, int64_t target_frames, std::string & error) {
+CpuTensor cpu_harmonic_stft(KokoroArch & model, const std::vector<float> & f0, int64_t target_frames, std::string & error) {
     std::vector<float> & har_data = model.tmp_stft_har_f32;
     if (!fill_harmonic_stft(model, f0, target_frames, har_data, error)) {
         return {};
@@ -433,20 +434,40 @@ CpuTensor cpu_harmonic_stft(Model & model, const std::vector<float> & f0, int64_
     };
 }
 
-// cpu_istft takes a Model& and a std::vector<float>& for the output buffer.
-// The intermediate y[] and denom[] arrays are cached inside Model and reused
-// across calls, eliminating two large allocations per chunk.
-static bool cpu_istft_data(Model & model, const float * post_data, int64_t n_frames, std::vector<float> & out) {
+// Kokoro's iSTFT: convert its log-magnitude/phase pair to a complex
+// half-spectrum, then hand it to the shared component in src/audio.
+//
+// Only the conversion is Kokoro's. The window, the inverse transform, the
+// overlap-add and the 1/Sum(w^2) normalisation live in IstftPlan/istft(), which
+// sanoTTS reuses at n_fft=1024.
+static const IstftPlan & kokoro_istft_plan() {
+    // Immutable and stateless once built, so one instance is shared by every
+    // arch instance and every thread. C++11 guarantees the init is thread-safe.
+    static const IstftPlan plan = [] {
+        IstftPlan p;
+        std::string error;
+        const bool ok = IstftPlan::create(
+            IstftConfig{static_cast<uint32_t>(KOKOPOP_STFT_N),
+                        static_cast<uint32_t>(KOKOPOP_STFT_HOP),
+                        /*center=*/true},
+            p, error);
+        // The configuration is a compile-time constant, so a failure here would
+        // be a build-time mistake, not a runtime condition.
+        (void)ok;
+        return p;
+    }();
+    return plan;
+}
+
+static bool cpu_istft_data(KokoroArch & model, const float * post_data, int64_t n_frames, std::vector<float> & out) {
     constexpr int n_fft = KOKOPOP_STFT_N;
-    constexpr int hop = KOKOPOP_STFT_HOP;
     if (n_frames <= 0) {
         out.clear();
         return true;
     }
-    const int64_t padded_len = n_fft + hop * (n_frames - 1);
-    const int64_t center_pad = n_fft / 2;
-    const int64_t out_len = std::max<int64_t>(0, padded_len - 2 * center_pad);
-    if (out_len <= 0) {
+    const IstftPlan & plan = kokoro_istft_plan();
+    size_t out_len = 0;
+    if (!plan.output_samples(static_cast<size_t>(n_frames), out_len) || out_len == 0) {
         out.clear();
         return true;
     }
@@ -454,7 +475,7 @@ static bool cpu_istft_data(Model & model, const float * post_data, int64_t n_fra
 #ifdef KOKOPOP_HAS_METAL
     if (model.backend != nullptr) {
         if (auto * stft = static_cast<MetalStftState *>(model.backend->metal_stft_kernel())) {
-            out.resize(static_cast<size_t>(out_len));
+            out.resize(out_len);
             metal_istft_compute(stft, post_data, out.data(),
                                 static_cast<int>(n_frames),
                                 static_cast<int>(out_len));
@@ -463,70 +484,54 @@ static bool cpu_istft_data(Model & model, const float * post_data, int64_t n_fra
     }
 #endif
 
-    // Reuse pre-allocated accumulator and denominator buffers.
-    std::vector<float> & y = model.tmp_istft_y_f32;
-    std::vector<float> & denom = model.tmp_istft_denom_f32;
-    const size_t pad_size = static_cast<size_t>(padded_len);
-    if (y.size() < pad_size) {
-        y.resize(pad_size);
-    }
-    if (denom.size() < pad_size) {
-        denom.resize(pad_size);
-    }
-    std::fill(y.begin(), y.begin() + static_cast<ptrdiff_t>(pad_size), 0.0f);
-    std::fill(denom.begin(), denom.begin() + static_cast<ptrdiff_t>(pad_size), 0.0f);
-    const float * window = hann_window_20();
-    const StftTwiddles & tw = stft_twiddles();
+    const size_t bins = plan.bins();
+    const size_t frames = static_cast<size_t>(n_frames);
+    std::vector<float> & real = model.tmp_istft_real_f32;
+    std::vector<float> & imag = model.tmp_istft_imag_f32;
+    real.resize(bins * frames);
+    imag.resize(bins * frames);
+
     const auto post_at = [post_data, n_frames](int64_t c, int64_t t) -> float {
         return post_data[static_cast<size_t>(c * n_frames + t)];
     };
+    for (size_t k = 0; k < bins; ++k) {
+        for (size_t t = 0; t < frames; ++t) {
+            const float mag = std::exp(std::clamp(
+                post_at(static_cast<int64_t>(k), static_cast<int64_t>(t)),
+                -20.0f, 8.0f));
 
-    // Precompute window² once per thread — same for every frame.
-    static thread_local float win_sq[n_fft];
-    static thread_local bool  win_sq_init = false;
-    if (!win_sq_init) {
-        for (int n = 0; n < n_fft; ++n) win_sq[n] = window[n] * window[n];
-        win_sq_init = true;
-    }
+            // Kokoro's convention: the phase channel is passed through sin()
+            // before being used as an angle. Odd, but it is what the weights
+            // were trained against.
+            const float phase = std::sin(
+                post_at(static_cast<int64_t>(k) + n_fft / 2 + 1, static_cast<int64_t>(t)));
 
-    for (int64_t frame = 0; frame < n_frames; ++frame) {
-        float real[n_fft / 2 + 1]{};
-        float imag[n_fft / 2 + 1]{};
-        for (int k = 0; k <= n_fft / 2; ++k) {
-            const float mag = std::exp(std::clamp(post_at(k, frame), -20.0f, 8.0f));
-            const float phase = std::sin(post_at(k + n_fft / 2 + 1, frame));
-            const float sin_ph = std::sin(phase);
-            const float cos_ph = std::cos(phase);
-            real[k] = mag * cos_ph;
-            imag[k] = mag * sin_ph;
-        }
-
-        for (int n = 0; n < n_fft; ++n) {
-            // (n%2)==0 ? 1:-1  →  1 - 2*(n&1), no branch
-            float sample = real[0] + real[n_fft / 2] * static_cast<float>(1 - 2 * (n & 1));
-            const float * tc = tw.c[n];
-            const float * ts = tw.s[n];
-            for (int k = 1; k < n_fft / 2; ++k) {
-                sample += 2.0f * (real[k] * tc[k] - imag[k] * ts[k]);
-            }
-            sample *= (1.0f / static_cast<float>(n_fft));
-            const int64_t dst = frame * hop + n;
-            y[static_cast<size_t>(dst)]     += sample * window[n];
-            denom[static_cast<size_t>(dst)] += win_sq[n];
+            real[k * frames + t] = mag * std::cos(phase);
+            imag[k * frames + t] = mag * std::sin(phase);
         }
     }
-    out.resize(static_cast<size_t>(out_len));
-    for (int64_t i = 0; i < out_len; ++i) {
-        const int64_t src = i + center_pad;
-        const float d = denom[static_cast<size_t>(src)];
-        out[static_cast<size_t>(i)] = std::clamp(
-            d > 1e-8f ? y[static_cast<size_t>(src)] / d : 0.0f,
-            -1.0f, 1.0f);
+
+    ComplexSpectrumView spectrum;
+    spectrum.real = real.data();
+    spectrum.imag = imag.data();
+    spectrum.bins = bins;
+    spectrum.frames = frames;
+    spectrum.bin_stride = static_cast<ptrdiff_t>(frames);
+    spectrum.frame_stride = 1;
+
+    std::string error;
+    if (!istft(plan, model.istft_workspace, spectrum, out, error)) {
+        out.clear();
+        return false;
+    }
+    // Kokoro clamps its own output; the component deliberately does not.
+    for (float & sample : out) {
+        sample = std::clamp(sample, -1.0f, 1.0f);
     }
     return !out.empty();
 }
 
-bool cpu_istft(Model & model, const CpuTensor & post, std::vector<float> & out) {
+bool cpu_istft(KokoroArch & model, const CpuTensor & post, std::vector<float> & out) {
     return cpu_istft_data(model, post.data.data(), post.length, out);
 }
 
@@ -559,7 +564,7 @@ size_t generator_graph_size(int64_t) {
 // ---------------------------------------------------------------------------
 
 ggml_context * init_scratch_context(
-    Model & model, ScratchArena & arena, size_t mem_size,
+    KokoroArch & model, ScratchArena & arena, size_t mem_size,
     bool no_alloc, const char * label, std::string & error) {
     (void)model;
     uint8_t * mem = nullptr;
@@ -587,7 +592,7 @@ ggml_context * init_scratch_context(
 // ---------------------------------------------------------------------------
 
 bool ggml_generator(
-    Model & model,
+    KokoroArch & model,
     const CpuTensor & decoder,
     const std::vector<float> & f0,
     const std::vector<float> & style,
@@ -603,7 +608,7 @@ bool ggml_generator(
         return false;
     }
 
-    const size_t mem_size = model.backend->generator_context_bytes(decoder.length);
+    const size_t mem_size = kokoro_generator_context_bytes(*model.backend, decoder.length);
     model.backend->clear_pending_inits();
 
     ggml_context * ctx = init_scratch_context(model, model.generator_scratch, mem_size, true, "generator", error);

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "model/model.h"
+#include "arch/kokoro/kokoro_arch.h"
 
 #include <cstdint>
 #include <string>
@@ -34,7 +34,7 @@ struct KokoroGenerationProbe {
 // Internal helpers (defined in kokoro.cpp)
 // ---------------------------------------------------------------------------
 
-ggml_tensor * require_tensor(Model & model, const char * name, std::string & error);
+ggml_tensor * require_tensor(KokoroArch & model, const char * name, std::string & error);
 
 // ---------------------------------------------------------------------------
 // Graph operations (defined in graph_ops.cpp)
@@ -46,7 +46,7 @@ ggml_tensor * add_channel_bias(ggml_context * ctx, ggml_tensor * x, ggml_tensor 
 // ggml_leaky_relu, unless the active backend has no kernel for it, in which
 // case the mathematically identical relu(x) - slope*relu(-x) is emitted so the
 // tensor stays on the device (see Backend::has_leaky_relu).
-ggml_tensor * graph_leaky_relu(ggml_context * ctx, const Model & model, ggml_tensor * x, float slope);
+ggml_tensor * graph_leaky_relu(ggml_context * ctx, const KokoroArch & model, ggml_tensor * x, float slope);
 // direct=true asks for a single CONV_2D node instead of im2col + mul_mat; see
 // Backend::prefers_direct_conv. Silently falls back when the shapes do not fit.
 ggml_tensor * conv1d(
@@ -61,7 +61,7 @@ ggml_tensor * conv_transpose1d_crop(
     int out_len);
 ggml_tensor * conv_transpose1d_crop_bias(
     ggml_context * ctx,
-    Model & model,
+    KokoroArch & model,
     ggml_tensor * weight,
     ggml_tensor * input,
     ggml_tensor * bias,
@@ -70,16 +70,16 @@ ggml_tensor * conv_transpose1d_crop_bias(
     int out_len);
 ggml_tensor * depthwise_pool_upsample(
     ggml_context * ctx,
-    Model & model,
+    KokoroArch & model,
     ggml_tensor * x,
     const std::string & prefix,
     std::string & error);
 ggml_context * init_scratch_context(
-    Model & model, ScratchArena & arena, size_t mem_size,
+    KokoroArch & model, ScratchArena & arena, size_t mem_size,
     bool no_alloc, const char * label, std::string & error);
 ggml_tensor * adain_1d(
     ggml_context * ctx,
-    Model & model,
+    KokoroArch & model,
     ggml_tensor * x,
     ggml_tensor * style,
     const std::string & prefix,
@@ -91,7 +91,7 @@ ggml_tensor * adain_1d(
     const AdaIn1dWeights & weights);
 ggml_tensor * adain_resblk1d(
     ggml_context * ctx,
-    Model & model,
+    KokoroArch & model,
     ggml_tensor * x,
     ggml_tensor * style,
     const std::string & prefix,
@@ -99,7 +99,7 @@ ggml_tensor * adain_resblk1d(
     std::string & error);
 ggml_tensor * ada_layer_norm(
     ggml_context * ctx,
-    Model & model,
+    KokoroArch & model,
     ggml_tensor * x,
     ggml_tensor * style,
     const std::string & prefix,
@@ -111,7 +111,7 @@ ggml_tensor * graph_snake1d(
     const std::string & alpha_name,
     std::string & error);
 ggml_tensor * graph_snake1d(
-    ggml_context * ctx, Model & model, ggml_tensor * x,
+    ggml_context * ctx, KokoroArch & model, ggml_tensor * x,
     const std::string & alpha_name, std::string & error);
 ggml_tensor * graph_generator_resblock(
     ggml_context * ctx,
@@ -125,7 +125,7 @@ ggml_tensor * graph_generator_resblock(
     bool direct = false);
 ggml_tensor * graph_generator_resblock(
     ggml_context * ctx,
-    Model & model,
+    KokoroArch & model,
     ggml_tensor * x,
     ggml_tensor * style,
     const std::string & prefix,
@@ -141,7 +141,7 @@ ggml_tensor * graph_generator_resblock(
 // entire stage including this sum.
 ggml_tensor * graph_3branch_main_sum(
     ggml_context * ctx,
-    Model & model,
+    KokoroArch & model,
     ggml_tensor * x,
     ggml_tensor * style,
     int stage,
@@ -160,7 +160,7 @@ ggml_tensor * graph_3branch_main_sum(
 // `stage` is 0 or 1. `har_t` is the harmonic STFT tensor (graph input).
 ggml_tensor * graph_generator_stage_fused(
     ggml_context * ctx,
-    Model & model,
+    KokoroArch & model,
     ggml_tensor * x,
     ggml_tensor * style,
     ggml_tensor * har_t,
@@ -168,21 +168,21 @@ ggml_tensor * graph_generator_stage_fused(
     std::string & error);
 ggml_tensor * duration_encoder(
     ggml_context * ctx,
-    Model & model,
+    KokoroArch & model,
     ggml_tensor * x,
     ggml_tensor * style,
     int64_t n_steps,
     std::string & error);
 ggml_tensor * text_encoder(
     ggml_context * ctx,
-    Model & model,
+    KokoroArch & model,
     ggml_tensor * token_ids,
     ggml_tensor * duration_mask,
     int64_t n_tokens,
     std::string & error);
 ggml_tensor * bidirectional_lstm(
     ggml_context * ctx,
-    Model & model,
+    KokoroArch & model,
     ggml_tensor * input,
     const std::string & prefix,
     int64_t n_steps,
@@ -211,17 +211,8 @@ struct CpuTensor {
     }
 };
 
-struct KokoroDiffusionOptions {
-    bool enabled = false;
-    uint32_t seed = 0;
-    int steps = 5;
-    float alpha = 0.1f;
-    float beta = 0.5f;
-    float embedding_scale = 1.0f;
-};
-
 bool ggml_generator(
-    Model & model, const CpuTensor & decoder,
+    KokoroArch & model, const CpuTensor & decoder,
     const std::vector<float> & f0,
     const std::vector<float> & style,
     std::vector<float> & audio,
@@ -230,6 +221,29 @@ bool ggml_generator(
 // ---------------------------------------------------------------------------
 // Main pipeline (defined in kokoro.cpp)
 // ---------------------------------------------------------------------------
+
+bool run_kokoro_frontend_probe(
+    KokoroArch & model,
+    const std::vector<uint32_t> & ids,
+    const std::string & voice,
+    KokoroFrontendProbe & probe,
+    std::string & error,
+    int64_t style_len = -1,
+    const KokoroDiffusionOptions * diffusion = nullptr);
+
+bool run_kokoro_generation_probe(
+    KokoroArch & model,
+    const std::vector<uint32_t> & ids,
+    const std::string & voice,
+    float speed,
+    const KokoroFrontendProbe & frontend,
+    KokoroGenerationProbe & probe,
+    std::string & error,
+    int64_t style_len = -1);
+
+// Convenience overloads for callers that hold a `Model` (tools, tests, the
+// benchmark): they resolve the KokoroArch behind it and fail with a clear
+// message when the file is not a Kokoro model.
 
 bool run_kokoro_frontend_probe(
     Model & model,

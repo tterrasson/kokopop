@@ -1,7 +1,7 @@
-#include "inference/diffusion_sampler.h"
+#include "arch/kokoro/diffusion_sampler.h"
 
 #include "core/constants.h"
-#include "inference/diffusion_kernels.h"
+#include "arch/kokoro/diffusion_kernels.h"
 
 #include <algorithm>
 #include <cmath>
@@ -21,7 +21,7 @@ struct DiffusionTensor {
 };
 
 bool diffusion_tensor(
-    Model & model,
+    KokoroArch & model,
     const std::string & name,
     DiffusionTensor & out,
     std::string & error) {
@@ -53,7 +53,7 @@ float gelu_exact(float x) {
 }
 
 bool diffusion_linear_rows(
-    Model & model,
+    KokoroArch & model,
     const std::string & prefix,
     const std::vector<float> & input,
     int64_t rows,
@@ -92,7 +92,7 @@ bool diffusion_linear_rows(
 }
 
 bool diffusion_layer_norm_rows(
-    Model & model,
+    KokoroArch & model,
     const std::string & prefix,
     const std::vector<float> & input,
     int64_t rows,
@@ -127,7 +127,7 @@ bool diffusion_layer_norm_rows(
 //   h = fc(s); gamma, beta = chunk(h); out = (1 + gamma) * layernorm(x) + beta
 // fc lives at `prefix + ".fc"` (weight [2*dim, style_dim], bias [2*dim]).
 bool diffusion_ada_layer_norm_rows(
-    Model & model,
+    KokoroArch & model,
     const std::string & prefix,
     const std::vector<float> & input,
     int64_t rows,
@@ -164,7 +164,7 @@ bool diffusion_ada_layer_norm_rows(
 // StyleTransformerBlock (AdaLayerNorm conditioned on the style vector);
 // otherwise it is a plain TransformerBlock with a static LayerNorm.
 bool diffusion_attention_block(
-    Model & model,
+    KokoroArch & model,
     const std::string & prefix,
     std::vector<float> & x,
     int64_t rows,
@@ -266,7 +266,7 @@ bool diffusion_attention_block(
 }
 
 bool diffusion_transformer_run(
-    Model & model,
+    KokoroArch & model,
     const std::vector<float> & x_style,
     float c_noise,
     const std::vector<float> & embedding,
@@ -428,7 +428,7 @@ std::vector<float> karras_sigmas(int steps) {
 }
 
 bool diffusion_denoise(
-    Model & model,
+    KokoroArch & model,
     const std::vector<float> & x_noisy,
     float sigma,
     const std::vector<float> & embedding,
@@ -470,7 +470,7 @@ bool diffusion_denoise(
 } // namespace
 
 bool apply_diffusion_style_options(
-    Model & model,
+    KokoroArch & model,
     const KokoroDiffusionOptions * options,
     std::vector<float> & style,
     const std::vector<float> & embedding,

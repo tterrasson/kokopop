@@ -22,7 +22,7 @@ sanoTTS support derives only from files on that MIT list:
 | `pypkg/sanotts/voicepack.py` | voice-pack manifest validation | [tools/convert_sanotts_to_gguf.py](tools/convert_sanotts_to_gguf.py) |
 
 Nothing in kokopop derives from `tools/`, `web/`, `npmpkg/` or any espeak-ng
-port in that repository — all of which stay GPL-3.0-or-later.
+port in that repository, all of which stay GPL-3.0-or-later.
 
 ### Notice
 

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "inference/kokoro.h"
+#include "arch/kokoro/kokoro.h"
 
 #include <cstdint>
 #include <string>
@@ -9,7 +9,7 @@
 namespace kokopop {
 
 bool apply_diffusion_style_options(
-    Model & model,
+    KokoroArch & model,
     const KokoroDiffusionOptions * options,
     std::vector<float> & style,
     const std::vector<float> & embedding,

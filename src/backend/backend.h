@@ -9,8 +9,23 @@
 #include <ggml-backend.h>
 
 #include "kokopop.h"
+#include "model/arch.h"
 
 namespace kokopop {
+
+// Shared utilities for backend implementations.
+inline size_t backend_mib(size_t value) {
+    return value * 1024ull * 1024ull;
+}
+
+/// ggml object/graph metadata for a graph of this size, floored at `margin`.
+inline size_t graph_context_bytes_with_margin(size_t n_tensors, size_t n_nodes,
+                                              size_t margin) {
+    const size_t nodes = n_nodes > 0 ? n_nodes : 1;
+    const size_t meta  = n_tensors * ggml_tensor_overhead()
+                       + ggml_graph_overhead_custom(nodes, /*grads=*/false);
+    return meta > margin ? meta : margin;
+}
 
 // Abstract backend interface — zero #ifdef GGML_USE_METAL in inference code.
 // Each concrete backend encapsulates its own graph-execution strategy and I/O.
@@ -131,21 +146,23 @@ struct Backend {
 
     // ---- Context sizing ----
 
-    // Memory bytes needed for a generation scratch context.
-    virtual size_t generation_context_bytes(int64_t total_frames,
-                                            int64_t n_tokens) const = 0;
-
-    // Memory bytes needed for a generator scratch context.
-    virtual size_t generator_context_bytes(int64_t decoder_len) const = 0;
-
-    // Memory bytes needed for a frontend scratch context.
-    virtual size_t frontend_context_bytes() const = 0;
+    /// Bytes to reserve for a ggml graph context sized for `n_tensors` tensors
+    /// and `n_nodes` nodes.
+    ///
+    /// The graph contexts are created with `no_alloc=true`, so tensor *data*
+    /// never lives in them; what has to fit is ggml's own object and graph
+    /// metadata. An architecture that also stages data through the context adds
+    /// its own estimate on top of this value (see
+    /// arch/kokoro/kokoro_arch.h for Kokoro's three formulas).
+    ///
+    /// The result is floored at a per-backend margin covering submission
+    /// bookkeeping and the extra nodes ggml-sched splices in when it bounces a
+    /// tensor between sub-backends. Metal needs noticeably more of it, so it
+    /// overrides this method rather than the margin being one global constant.
+    virtual size_t graph_context_bytes(size_t n_tensors, size_t n_nodes) const {
+        return graph_context_bytes_with_margin(n_tensors, n_nodes, backend_mib(16));
+    }
 };
-
-// Shared utilities for backend implementations.
-inline size_t backend_mib(size_t value) {
-    return value * 1024ull * 1024ull;
-}
 
 inline size_t backend_graph_capacity(ggml_cgraph * graph) {
     const size_t need = static_cast<size_t>(std::max(1, ggml_graph_size(graph)));
@@ -247,7 +264,18 @@ std::unique_ptr<Backend> create_cpu_backend(int32_t n_threads);
 // requested: KOKOPOP_BACKEND_AUTO (0), KOKOPOP_BACKEND_CPU (1),
 //            KOKOPOP_BACKEND_METAL (2), KOKOPOP_BACKEND_CUDA (3),
 //            KOKOPOP_BACKEND_VULKAN (4), KOKOPOP_BACKEND_OPENCL (5)
+//
+// `arch_hint` is the architecture declared by the GGUF being loaded. AUTO uses
+// it because the right answer differs per architecture: Kokoro is worth
+// offloading, a sub-megaparameter sanoTTS voice is not obviously so. An
+// explicit request is always honoured.
 std::unique_ptr<Backend> create_backend(
-    int32_t requested, int32_t n_threads, std::string & error);
+    int32_t requested, int32_t n_threads, Arch arch_hint, std::string & error);
+
+/// Overload for callers with no GGUF in hand (tests, backend probes).
+inline std::unique_ptr<Backend> create_backend(
+    int32_t requested, int32_t n_threads, std::string & error) {
+    return create_backend(requested, n_threads, Arch::Unknown, error);
+}
 
 } // namespace kokopop

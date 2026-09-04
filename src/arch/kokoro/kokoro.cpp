@@ -1,7 +1,7 @@
 #include "kokoro.h"
 
 #include "constants.h"
-#include "inference/diffusion_sampler.h"
+#include "arch/kokoro/diffusion_sampler.h"
 
 #include <algorithm>
 #include <cmath>
@@ -16,7 +16,7 @@
 
 namespace kokopop {
 
-ggml_tensor * require_tensor(Model & model, const char * name, std::string & error) {
+ggml_tensor * require_tensor(KokoroArch & model, const char * name, std::string & error) {
     ggml_tensor * t = model.cached_tensor(name);
     if (t == nullptr && error.empty()) {
         error = std::string("missing Kokoro tensor: ") + name;
@@ -49,7 +49,7 @@ struct AlbertLayerWeights {
     ggml_tensor * out_norm_b = nullptr;
 };
 
-bool load_albert_layer(Model & model, AlbertLayerWeights & w, std::string & error) {
+bool load_albert_layer(KokoroArch & model, AlbertLayerWeights & w, std::string & error) {
     constexpr const char * base = KOKOPOP_PREFIX_ALBERT_LAYER;
 
     // Single reusable key string — avoids 16 temporary std::string allocations.
@@ -152,15 +152,15 @@ bool build_duration_mask(
 }
 
 bool copy_voice_style_row(
-    const Model & model,
+    const KokoroArch & model,
     const std::string & voice_name,
     ggml_tensor * voice,
     int64_t n_tokens,
     int64_t style_len,
     std::vector<float> & out,
     std::string & error) {
-    const auto it = model.voices.find(voice_name);
-    if (it == model.voices.end()) {
+    const auto it = model.voice_styles.find(voice_name);
+    if (it == model.voice_styles.end()) {
         error = "missing Kokoro voice data for style sampling";
         return false;
     }
@@ -197,7 +197,7 @@ int duration_to_frames(float value, float speed) {
 // ---------------------------------------------------------------------------
 
 bool run_kokoro_frontend_probe(
-    Model & model,
+    KokoroArch & model,
     const std::vector<uint32_t> & ids,
     const std::string & requested_voice,
     KokoroFrontendProbe & probe,
@@ -239,7 +239,7 @@ bool run_kokoro_frontend_probe(
         return false;
     }
 
-    const std::string voice_name = resolve_voice_name(requested_voice, model.voices);
+    const std::string voice_name = model.resolve_voice(requested_voice);
     ggml_tensor * voice = !voice_name.empty() ? model.cached_tensor("kokopop.voice." + voice_name) : nullptr;
     if (voice == nullptr) {
         error = "missing Kokoro voice tensor for duration graph";
@@ -249,7 +249,7 @@ bool run_kokoro_frontend_probe(
         return false;
     }
 
-    const size_t mem_size = model.backend->frontend_context_bytes();
+    const size_t mem_size = kokoro_frontend_context_bytes(*model.backend);
     model.backend->clear_pending_inits();
 
     ggml_context * ctx = init_scratch_context(model, model.frontend_scratch, mem_size, true, "frontend", error);
@@ -546,7 +546,7 @@ bool run_kokoro_frontend_probe(
 // ---------------------------------------------------------------------------
 
 bool run_kokoro_generation_probe(
-    Model & model,
+    KokoroArch & model,
     const std::vector<uint32_t> & ids,
     const std::string & requested_voice,
     float speed,
@@ -608,7 +608,7 @@ bool run_kokoro_generation_probe(
         return false;
     }
 
-    const std::string voice_name = resolve_voice_name(requested_voice, model.voices);
+    const std::string voice_name = model.resolve_voice(requested_voice);
     ggml_tensor * voice = !voice_name.empty() ? model.cached_tensor("kokopop.voice." + voice_name) : nullptr;
     if (voice == nullptr) {
         error = "missing Kokoro voice tensor for generation graph";
@@ -623,7 +623,7 @@ bool run_kokoro_generation_probe(
         style_data = &fallback_style;
     }
 
-    const size_t mem_size = model.backend->generation_context_bytes(total_frames, frontend.n_tokens);
+    const size_t mem_size = kokoro_generation_context_bytes(*model.backend, total_frames, frontend.n_tokens);
     model.backend->clear_pending_inits();
 
     ggml_context * ctx = init_scratch_context(model, model.generation_scratch, mem_size, true, "generation", error);
@@ -982,6 +982,54 @@ bool run_kokoro_generation_probe(
 
     ggml_free(ctx);
     return true;
+}
+
+
+// ---------------------------------------------------------------------------
+// Model& convenience overloads
+// ---------------------------------------------------------------------------
+
+namespace {
+
+KokoroArch * require_kokoro_arch(Model & model, std::string & error) {
+    KokoroArch * arch = kokoro_arch(model);
+    if (arch == nullptr) {
+        error = "model is not a Kokoro model";
+    }
+    return arch;
+}
+
+} // namespace
+
+bool run_kokoro_frontend_probe(
+    Model & model,
+    const std::vector<uint32_t> & ids,
+    const std::string & voice,
+    KokoroFrontendProbe & probe,
+    std::string & error,
+    int64_t style_len,
+    const KokoroDiffusionOptions * diffusion) {
+    KokoroArch * arch = require_kokoro_arch(model, error);
+    if (arch == nullptr) {
+        return false;
+    }
+    return run_kokoro_frontend_probe(*arch, ids, voice, probe, error, style_len, diffusion);
+}
+
+bool run_kokoro_generation_probe(
+    Model & model,
+    const std::vector<uint32_t> & ids,
+    const std::string & voice,
+    float speed,
+    const KokoroFrontendProbe & frontend,
+    KokoroGenerationProbe & probe,
+    std::string & error,
+    int64_t style_len) {
+    KokoroArch * arch = require_kokoro_arch(model, error);
+    if (arch == nullptr) {
+        return false;
+    }
+    return run_kokoro_generation_probe(*arch, ids, voice, speed, frontend, probe, error, style_len);
 }
 
 } // namespace kokopop

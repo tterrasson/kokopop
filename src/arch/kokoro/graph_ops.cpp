@@ -812,7 +812,7 @@ ggml_tensor * conv_transpose1d_crop(
 
 ggml_tensor * conv_transpose1d_crop_bias(
     ggml_context * ctx,
-    [[maybe_unused]] Model & model,
+    [[maybe_unused]] KokoroArch & model,
     ggml_tensor * weight,
     ggml_tensor * input,
     ggml_tensor * bias,
@@ -864,7 +864,7 @@ ggml_tensor * repeat_style(ggml_context * ctx, ggml_tensor * style, int64_t n_st
 
 ggml_tensor * ada_layer_norm(
     ggml_context * ctx,
-    Model & model,
+    KokoroArch & model,
     ggml_tensor * x,
     ggml_tensor * style,
     const std::string & prefix,
@@ -932,7 +932,7 @@ ggml_tensor * graph_snake1d(
 
 ggml_tensor * graph_snake1d(
     ggml_context * ctx,
-    Model & model,
+    KokoroArch & model,
     ggml_tensor * x,
     const std::string & alpha_name,
     std::string & error) {
@@ -953,7 +953,7 @@ ggml_tensor * graph_snake1d(
 
 ggml_tensor * adain_1d(
     ggml_context * ctx,
-    Model & model,
+    KokoroArch & model,
     ggml_tensor * x,
     ggml_tensor * style,
     const std::string & prefix,
@@ -978,11 +978,11 @@ ggml_tensor * adain_1d(
 }
 
 // Shorthand for the convolution policy of the active backend.
-static bool direct_conv(const Model & model) {
+static bool direct_conv(const KokoroArch & model) {
     return model.backend != nullptr && model.backend->prefers_direct_conv();
 }
 
-ggml_tensor * graph_leaky_relu(ggml_context * ctx, const Model & model, ggml_tensor * x, float slope) {
+ggml_tensor * graph_leaky_relu(ggml_context * ctx, const KokoroArch & model, ggml_tensor * x, float slope) {
     if (model.backend == nullptr || model.backend->has_leaky_relu()) {
         return ggml_leaky_relu(ctx, x, slope, false);
     }
@@ -995,7 +995,7 @@ ggml_tensor * graph_leaky_relu(ggml_context * ctx, const Model & model, ggml_ten
 
 ggml_tensor * adain_resblk1d(
     ggml_context * ctx,
-    Model & model,
+    KokoroArch & model,
     ggml_tensor * x,
     ggml_tensor * style,
     const std::string & prefix,
@@ -1112,7 +1112,7 @@ ggml_tensor * graph_generator_resblock(
 
 ggml_tensor * graph_generator_resblock(
     ggml_context * ctx,
-    Model & model,
+    KokoroArch & model,
     ggml_tensor * x,
     ggml_tensor * style,
     const std::string & prefix,
@@ -1224,7 +1224,7 @@ struct LstmWeights {
 };
 
 static LstmWeights load_lstm_weights(
-    Model & model,
+    KokoroArch & model,
     const std::string & prefix,
     bool reverse,
     std::string & error) {
@@ -1299,7 +1299,7 @@ static LstmWeights load_lstm_weights(
 // fuses everything in graph_generator_stage_fused().
 ggml_tensor * graph_3branch_main_sum(
     ggml_context * ctx,
-    Model & model,
+    KokoroArch & model,
     ggml_tensor * x,
     ggml_tensor * style,
     int stage,
@@ -1324,7 +1324,7 @@ ggml_tensor * graph_3branch_main_sum(
 // ---------------------------------------------------------------------------
 ggml_tensor * graph_generator_stage_fused(
     ggml_context * ctx,
-    Model & model,
+    KokoroArch & model,
     ggml_tensor * x,
     ggml_tensor * style,
     ggml_tensor * har_t,
@@ -1438,7 +1438,7 @@ ggml_tensor * graph_generator_stage_fused(
 
 ggml_tensor * lstm_direction(
     ggml_context * ctx,
-    Model & model,
+    KokoroArch & model,
     ggml_tensor * input,
     const std::string & prefix,
     bool reverse,
@@ -1513,7 +1513,7 @@ ggml_tensor * lstm_direction(
 
 ggml_tensor * bidirectional_lstm(
     ggml_context * ctx,
-    Model & model,
+    KokoroArch & model,
     ggml_tensor * input,
     const std::string & prefix,
     int64_t n_steps,
@@ -1534,7 +1534,7 @@ ggml_tensor * bidirectional_lstm(
 
 ggml_tensor * duration_encoder(
     ggml_context * ctx,
-    Model & model,
+    KokoroArch & model,
     ggml_tensor * x,
     ggml_tensor * style,
     int64_t n_steps,
@@ -1577,7 +1577,7 @@ ggml_tensor * duration_encoder(
 
 ggml_tensor * text_encoder(
     ggml_context * ctx,
-    Model & model,
+    KokoroArch & model,
     ggml_tensor * token_ids,
     ggml_tensor * duration_mask,
     int64_t n_tokens,

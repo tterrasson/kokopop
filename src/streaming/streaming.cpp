@@ -54,15 +54,16 @@ SynthesisPlan prepare_synthesis(
         plan.config = merge_chunk_config(plan.config, *chunk_config_override);
     }
 
-    // Tokenize function wrapper
-    TokenizeFn tokenize_fn = [&model](const std::string & phonemes,
-                                       std::vector<uint32_t> & ids,
-                                       std::string & err) -> bool {
-        return model.tokenize_phonemes(phonemes, ids, err);
-    };
+    // Phonemize/tokenize through the architecture, bound to the resolved voice.
+    VoiceFrontend frontend;
+    if (!make_voice_frontend(model, voice, frontend, error)) {
+        return plan;
+    }
+    plan.config = model.arch->adjust_chunk_config(plan.config, frontend.voice);
 
     // Chunk the text
-    plan.chunks = chunk_text(text, voice, plan.config, tokenize_fn, error);
+    plan.chunks = chunk_text(text, plan.config,
+                             frontend.phonemize, frontend.tokenize, error);
     if (plan.chunks.empty()) {
         return plan;
     }
@@ -105,21 +106,17 @@ std::vector<float> infer_chunk(
                 chunk.n_tokens, chunk.phonemes.size());
 
     // --- Synthesize raw audio ---
-    // Strip trailing punctuation on intermediate chunks: keeping it
-    // destabilises Kokoro at chunk boundaries (gibberish/noise after a few
-    // chunks). The boundary pause is reinserted by postprocess_chunk_audio.
-    std::string chunk_phonemes = chunk.phonemes;
-    if (!chunk.is_last) {
-        trim_trailing_chunk_punctuation(chunk_phonemes);
-    }
+    // Straight from the chunk's own ids: the chunker already trimmed the
+    // boundary punctuation and tokenized once, so what is inferred here is
+    // exactly what was budgeted.
     if (std::getenv("KOKOPOP_DUMP_CHUNK_PHONEMES") != nullptr) {
         std::fprintf(stderr, "[chunk-phonemes idx=%d] >>>%s<<<\n",
-                     chunk_idx + 1, chunk_phonemes.c_str());
+                     chunk_idx + 1, chunk.phonemes.c_str());
         std::fflush(stderr);
     }
 
     kokopop_audio raw{};
-    if (!synthesize_phonemes(model, chunk_phonemes, plan.voice, plan.speed, plan.diffusion, raw, error)) {
+    if (!synthesize_chunk(model, chunk, plan.voice, plan.speed, plan.diffusion, raw, error)) {
         return {};
     }
 
@@ -136,13 +133,13 @@ std::vector<float> infer_chunk(
 
     std::fprintf(stderr, "[kokopop] chunk[%d] synthesized: %zu samples (%.1fms)\n",
                 chunk_idx + 1, raw_audio.size(),
-                (double)raw_audio.size() / model.sample_rate * 1000.0);
+                (double)raw_audio.size() / model.sample_rate() * 1000.0);
 
     // --- Post-process ---
     auto processed = postprocess_chunk_audio(
         raw_audio, chunk, chunk_idx,
         static_cast<int>(plan.chunks.size()),
-        plan.config, model.sample_rate);
+        plan.config, model.sample_rate());
 
     // --- Crossfade with previous chunk ---
     if (!prev_tail.empty() && !processed.empty()) {
@@ -150,13 +147,13 @@ std::vector<float> infer_chunk(
             prev_tail, processed,
             chunk.boundary_after,
             plan.config.crossfade_ms,
-            model.sample_rate);
+            model.sample_rate());
         processed = std::move(crossed);
     }
 
     // --- Save tail for next crossfade ---
     out_tail.clear();
-    const int crossfade_samples = (plan.config.crossfade_ms * model.sample_rate) / 1000;
+    const int crossfade_samples = (plan.config.crossfade_ms * model.sample_rate()) / 1000;
     if (!processed.empty() && crossfade_samples > 0) {
         size_t tail_start = processed.size() > static_cast<size_t>(crossfade_samples)
             ? processed.size() - crossfade_samples
@@ -225,7 +222,7 @@ StreamHandle stream_synthesize(
             // stop-on-cancel responsive: at most one chunk of inference is
             // running ahead when the callback returns false.
             const int n_chunks    = static_cast<int>(plan.chunks.size());
-            const int sample_rate = model->sample_rate;
+            const int sample_rate = model->sample_rate();
 
             struct RawResult {
                 std::vector<float> samples;
@@ -239,14 +236,10 @@ StreamHandle stream_synthesize(
                     return r;
                 }
                 const auto & chunk = plan.chunks[static_cast<size_t>(idx)];
-                std::string chunk_phonemes = chunk.phonemes;
-                if (!chunk.is_last) {
-                    trim_trailing_chunk_punctuation(chunk_phonemes);
-                }
 
                 kokopop_audio raw{};
-                if (!synthesize_phonemes(*model, chunk_phonemes,
-                                          plan.voice, plan.speed, plan.diffusion, raw, r.error)) {
+                if (!synthesize_chunk(*model, chunk,
+                                      plan.voice, plan.speed, plan.diffusion, raw, r.error)) {
                     return r;
                 }
                 if (raw.n_samples > 0 && raw.samples != nullptr) {

@@ -230,7 +230,7 @@ int kokopop_synthesize_text(
     if (combined.empty()) {
         return fail(KOKOPOP_ERROR_INFERENCE, "synthesis produced no audio");
     }
-    if (!allocate_audio_from_vector(combined, model->impl->sample_rate, *out_audio)) {
+    if (!allocate_audio_from_vector(combined, model->impl->sample_rate(), *out_audio)) {
         return fail(KOKOPOP_ERROR_INFERENCE, "failed to allocate output audio");
     }
     return KOKOPOP_OK;
@@ -512,7 +512,7 @@ void kokopop_model_free(kokopop_model * model) {
 
 int kokopop_model_sample_rate(kokopop_model * model) {
     if (!model || !model->impl) return 0;
-    return model->impl->sample_rate;
+    return model->impl->sample_rate();
 }
 
 int32_t kokopop_model_backend(const kokopop_model * model) {

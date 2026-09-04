@@ -1,6 +1,6 @@
 #pragma once
 
-#include "inference/kokoro.h"
+#include "arch/kokoro/kokoro.h"
 #include "model/model.h"
 #include "synthesis/chunker/chunker.h"
 
