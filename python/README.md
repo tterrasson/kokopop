@@ -1,6 +1,6 @@
-# kokopop Python
+# kokopop for Python
 
-Native Python bindings for the Kokopop Kokoro GGUF runtime.
+Native Python bindings for running Kokoro GGUF models with the Kokopop runtime.
 
 ## Installation
 
@@ -8,16 +8,16 @@ Native Python bindings for the Kokopop Kokoro GGUF runtime.
 pip install kokopop
 ```
 
-The package is distributed as a source distribution: `pip install` compiles the
-native C++ runtime on your machine. Prerequisites: a C++17 compiler and
-CMake ≥ 3.24.
+The package is distributed as source code. `pip install` compiles the
+native C++ runtime on your machine. Prerequisites are a C++17 compiler and
+CMake 3.24 or newer.
 
 ### Selecting a GPU backend
 
-By default the build is **CPU-only**. No backend is auto-detected — even on
-platforms where the SDK is present — because the chosen backend determines the
-runtime dependencies of the resulting install. Opt in explicitly with an
-environment variable at install time:
+By default, the build is **CPU-only**. No backend is detected automatically,
+even on platforms where the SDK is present, because the chosen backend
+determines the runtime dependencies of the resulting installation. Opt in
+explicitly with an environment variable at install time:
 
 ```bash
 KOKOPOP_ENABLE_METAL=ON  pip install kokopop   # macOS (requires Xcode CLT)
@@ -30,8 +30,8 @@ Available environment variables:
 | Variable | Default | Notes |
 |---|---|---|
 | `KOKOPOP_ENABLE_METAL` | `OFF` | macOS Metal backend. Apple platforms only. |
-| `KOKOPOP_ENABLE_CUDA` | `OFF` | NVIDIA CUDA backend. Needs CUDA toolkit installed. |
-| `KOKOPOP_ENABLE_VULKAN` | `OFF` | Vulkan backend. Needs Vulkan SDK + SPIR-V headers. |
+| `KOKOPOP_ENABLE_CUDA` | `OFF` | NVIDIA CUDA backend. Requires the CUDA toolkit. |
+| `KOKOPOP_ENABLE_VULKAN` | `OFF` | Vulkan backend. Requires the Vulkan SDK and SPIR-V headers. |
 | `KOKOPOP_ENABLE_OPUS` | `ON` | Build Ogg/Opus encoder if `opus`, `ogg`, `libopusenc` are found. |
 
 When switching backends, force a clean rebuild:
@@ -121,7 +121,7 @@ for chunk in model.stream(
 Diffusion style options are accepted by `SynthesisSession` and `Model.stream()`
 using the same names as the C API (`enable_diffusion`, `diffusion_seed`,
 `diffusion_steps`, `diffusion_alpha`, `diffusion_beta`,
-`diffusion_embedding_scale`). Leave `enable_diffusion=False` for the stable
+`diffusion_embedding_scale`). Leave `enable_diffusion=False` to use the stable
 default voice style path.
 
 ## Streaming audio encoding

@@ -1,10 +1,10 @@
-# kokopop — Standalone Kokoro GGML Runtime
+# kokopop: Standalone Kokoro GGML Runtime
 
-A standalone C++ library and toolkit for running [Kokoro](https://github.com/hexgrad/kokoro) text-to-speech models in GGUF format, with no Python dependency.
+A standalone C++ library and toolkit for running [Kokoro](https://github.com/hexgrad/kokoro) text-to-speech models in GGUF format, with no Python dependencies.
 
 ## Features
 
-- **Zero dependencies beyond libespeak-ng and ggml** — no Python, no heavy ML frameworks
+- **Zero dependencies beyond libespeak-ng and ggml:** no Python or heavy ML frameworks
 - **Inference backends**:
   - **CPU** with configurable thread count
   - **Metal GPU** (macOS)
@@ -14,7 +14,7 @@ A standalone C++ library and toolkit for running [Kokoro](https://github.com/hex
 - **Streaming API** for real-time audio generation
 - **Chunked synthesis** for long-form text processing
 - **WAV, PCM (float32/s16), and Ogg/Opus audio output**
-- **Full C & C++ API** — usable from C, C++, Rust, Go, and other languages via FFI
+- **Full C & C++ API:** usable from C, C++, Rust, Go, and other languages via FFI
 
 📊 See [Benchmarks](#benchmarks)
 
@@ -88,9 +88,9 @@ an option: `ggml-vulkan` hard-requires `VK_KHR_16bit_storage`, which the Adreno
 6xx driver does not expose.
 
 ggml's OpenCL backend needs the Khronos headers (`CL/cl.h`) and an ICD loader.
-kokopop deliberately does not call `find_package(OpenCL)` itself, ggml does,
-and cross-compiling embedders pre-seed the result as cache variables (the same
-pattern as `ESPEAK_NG_LIBRARY` for Android builds):
+kokopop deliberately does not call `find_package(OpenCL)` itself. ggml does,
+and cross-compiling embedders pre-seed the result as cache variables, following
+the same pattern as `ESPEAK_NG_LIBRARY` for Android builds:
 
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DKOKOPOP_ENABLE_OPENCL=ON \
@@ -121,11 +121,11 @@ brew install libogg opus libopusenc
 
 If these libraries are not found, CMake will automatically disable Ogg/Opus output and continue with PCM and WAV support.
 
-### Export Kokoro model to gguf format
+### Export a Kokoro model to GGUF format
 
-A pre-converted GGUF model is available at **[tterrasson/Kokoro-GGUF](https://huggingface.co/tterrasson/Kokoro-GGUF/tree/main)**
+A pre-converted GGUF model is available at **[tterrasson/Kokoro-GGUF](https://huggingface.co/tterrasson/Kokoro-GGUF/tree/main)**.
 
-Otherwise, to convert the model yourself, requires [uv](https://docs.astral.sh/uv/getting-started/installation/).
+To convert the model yourself, install [uv](https://docs.astral.sh/uv/getting-started/installation/).
 
 ```bash
 uv run python tools/convert_kokoro_to_gguf.py \
@@ -139,8 +139,8 @@ The converter emits a single F16 model (~157 MiB). Earlier tier-based
 quantization (`kokoro-md` / `kokoro-lg`) was removed: any K-quant on the
 acoustic path produces small per-element errors that compound through AdaIN
 + Snake1D, and any K-quant on ALBERT compounds through 12 transformer
-layers — both eventually destabilise the duration head or saturate the
-vocoder on some inputs. F16 stays bit-stable across all backends.
+layers. Both eventually destabilise the duration head or saturate the vocoder
+on some inputs. F16 stays bit-stable across all backends.
 
 #### Diffusion style tensors
 
@@ -196,7 +196,7 @@ Adjust generation speed:
 
 ### Streaming mode
 
-The `kokopop_stream` tool supports two operating modes: **STDIO** (default) and **HTTP server** (async, event-driven).
+The `kokopop_stream` tool supports two operating modes: **STDIO** (default) and **HTTP server** (asynchronous and event-driven).
 
 #### STDIO mode (default)
 
@@ -227,9 +227,11 @@ JSON protocol (one command per line):
 | `{"flush": true}` | Generate all accumulated text |
 | `{"stop": true}` | Stop streaming |
 
-#### HTTP server mode (async)
+#### HTTP server mode (asynchronous)
 
-Start an async, event-driven HTTP server for TTS synthesis. Uses `poll()` for non-blocking I/O with a `SynthesisScheduler` for round-robin chunk interleaving across concurrent requests:
+Start an asynchronous, event-driven HTTP server for TTS synthesis. The server
+uses `poll()` for non-blocking I/O and a `SynthesisScheduler` to interleave
+chunks from concurrent requests in round-robin order:
 
 ```bash
 ./build/kokopop_stream --model models/kokoro.gguf --http --port 8080
@@ -257,7 +259,7 @@ Start an async, event-driven HTTP server for TTS synthesis. Uses `poll()` for no
 
 | Option | Default | Description |
 |---|---|---|
-| `--http` | — | Run in HTTP server mode (async, event-driven) |
+| `--http` | not set | Run in HTTP server mode (asynchronous and event-driven) |
 | `--port N` | `8080` | HTTP server port |
 | `--bind ADDR` | `127.0.0.1` | HTTP server bind address (use `0.0.0.0` for all interfaces) |
 | `--idle-unload N` | disabled | Unload model after N minutes of inactivity; reload on next request (saves memory) |
@@ -265,7 +267,7 @@ Start an async, event-driven HTTP server for TTS synthesis. Uses `poll()` for no
 | `--threads N` | `min(4, hw_concurrency)` | Number of inference threads (affects model loading; scheduler worker is single-threaded) |
 | `--speed FLOAT` | `1.0` | Default synthesis speed for HTTP requests |
 | `--mode MODE` | `adaptative` | Default synthesis mode: `adaptative` or `long_form` |
-| `--voice NAME` | — | Default voice for HTTP requests (overrides per-request `voice` field) |
+| `--voice NAME` | not set | Default voice for HTTP requests (overrides the per-request `voice` field) |
 
 > **Note:** In HTTP server mode, `--voice` sets the server-wide default voice. Individual requests can override it by including a `voice` field in the JSON payload. Without `--http`, `--voice` is required.
 
@@ -283,14 +285,14 @@ Start an async, event-driven HTTP server for TTS synthesis. Uses `poll()` for no
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/tts` | `POST` | Synthesize text to audio — PCM float32, Ogg/Opus, or complete WAV |
-| `/health` | `GET` | Server health check — returns `{"status":"ready","sample_rate":24000}` or `{"status":"unloaded"}` if model was idle-unloaded |
-| `/voices` | `GET` | List all voices embedded in the GGUF model — returns `{"voices":[{"name":"..."}, ...]}` |
+| `/tts` | `POST` | Synthesize text to audio: PCM float32, Ogg/Opus, or complete WAV |
+| `/health` | `GET` | Server health check. Returns `{"status":"ready","sample_rate":24000}` or `{"status":"unloaded"}` if the model was unloaded due to inactivity |
+| `/voices` | `GET` | List all voices embedded in the GGUF model. Returns `{"voices":[{"name":"..."}, ...]}` |
 
 **Example requests:**
 
 ```bash
-# Stream raw PCM float32 (default) — chunked transfer encoding
+# Stream raw PCM float32 (default), using chunked transfer encoding
 curl -X POST http://localhost:8080/tts \
   -H 'Content-Type: application/json' \
   -d '{"text": "Hello world", "voice": "ff_siwis", "speed": 1.0}' \
@@ -393,14 +395,14 @@ All options:
 | `--speed` | `1.0` | Speed multiplier |
 | `--mode` | `adaptative` | `adaptative` or `long_form` |
 | `--format` | `pcm` | `pcm` (float32 stream), `wav` (complete file), or `ogg` (Ogg/Opus stream) |
-| `--out` | — | Output file; if omitted, raw bytes go to stdout |
+| `--out` | not set | Output file. If omitted, raw bytes go to stdout |
 | `--prebuffer-chunks` | `0` | Server-side Ogg synthesis chunks to buffer before playback |
 
 ## Docker
 
 A multi-stage [Dockerfile](Dockerfile) is provided for building and running kokopop without local dependencies.
 The default image is CPU-only. A separate CUDA target builds against NVIDIA CUDA and uses
-`nvidia/cuda:13.2.1-runtime-ubuntu24.04` for the runtime image.
+`nvidia/cuda:13.2.1-runtime-ubuntu24.04` as its runtime image.
 
 > **⚠️ Performance note:** The pre-built Docker images use conservative SIMD flags. If your host
 > CPU lacks **AVX2** (x86_64/amd64) or **NEON** (ARM64), inference will fall back to slower
@@ -491,7 +493,7 @@ docker run --cpus 4 -p 9000:9000 kokopop-cpu \
 
 ### Quick synthesis (one-shot)
 
-Override the default HTTP server command to use `kokopop_say`-like synthesis via the stream tool:
+Override the default HTTP server command to perform one-shot synthesis with the stream tool:
 
 ```bash
 echo '{"text": "Hello from Docker!", "flush": true}' | \
@@ -583,7 +585,7 @@ for (;;) {
     if (kokopop_synthesis_next(synth, 2, &chunks, &n) != KOKOPOP_OK || n == 0) break;
 
     for (size_t i = 0; i < n; ++i) {
-        /* chunks[i].samples — float32 PCM at chunks[i].sample_rate */
+        /* chunks[i].samples: float32 PCM at chunks[i].sample_rate */
         /* chunks[i].chunk_index, chunks[i].is_final */
     }
     int done = chunks[n - 1].is_final;
@@ -610,7 +612,7 @@ kokopop_bytes bytes = {0};
 kokopop_audio_encoder_start(enc, &bytes); /* WAV header / Ogg stream header */
 kokopop_bytes_free(&bytes);
 
-/* Push each chunk — PCM and Ogg emit bytes immediately; WAV buffers until finish */
+/* Push each chunk. PCM and Ogg emit bytes immediately; WAV buffers until finish. */
 kokopop_audio_encoder_push(enc, audio.samples, audio.n_samples, /*is_final=*/1, &bytes);
 kokopop_bytes_free(&bytes);
 
@@ -671,7 +673,7 @@ Kokopop supports the following languages:
 | `KOKOPOP_ENABLE_OPENCL` | `OFF` | Enable OpenCL GPU backend (Adreno / Android) |
 | `KOKOPOP_OPENCL_PROFILING` | `OFF` | Enable OpenCL profiling in ggml (adds CPU overhead) |
 | `KOKOPOP_OPENCL_TARGET_VERSION` | `300` | OpenCL version ggml targets (try `200` on older Adreno drivers) |
-| `KOKOPOP_BUILD_BENCH` | `OFF`   | Build benchmarks (requires model)|
+| `KOKOPOP_BUILD_BENCH` | `OFF`   | Build benchmarks (requires a model) |
 
 ## Testing
 
@@ -906,6 +908,6 @@ Licensed under the [MIT License](LICENSE).
 
 ## Acknowledgements
 
-- [Kokoro](https://github.com/hexgrad/kokoro) — Text-to-speech model
-- [ggml](https://github.com/ggerganov/ggml) — Tensor library for ML inference
-- [espeak-ng](https://github.com/espeak-ng/espeak-ng) — Speech synthesis engine for phonemization
+- [Kokoro](https://github.com/hexgrad/kokoro): Text-to-speech model
+- [ggml](https://github.com/ggerganov/ggml): Tensor library for ML inference
+- [espeak-ng](https://github.com/espeak-ng/espeak-ng): Speech synthesis engine for phonemization
