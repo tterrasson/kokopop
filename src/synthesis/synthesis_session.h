@@ -39,7 +39,7 @@ public:
 
     bool done() const { return _done; }
     int chunks_total() const { return _chunks_total; }
-    int sample_rate() const { return _model.sample_rate; }
+    int sample_rate() const { return _model.sample_rate(); }
 
 private:
     ChunkConfig selected_config() const;
@@ -53,6 +53,9 @@ private:
     bool _done = false;
 
     SynthesisPlan _plan;
+    /// The resolved voice's tokenizer, bound in `prepare()`. Captures `_model`
+    /// by reference, which outlives the session.
+    TokenizeFn _tokenize;
     std::vector<Unit> _adaptative_units;
     size_t _adaptative_next_unit = 0;
     AdaptativeChunkController _adaptative_controller;

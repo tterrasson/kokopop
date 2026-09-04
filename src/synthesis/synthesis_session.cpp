@@ -59,15 +59,19 @@ bool SynthesisSession::prepare(std::string & error) {
     }
 
     _started = true;
-    const ChunkConfig cfg = selected_config();
-    TokenizeFn tokenize_fn = [this](const std::string & phonemes,
-                                    std::vector<uint32_t> & ids,
-                                    std::string & token_error) -> bool {
-        return _model.tokenize_phonemes(phonemes, ids, token_error);
-    };
+    VoiceFrontend frontend;
+    if (!make_voice_frontend(_model, _options.voice, frontend, error)) {
+        return false;
+    }
+    const ChunkConfig cfg =
+        _model.arch->adjust_chunk_config(selected_config(), frontend.voice);
+    // Kept for the adaptative path, which assembles a chunk per `next()` call
+    // and re-tokenizes it into its canonical sequence.
+    _tokenize = frontend.tokenize;
 
     if (_options.mode == StreamMode::LongForm) {
-        _plan.chunks = chunk_text(_text, _options.voice, cfg, tokenize_fn, error);
+        _plan.chunks = chunk_text(_text, cfg,
+                                  frontend.phonemize, frontend.tokenize, error);
         if (_plan.chunks.empty()) return false;
         _plan.voice = _options.voice;
         _plan.speed = _options.speed;
@@ -76,7 +80,9 @@ bool SynthesisSession::prepare(std::string & error) {
         _plan.diffusion = _options.diffusion;
         _chunks_total = static_cast<int>(_plan.chunks.size());
     } else {
-        _adaptative_units = prepare_chunk_units(_text, _options.voice, cfg, tokenize_fn, error);
+        _adaptative_units = prepare_chunk_units(_text, cfg,
+                                                frontend.phonemize,
+                                                frontend.tokenize, error);
         if (_adaptative_units.empty()) return false;
 
         _plan.voice = _options.voice;
@@ -117,10 +123,15 @@ bool SynthesisSession::next(size_t max_chunks, size_t queued_requests,
             is_last_chunk = chunk_index >= _chunks_total - 1;
         } else {
             const int target_tokens = _adaptative_controller.target_tokens(queued_requests);
+            std::string chunk_error;
             Chunk chunk = build_adaptative_chunk(
                 _adaptative_units, _adaptative_next_unit, _plan.config,
-                target_tokens, chunk_index == 0);
+                target_tokens, chunk_index == 0, _tokenize, chunk_error);
             if (chunk.tokens.empty()) {
+                if (!chunk_error.empty()) {
+                    error = chunk_error;
+                    return false;
+                }
                 _done = true;
                 break;
             }
@@ -142,7 +153,7 @@ bool SynthesisSession::next(size_t max_chunks, size_t queued_requests,
                 const double generation_ms =
                     std::chrono::duration<double, std::milli>(end - start).count();
                 const double audio_ms = static_cast<double>(audio.size()) /
-                    static_cast<double>(_model.sample_rate) * 1000.0;
+                    static_cast<double>(_model.sample_rate()) * 1000.0;
                 const bool first_chunk_oversized =
                     (chunk_index == 0 && _plan.config.first_chunk_target_max_tokens > 0);
                 if (!first_chunk_oversized) {

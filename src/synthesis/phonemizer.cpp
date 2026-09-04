@@ -120,35 +120,19 @@ constexpr size_t countof(const T (&)[N]) {
 
 } // namespace
 
-std::string espeak_voice_for_kokoro_voice(const std::string & voice) {
-    const char lang = voice.empty() ? 'a' : voice[0];
-    switch (lang) {
-    case 'a': return "gmw/en-US";
-    case 'b': return "gmw/en";
-    case 'e': return "roa/es";
-    case 'f': return "roa/fr";
-    case 'h': return "inc/hi";
-    case 'i': return "roa/it";
-    case 'j': return "jpx/ja";
-    case 'p': return "roa/pt-BR";
-    case 'z': return "sit/cmn";
-    default: return "gmw/en-US";
-    }
-}
-
-std::string normalize_espeak_phonemes(std::string ps, char kokoro_lang) {
+std::string normalize_espeak_phonemes(std::string ps, char normalization_lang) {
     // Select language-specific rule groups
     const Rule * lang_rules   = nullptr;
     size_t        lang_count  = 0;
     const Rule * dialect_rules = nullptr;
     size_t        dialect_count = 0;
 
-    if (kokoro_lang == 'a') {
+    if (normalization_lang == 'a') {
         lang_rules   = english_rules;
         lang_count   = countof(english_rules);
         dialect_rules = american_rules;
         dialect_count = countof(american_rules);
-    } else if (kokoro_lang == 'b') {
+    } else if (normalization_lang == 'b') {
         lang_rules   = english_rules;
         lang_count   = countof(english_rules);
         dialect_rules = british_rules;
@@ -180,7 +164,7 @@ std::string normalize_espeak_phonemes(std::string ps, char kokoro_lang) {
         }
 
         // 2. Combining tilde removal (non-French only)
-        if (!matched && kokoro_lang != 'f') {
+        if (!matched && normalization_lang != 'f') {
             const unsigned char tilde_hi = 0xcc, tilde_lo = 0x83;
             if (i + 1 < ps.size() &&
                 static_cast<unsigned char>(ps[i])   == tilde_hi &&
@@ -250,30 +234,95 @@ std::string normalize_espeak_phonemes(std::string ps, char kokoro_lang) {
     return collapsed;
 }
 
-bool phonemize_text(const std::string & text, const std::string & voice, std::string & phonemes, std::string & error) {
-    const char lang = voice.empty() ? 'a' : voice[0];
+namespace {
+
+/// espeak-ng initialisation, shared by every entry point in this file.
+///
+/// espeak's translator is a single global; `espeak_mutex` serialises voice
+/// selection together with the clause loop that follows it, because a
+/// concurrent voice change between two clauses would phonemize half an
+/// utterance in the wrong language.
+struct EspeakSession {
+    std::mutex mutex;
+    int init_result = 0;
+};
+
+EspeakSession & espeak_session() {
+    static EspeakSession session;
+    static std::once_flag once;
+    std::call_once(once, [] {
+        session.init_result = espeak_Initialize(AUDIO_OUTPUT_SYNCHRONOUS, 0, nullptr, 0);
+    });
+    return session;
+}
+
+} // namespace
+
+bool espeak_phonemize_raw(const std::string & text,
+                          const std::string & espeak_voice,
+                          int phoneme_mode,
+                          std::string & phonemes,
+                          std::string & error) {
+    phonemes.clear();
+    if (text.empty()) {
+        return true;
+    }
+
+    EspeakSession & session = espeak_session();
+    if (session.init_result < 0) {
+        error = "failed to initialize eSpeak-ng";
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(session.mutex);
+    if (espeak_SetVoiceByName(espeak_voice.c_str()) != EE_OK) {
+        error = "failed to select eSpeak-ng voice: " + espeak_voice;
+        return false;
+    }
+
+    const char * input = text.c_str();
+    const void * input_ptr = input;
+    for (;;) {
+        const char * part = espeak_TextToPhonemes(&input_ptr, espeakCHARS_UTF8, phoneme_mode);
+        if (part == nullptr || *part == '\0') {
+            break;
+        }
+        if (!phonemes.empty() && phonemes.back() != ' ') {
+            phonemes.push_back(' ');
+        }
+        phonemes += part;
+        if (input_ptr == nullptr || static_cast<const char *>(input_ptr)[0] == '\0') {
+            break;
+        }
+    }
+    return true;
+}
+
+bool phonemize_text(const std::string & text,
+                    const std::string & espeak_voice,
+                    char normalization_lang,
+                    std::string & phonemes,
+                    std::string & error) {
+    const char lang = normalization_lang;
 
     // Route Mandarin (z) to pure C++ G2P — no eSpeak needed
     if (lang == 'z') {
         return g2p::zh::g2p_chinese(text, phonemes, error);
     }
 
-    // All other languages: eSpeak-ng path
-    static std::once_flag init_once;
-    static int init_result = 0;
-    static std::mutex espeak_mutex;
-    std::call_once(init_once, [] {
-        init_result = espeak_Initialize(AUDIO_OUTPUT_SYNCHRONOUS, 0, nullptr, 0);
-    });
-    if (init_result < 0) {
+    // All other languages: eSpeak-ng path. The session is shared with
+    // `espeak_phonemize_raw()`: espeak's translator is one global, so a second
+    // mutex here would let the two entry points select a voice concurrently
+    // and phonemize an utterance in the wrong language.
+    EspeakSession & session = espeak_session();
+    if (session.init_result < 0) {
         error = "failed to initialize eSpeak-ng";
         return false;
     }
 
     std::string out;
     {
-        std::lock_guard<std::mutex> lock(espeak_mutex);
-        const std::string espeak_voice = espeak_voice_for_kokoro_voice(voice);
+        std::lock_guard<std::mutex> lock(session.mutex);
         if (espeak_SetVoiceByName(espeak_voice.c_str()) != EE_OK) {
             error = "failed to select eSpeak-ng voice: " + espeak_voice;
             return false;

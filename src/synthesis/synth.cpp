@@ -2,7 +2,7 @@
 
 #include "core/constants.h"
 #include "core/utf8.h"
-#include "inference/kokoro.h"
+#include "arch/kokoro/kokoro.h"
 
 #include <algorithm>
 #include <cmath>
@@ -12,11 +12,6 @@
 
 namespace kokopop {
 namespace {
-
-bool ends_with(const std::string & text, const char * suffix) {
-    const size_t n = std::strlen(suffix);
-    return text.size() >= n && std::memcmp(text.data() + text.size() - n, suffix, n) == 0;
-}
 
 float hash_freq(const std::vector<uint32_t> & ids, const std::string & voice) {
     uint32_t h = 2166136261u;
@@ -59,70 +54,87 @@ bool run_real_synthesis(
     const KokoroDiffusionOptions * diffusion,
     std::vector<float> & audio,
     std::string & error) {
+    if (model.arch == nullptr) {
+        error = "model has no architecture loaded";
+        return false;
+    }
+
+    const std::string voice_name = resolve_voice_name(voice, model);
+    const VoiceDesc * desc = model.arch->find_voice(voice_name);
+    if (desc == nullptr) {
+        error = voice_name.empty() ? std::string("model has no voice")
+                                   : "voice not found in GGUF: " + voice_name;
+        return false;
+    }
+
     std::vector<uint32_t> ids;
-    if (!model.tokenize_phonemes(phonemes, ids, error)) {
+    if (!model.arch->tokenize(phonemes, *desc, ids, error)) {
         return false;
     }
 
-    KokoroFrontendProbe probe;
-    const int64_t style_len = utf8_codepoint_count(phonemes);
-    if (!run_kokoro_frontend_probe(model, ids, voice, probe, error, style_len, diffusion)) {
-        return false;
+    SynthesisExtras extras;
+    if (diffusion != nullptr) {
+        extras.diffusion = *diffusion;
     }
-    KokoroGenerationProbe gen;
-    if (!run_kokoro_generation_probe(model, ids, voice, speed, probe, gen, error, style_len)) {
-        return false;
-    }
-    if (gen.audio.empty()) {
-        error = "Kokoro generator produced no audio";
-        return false;
-    }
+    // The style row is selected by the phoneme code-point count, which is not
+    // recoverable from `ids`, so it travels through the extras.
+    extras.kokoro_style_len = utf8_codepoint_count(phonemes);
 
-    audio = std::move(gen.audio);
-
-    // Free large intermediate probe buffers before returning.
-    // gen.asr (~6 MB) and gen.decoder (~3 MB) are no longer needed
-    // after audio extraction, reducing peak RAM during streaming.
-    gen.asr.clear();
-    gen.asr.shrink_to_fit();
-    gen.decoder.clear();
-    gen.decoder.shrink_to_fit();
-
-    return true;
+    return model.arch->synthesize(model, ids, *desc, speed, extras, audio, error);
 }
 
 } // namespace
 
-void trim_trailing_chunk_punctuation(std::string & phonemes) {
-    auto trim_spaces = [&]() {
-        while (!phonemes.empty() && phonemes.back() == ' ') {
-            phonemes.pop_back();
-        }
-    };
-
-    trim_spaces();
-    for (;;) {
-        bool trimmed = false;
-        if (!phonemes.empty()) {
-            const char c = phonemes.back();
-            if (c == ',' || c == '.' || c == ';' || c == ':' || c == '!' || c == '?') {
-                phonemes.pop_back();
-                trimmed = true;
-            }
-        }
-        if (!trimmed && ends_with(phonemes, "…")) {
-            phonemes.erase(phonemes.size() - std::strlen("…"));
-            trimmed = true;
-        }
-        if (!trimmed && ends_with(phonemes, "—")) {
-            phonemes.erase(phonemes.size() - std::strlen("—"));
-            trimmed = true;
-        }
-        if (!trimmed) {
-            break;
-        }
-        trim_spaces();
+bool synthesize_chunk(
+    Model & model, const Chunk & chunk,
+    const std::string & voice, float speed,
+    const KokoroDiffusionOptions & diffusion,
+    kokopop_audio & out, std::string & error) {
+    if (speed <= 0.0f || speed > 4.0f || !std::isfinite(speed)) {
+        error = "speed must be greater than 0 and at most 4";
+        return false;
     }
+    if (chunk.tokens.empty()) {
+        error = "chunk has no token ids";
+        return false;
+    }
+    if (!voice.empty() && !model.voices.empty() && model.voices.find(voice) == model.voices.end()) {
+        error = "voice not found in GGUF: " + voice;
+        return false;
+    }
+
+    if (model.is_mock) {
+        return synthesize_phonemes(model, chunk.phonemes, voice, speed, diffusion, out, error);
+    }
+
+    if (model.arch == nullptr) {
+        error = "model has no architecture loaded";
+        return false;
+    }
+    const std::string voice_name = resolve_voice_name(voice, model);
+    const VoiceDesc * desc = model.arch->find_voice(voice_name);
+    if (desc == nullptr) {
+        error = voice_name.empty() ? std::string("model has no voice")
+                                   : "voice not found in GGUF: " + voice_name;
+        return false;
+    }
+
+    SynthesisExtras extras;
+    extras.diffusion = diffusion;
+    // The style row is selected by the phoneme code-point count, which is not
+    // recoverable from the ids, so it travels through the extras.
+    extras.kokoro_style_len = utf8_codepoint_count(chunk.phonemes);
+
+    std::vector<float> audio;
+    if (!model.arch->synthesize(model, chunk.tokens, *desc, speed, extras, audio, error)) {
+        return false;
+    }
+    if (!allocate_audio(audio.size(), model.sample_rate(voice), out)) {
+        error = "failed to allocate output audio";
+        return false;
+    }
+    std::memcpy(out.samples, audio.data(), audio.size() * sizeof(float));
+    return true;
 }
 
 bool synthesize_phonemes(
@@ -157,7 +169,7 @@ bool synthesize_phonemes(
             return false;
         }
 
-        if (!allocate_audio(audio.size(), model.sample_rate, out)) {
+        if (!allocate_audio(audio.size(), model.sample_rate(voice), out)) {
             error = "failed to allocate output audio";
             return false;
         }
@@ -172,14 +184,14 @@ bool synthesize_phonemes(
     }
 
     const float duration_s = std::max(0.10f, static_cast<float>(ids.size()) * 0.035f / speed);
-    const size_t n = static_cast<size_t>(duration_s * static_cast<float>(model.sample_rate));
-    if (!allocate_audio(n, model.sample_rate, out)) {
+    const size_t n = static_cast<size_t>(duration_s * static_cast<float>(model.sample_rate()));
+    if (!allocate_audio(n, model.sample_rate(), out)) {
         error = "failed to allocate output audio";
         return false;
     }
 
     const float freq = hash_freq(ids, voice);
-    const float sr = static_cast<float>(model.sample_rate);
+    const float sr = static_cast<float>(model.sample_rate());
     for (size_t i = 0; i < n; ++i) {
         const float t = static_cast<float>(i) / sr;
         const float attack = static_cast<float>(i) / (0.02f * sr);

@@ -1,7 +1,8 @@
 #pragma once
 
 #include "model/model.h"
-#include "inference/kokoro.h"
+#include "arch/kokoro/kokoro.h"
+#include "synthesis/chunker/chunker.h"
 
 #include <string>
 
@@ -18,10 +19,16 @@ bool synthesize_phonemes(
     const KokoroDiffusionOptions & diffusion,
     kokopop_audio & out, std::string & error);
 
-// Strip trailing punctuation (and trailing spaces) from a phoneme string.
-// Used at intermediate chunk boundaries: keeping the punctuation tokens there
-// destabilises the Kokoro model without improving prosody, since the chunk
-// pause is already added by audio post-processing.
-void trim_trailing_chunk_punctuation(std::string & phonemes);
+/// Synthesize one chunk from the ids the chunker already produced.
+///
+/// The streaming paths use this rather than `synthesize_phonemes()`: the chunk
+/// carries the sequence that was budgeted, and re-tokenizing its phoneme string
+/// here could yield a different one. `chunk.phonemes` is still read, for the
+/// code-point count that picks Kokoro's style row.
+bool synthesize_chunk(
+    Model & model, const Chunk & chunk,
+    const std::string & voice, float speed,
+    const KokoroDiffusionOptions & diffusion,
+    kokopop_audio & out, std::string & error);
 
 } // namespace kokopop
