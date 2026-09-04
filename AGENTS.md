@@ -13,7 +13,8 @@ src/
   core/           Error handling, UTF-8, string replace, WAV I/O
   backend/        CPU + Metal / CUDA / Vulkan / OpenCL GPU inference backends
   model/          GGUF model loading
-  inference/      Kokoro graph ops, audio utilities
+  arch/kokoro/    Kokoro graph ops, audio utilities, KokoroArch
+  arch/sanotts/   sanoTTS frontend, decoders, tokenizer, deterministic noise
   synthesis/      Phonemizer, text chunking/splitting, G2P (zh_g2p), main synth pipeline
   audio/          Audio post-processing
   streaming/      Streaming generation support

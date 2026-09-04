@@ -122,8 +122,30 @@ find_package(PkgConfig QUIET)
 if(PkgConfig_FOUND)
   pkg_check_modules(ESPEAK_NG QUIET espeak-ng)
 endif()
+
+# pkg_check_modules produces two library lists, and only one of them links.
+#
+#   <PREFIX>_LIBRARIES       bare names ("espeak-ng"), the -l flags. Resolving
+#                            them needs <PREFIX>_LIBRARY_DIRS on the link line,
+#                            so on their own they only work when the library
+#                            happens to sit in a default search path — which
+#                            /opt/homebrew/lib and /usr/local/lib are not.
+#   <PREFIX>_LINK_LIBRARIES  the same libraries as absolute paths (CMake >= 3.12,
+#                            and this project already requires 3.24).
+#
+# Prefer the absolute paths; keep the bare names plus their directories as the
+# fallback, for a pkg-config file that somehow declares no resolvable path.
+function(kokopop_pkg_link_libraries prefix out_var)
+  if(${prefix}_LINK_LIBRARIES)
+    set(${out_var} "${${prefix}_LINK_LIBRARIES}" PARENT_SCOPE)
+  else()
+    set(${out_var} "${${prefix}_LIBRARIES}" PARENT_SCOPE)
+    link_directories(${${prefix}_LIBRARY_DIRS})
+  endif()
+endfunction()
+
 if(ESPEAK_NG_FOUND)
-  set(KOKOPOP_ESPEAK_LIBRARIES ${ESPEAK_NG_LIBRARIES})
+  kokopop_pkg_link_libraries(ESPEAK_NG KOKOPOP_ESPEAK_LIBRARIES)
   set(KOKOPOP_ESPEAK_INCLUDE_DIRS ${ESPEAK_NG_INCLUDE_DIRS})
 else()
   find_path(ESPEAK_NG_INCLUDE_DIR espeak-ng/speak_lib.h)
@@ -156,6 +178,9 @@ if(KOKOPOP_ENABLE_OPUS)
       message(STATUS "kokopop: libopusenc not found — Ogg/Opus output disabled (install libopusenc-dev / libopusenc)")
     endif()
   else()
+    kokopop_pkg_link_libraries(OPUS KOKOPOP_OPUS_LIBRARIES)
+    kokopop_pkg_link_libraries(OGG KOKOPOP_OGG_LIBRARIES)
+    kokopop_pkg_link_libraries(OPUSENC KOKOPOP_OPUSENC_LIBRARIES)
     message(STATUS "kokopop: Ogg/Opus output enabled")
   endif()
 else()
@@ -194,18 +219,23 @@ if(KOKOPOP_ENABLE_OPENCL)
   list(APPEND _kokopop_backend_sources src/backend/opencl.cpp)
 endif()
 
-# Model module (GGUF loading)
+# Model module (GGUF loading + architecture dispatch)
 set(_kokopop_model_sources
   src/model/model.cpp
+  src/model/arch.cpp
 )
 
-# Inference module (Kokoro graph operations + audio utilities)
-set(_kokopop_inference_sources
-  src/inference/kokoro.cpp
-  src/inference/diffusion_sampler.cpp
-  src/inference/graph_ops.cpp
-  src/inference/audio_utils.cpp
-  src/inference/lstm_fused.cpp
+# Architecture implementations
+set(_kokopop_arch_sources
+  src/arch/sanotts/sano_noise.cpp
+  src/arch/sanotts/sano_tokenizer.cpp
+  src/arch/sanotts/sano_frontend_text.cpp
+  src/arch/kokoro/kokoro_arch.cpp
+  src/arch/kokoro/kokoro.cpp
+  src/arch/kokoro/diffusion_sampler.cpp
+  src/arch/kokoro/graph_ops.cpp
+  src/arch/kokoro/audio_utils.cpp
+  src/arch/kokoro/lstm_fused.cpp
 )
 
 # Synthesis module (phonemization + chunking + main synth)
@@ -223,6 +253,7 @@ set(_kokopop_synthesis_sources
 set(_kokopop_audio_sources
   src/audio/audio_postprocess.cpp
   src/audio/audio_encoder.cpp
+  src/audio/istft.cpp
 )
 
 # Streaming module
@@ -251,7 +282,7 @@ add_library(kokopop
   ${_kokopop_core_sources}
   ${_kokopop_backend_sources}
   ${_kokopop_model_sources}
-  ${_kokopop_inference_sources}
+  ${_kokopop_arch_sources}
   ${_kokopop_synthesis_sources}
   ${_kokopop_audio_sources}
   ${_kokopop_streaming_sources}
@@ -269,7 +300,7 @@ target_include_directories(kokopop
     $<BUILD_INTERFACE:${yyjson_SOURCE_DIR}/src>
     ${CMAKE_CURRENT_SOURCE_DIR}/src/core
     ${CMAKE_CURRENT_SOURCE_DIR}/src/model
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/inference
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/arch
     ${CMAKE_CURRENT_SOURCE_DIR}/src/synthesis
     ${CMAKE_CURRENT_SOURCE_DIR}/src/synthesis/chunker
     ${CMAKE_CURRENT_SOURCE_DIR}/src/synthesis/g2p
@@ -297,9 +328,9 @@ if(KOKOPOP_ENABLE_OPUS)
     ${OGG_INCLUDE_DIRS}
   )
   target_link_libraries(kokopop PRIVATE
-    ${OPUSENC_LIBRARIES}
-    ${OPUS_LIBRARIES}
-    ${OGG_LIBRARIES}
+    ${KOKOPOP_OPUSENC_LIBRARIES}
+    ${KOKOPOP_OPUS_LIBRARIES}
+    ${KOKOPOP_OGG_LIBRARIES}
   )
 endif()
 
@@ -363,7 +394,7 @@ if(KOKOPOP_BUILD_TOOLS)
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/src/core
     ${CMAKE_CURRENT_SOURCE_DIR}/src/model
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/inference
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/arch
     ${CMAKE_CURRENT_SOURCE_DIR}/src/synthesis
     ${CMAKE_CURRENT_SOURCE_DIR}/src/synthesis/chunker
     ${CMAKE_CURRENT_SOURCE_DIR}/src/synthesis/g2p
@@ -389,7 +420,7 @@ if(KOKOPOP_BUILD_TOOLS)
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/src/core
     ${CMAKE_CURRENT_SOURCE_DIR}/src/model
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/inference
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/arch
     ${CMAKE_CURRENT_SOURCE_DIR}/src/synthesis
     ${CMAKE_CURRENT_SOURCE_DIR}/src/synthesis/chunker
     ${CMAKE_CURRENT_SOURCE_DIR}/src/audio
@@ -420,7 +451,7 @@ if(KOKOPOP_BUILD_TOOLS)
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/src/core
     ${CMAKE_CURRENT_SOURCE_DIR}/src/model
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/inference
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/arch
     ${CMAKE_CURRENT_SOURCE_DIR}/src/synthesis
     ${CMAKE_CURRENT_SOURCE_DIR}/src/synthesis/chunker
     ${CMAKE_CURRENT_SOURCE_DIR}/src/audio
@@ -460,7 +491,7 @@ if(KOKOPOP_BUILD_TESTS)
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/src/core
     ${CMAKE_CURRENT_SOURCE_DIR}/src/model
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/inference
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/arch
     ${CMAKE_CURRENT_SOURCE_DIR}/src/synthesis
     ${CMAKE_CURRENT_SOURCE_DIR}/src/synthesis/chunker
     ${CMAKE_CURRENT_SOURCE_DIR}/src/audio
@@ -469,6 +500,11 @@ if(KOKOPOP_BUILD_TESTS)
     ${CMAKE_CURRENT_SOURCE_DIR}/src/playback
     $<BUILD_INTERFACE:${yyjson_SOURCE_DIR}/src>
   )
+  # Committed test data (the sanoTTS G2P parity corpus) is found by absolute
+  # path: the tests must pass from any build directory, not only one that
+  # happens to sit inside the source tree.
+  target_compile_definitions(kokopop_tests PRIVATE
+    KOKOPOP_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
   target_link_libraries(kokopop_tests PRIVATE kokopop doctest::doctest ggml yyjson)
   include(${doctest_SOURCE_DIR}/scripts/cmake/doctest.cmake)
   doctest_discover_tests(kokopop_tests)
@@ -481,7 +517,7 @@ if(KOKOPOP_BUILD_BENCH)
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/src/core
     ${CMAKE_CURRENT_SOURCE_DIR}/src/model
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/inference
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/arch
     ${CMAKE_CURRENT_SOURCE_DIR}/src/synthesis
     $<BUILD_INTERFACE:${ggml_SOURCE_DIR}/include>
   )
