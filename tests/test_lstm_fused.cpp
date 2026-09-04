@@ -1,5 +1,5 @@
 #include "test_helpers.h"
-#include "inference/lstm_fused.h"
+#include "arch/kokoro/lstm_fused.h"
 
 #include <algorithm>
 #include <cmath>

@@ -2,6 +2,17 @@
 #include "synthesis/chunker/chunker.h"
 #include "streaming/streaming.h"
 
+#include <algorithm>
+
+// Phonemize using Kokoro's voice-name convention, as the chunker did before
+// the text frontend moved behind ModelArch.
+static kokopop::PhonemizeFn kokoro_phonemizer(std::string voice) {
+    return [voice](const std::string & text, std::string & phonemes,
+                   std::string & error) {
+        return kokopop::phonemize_text(text, voice, phonemes, error);
+    };
+}
+
 // ---- ChunkConfig merge ----
 
 TEST_CASE("merge_chunk_config_no_override_keeps_base") {
@@ -113,8 +124,9 @@ TEST_CASE("chunk_text_adds_terminal_sentence_boundary_for_complete_text") {
     };
 
     auto chunks = kokopop::chunk_text(
-        "Hello world", "af_heart",
-        kokopop::make_long_form_config(), tokenize, error);
+        "Hello world",
+        kokopop::make_long_form_config(), kokoro_phonemizer("af_heart"),
+        tokenize, error);
 
     REQUIRE_EQ(chunks.size(), 1);
     CHECK_EQ(chunks.front().text, std::string("Hello world."));
@@ -133,11 +145,12 @@ TEST_CASE("adaptative_first_chunk_stops_at_short_natural_pause") {
 
     auto cfg = kokopop::make_adaptative_config();
     auto units = kokopop::prepare_chunk_units(
-        "Bonjour, comment allez-vous ?", "ff_siwis", cfg, tokenize, error);
+        "Bonjour, comment allez-vous ?", cfg,
+        kokoro_phonemizer("ff_siwis"), tokenize, error);
     REQUIRE(units.size() >= 2);
 
     size_t next = 0;
-    auto chunk = kokopop::build_adaptative_chunk(units, next, cfg, 96, true);
+    auto chunk = kokopop::build_adaptative_chunk(units, next, cfg, 96, true, tokenize, error);
     CHECK_EQ(chunk.text, std::string("Bonjour,"));
     CHECK_EQ(chunk.boundary_after, kokopop::Boundary::ClauseWeak);
     CHECK_EQ(next, 1u);
@@ -155,11 +168,11 @@ TEST_CASE("adaptative_first_chunk_keeps_long_clause_until_first_pause") {
     auto cfg = kokopop::make_adaptative_config();
     auto units = kokopop::prepare_chunk_units(
         "Bonjour Monsieur Jean qui aime les fraises, comment allez-vous ?",
-        "ff_siwis", cfg, tokenize, error);
+        cfg, kokoro_phonemizer("ff_siwis"), tokenize, error);
     REQUIRE(units.size() >= 2);
 
     size_t next = 0;
-    auto chunk = kokopop::build_adaptative_chunk(units, next, cfg, 32, true);
+    auto chunk = kokopop::build_adaptative_chunk(units, next, cfg, 32, true, tokenize, error);
     CHECK_EQ(chunk.text, std::string("Bonjour Monsieur Jean qui aime les fraises,"));
     CHECK_EQ(chunk.boundary_after, kokopop::Boundary::ClauseWeak);
     CHECK_EQ(next, 1u);
@@ -171,7 +184,6 @@ TEST_CASE("adaptative_long_unpunctuated_text_caps_at_target_max") {
         kokopop::Unit unit;
         unit.text = "word ";
         unit.phonemes = "word";
-        unit.tokens.assign(5, 1);
         unit.n_tokens = 5;
         unit.boundary_after = kokopop::Boundary::None;
         units.push_back(std::move(unit));
@@ -183,8 +195,19 @@ TEST_CASE("adaptative_long_unpunctuated_text_caps_at_target_max") {
     cfg.soft_max_tokens = 25;
     cfg.hard_max_tokens = 30;
 
+    // 5 ids per word, so re-tokenizing the assembled chunk reproduces the sum
+    // of the units it was budgeted from.
+    std::string error;
+    auto tokenize = [](const std::string & phonemes,
+                       std::vector<uint32_t> & ids,
+                       std::string &) {
+        const size_t words = 1 + std::count(phonemes.begin(), phonemes.end(), ' ');
+        ids.assign(5 * words, 1);
+        return true;
+    };
+
     size_t next = 0;
-    auto chunk = kokopop::build_adaptative_chunk(units, next, cfg, 20, false);
+    auto chunk = kokopop::build_adaptative_chunk(units, next, cfg, 20, false, tokenize, error);
     // Caps at target_max_tokens=20 even without a boundary.
     CHECK_EQ(chunk.n_tokens, 20);
     CHECK_EQ(next, 4u);

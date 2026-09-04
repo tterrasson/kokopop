@@ -1,5 +1,5 @@
 #include "test_helpers.h"
-#include "inference/diffusion_kernels.h"
+#include "arch/kokoro/diffusion_kernels.h"
 
 #include <cmath>
 #include <vector>

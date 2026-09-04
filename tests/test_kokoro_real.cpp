@@ -1,5 +1,6 @@
 #include "test_helpers.h"
 #include "synthesis/chunker/chunker.h"
+#include "synthesis/synth.h"
 
 // ---- Tests avec modèle réel kokoro.gguf ----
 // Le modèle est chargé une seule fois via shared_real_model() et réutilisé
@@ -97,10 +98,16 @@ TEST_CASE("real_kokoro_text_frontend_adds_stable_end_for_short_unpunctuated_text
                 std::string & token_error) {
             return model->tokenize_phonemes(phonemes, ids, token_error);
         };
+    kokopop::PhonemizeFn phonemize_fn =
+        [](const std::string & text,
+           std::string & phonemes,
+           std::string & ph_error) {
+            return kokopop::phonemize_text(text, "gmw/en-US", 'a', phonemes, ph_error);
+        };
 
     auto chunks = kokopop::chunk_text(
-        "Hello world", "af_heart",
-        kokopop::make_long_form_config(), tokenize_fn, error);
+        "Hello world",
+        kokopop::make_long_form_config(), phonemize_fn, tokenize_fn, error);
     REQUIRE_EQ(chunks.size(), 1);
     CHECK_EQ(chunks.front().boundary_after, kokopop::Boundary::Sentence);
     CHECK(chunks.front().phonemes.find('.') != std::string::npos);
@@ -153,9 +160,11 @@ TEST_CASE("real_kokoro_scratch_reuse") {
     CHECK(kokopop::run_kokoro_frontend_probe(*model, ids, "af_heart", front1, error));
     CHECK(kokopop::run_kokoro_generation_probe(*model, ids, "af_heart", 1.0f, front1, gen1, error));
 
-    const size_t frontend_cap   = model->frontend_scratch.capacity();
-    const size_t generation_cap = model->generation_scratch.capacity();
-    const size_t generator_cap  = model->generator_scratch.capacity();
+    kokopop::KokoroArch * arch = kokopop::kokoro_arch(*model);
+    REQUIRE(arch != nullptr);
+    const size_t frontend_cap   = arch->frontend_scratch.capacity();
+    const size_t generation_cap = arch->generation_scratch.capacity();
+    const size_t generator_cap  = arch->generator_scratch.capacity();
     CHECK(frontend_cap > 0);
     CHECK(generation_cap > 0);
     CHECK(generator_cap > 0);
@@ -166,9 +175,9 @@ TEST_CASE("real_kokoro_scratch_reuse") {
     CHECK(kokopop::run_kokoro_generation_probe(*model, ids, "af_heart", 1.0f, front2, gen2, error));
 
     // Same-sized input: scratch buffers must not reallocate.
-    CHECK_EQ(model->frontend_scratch.capacity(),   frontend_cap);
-    CHECK_EQ(model->generation_scratch.capacity(), generation_cap);
-    CHECK_EQ(model->generator_scratch.capacity(),  generator_cap);
+    CHECK_EQ(arch->frontend_scratch.capacity(),   frontend_cap);
+    CHECK_EQ(arch->generation_scratch.capacity(), generation_cap);
+    CHECK_EQ(arch->generator_scratch.capacity(),  generator_cap);
     CHECK_EQ(gen2.audio.size(), gen1.audio.size());
     CHECK_NEAR(stats(gen2.audio).rms, stats(gen1.audio).rms, 0.002);
 }
@@ -409,4 +418,114 @@ TEST_CASE("real_model_mandarin_multichunk_text_synthesis_stable") {
     }
     CHECK(all_finite);
     kokopop_audio_free(&audio);
+}
+
+// ---- Chunk token gate: the ids that were budgeted are the ids
+// that reach inference. `Chunk::tokens` must be the chunk's phoneme string
+// tokenized once — not a concatenation of per-unit sequences, each carrying its
+// own framing — in both chunking modes.
+
+TEST_CASE("chunk_tokens_are_the_canonical_sequence_long_form") {
+    auto * model = shared_real_model();
+    if (!model) { MESSAGE("skipping: models/kokoro-md.gguf not found"); return; }
+
+    std::string error;
+    kokopop::VoiceFrontend frontend;
+    REQUIRE(kokopop::make_voice_frontend(*model, "af_heart", frontend, error));
+
+    const std::string text =
+        "This is a first sentence, with a clause. And a second one follows here. "
+        "A third sentence, longer than the others, closes the paragraph. "
+        "Then a fourth. And a fifth, to force several chunks.";
+
+    auto cfg = kokopop::make_long_form_config();
+    cfg.target_min_tokens = 20;
+    cfg.target_max_tokens = 40;
+    cfg.soft_max_tokens   = 60;
+    auto chunks = kokopop::chunk_text(text, cfg, frontend.phonemize,
+                                      frontend.tokenize, error);
+    REQUIRE(chunks.size() > 1);
+
+    for (const auto & chunk : chunks) {
+        std::vector<uint32_t> expected;
+        REQUIRE(frontend.tokenize(chunk.phonemes, expected, error));
+        CHECK_EQ(chunk.tokens, expected);
+        CHECK_EQ(chunk.n_tokens, static_cast<int>(chunk.tokens.size()));
+        // A concatenation of framed unit sequences would repeat the sentinels.
+        for (size_t i = 1; i + 1 < chunk.tokens.size(); ++i) {
+            CHECK_NE(chunk.tokens[i], chunk.tokens.front());
+        }
+        // Intermediate chunks carry no trailing punctuation.
+        if (!chunk.is_last) {
+            std::string trimmed = chunk.phonemes;
+            kokopop::trim_trailing_chunk_punctuation(trimmed);
+            CHECK_EQ(trimmed, chunk.phonemes);
+        }
+    }
+}
+
+TEST_CASE("chunk_tokens_are_the_canonical_sequence_adaptative") {
+    auto * model = shared_real_model();
+    if (!model) { MESSAGE("skipping: models/kokoro-md.gguf not found"); return; }
+
+    std::string error;
+    kokopop::VoiceFrontend frontend;
+    REQUIRE(kokopop::make_voice_frontend(*model, "af_heart", frontend, error));
+
+    const std::string text =
+        "This is a first sentence, with a clause. And a second one follows here. "
+        "A third sentence, longer than the others, closes the paragraph.";
+
+    auto cfg = kokopop::make_adaptative_config();
+    auto units = kokopop::prepare_chunk_units(text, cfg, frontend.phonemize,
+                                              frontend.tokenize, error);
+    REQUIRE(units.size() > 1);
+
+    size_t next = 0;
+    int n_chunks = 0;
+    while (next < units.size()) {
+        auto chunk = kokopop::build_adaptative_chunk(
+            units, next, cfg, 40, n_chunks == 0, frontend.tokenize, error);
+        REQUIRE(!chunk.tokens.empty());
+        ++n_chunks;
+
+        std::vector<uint32_t> expected;
+        REQUIRE(frontend.tokenize(chunk.phonemes, expected, error));
+        CHECK_EQ(chunk.tokens, expected);
+        CHECK_EQ(chunk.n_tokens, static_cast<int>(chunk.tokens.size()));
+    }
+    CHECK(n_chunks > 1);
+}
+
+TEST_CASE("synthesize_chunk_matches_synthesize_phonemes_on_the_chunk_string") {
+    auto * model = shared_real_model();
+    if (!model) { MESSAGE("skipping: models/kokoro-md.gguf not found"); return; }
+
+    std::string error;
+    kokopop::VoiceFrontend frontend;
+    REQUIRE(kokopop::make_voice_frontend(*model, "af_heart", frontend, error));
+
+    auto cfg = kokopop::make_long_form_config();
+    auto chunks = kokopop::chunk_text(
+        "Hello world, this is a chunk. And here is a second one.",
+        cfg, frontend.phonemize, frontend.tokenize, error);
+    REQUIRE(!chunks.empty());
+    const auto & chunk = chunks.front();
+
+    kokopop_audio from_ids{};
+    REQUIRE(kokopop::synthesize_chunk(*model, chunk, "af_heart", 1.0f,
+                                      kokopop::KokoroDiffusionOptions{},
+                                      from_ids, error));
+    kokopop_audio from_phonemes{};
+    REQUIRE(kokopop::synthesize_phonemes(*model, chunk.phonemes, "af_heart", 1.0f,
+                                         from_phonemes, error));
+
+    REQUIRE_EQ(from_ids.n_samples, from_phonemes.n_samples);
+    bool identical = true;
+    for (size_t i = 0; i < from_ids.n_samples; ++i) {
+        if (from_ids.samples[i] != from_phonemes.samples[i]) { identical = false; break; }
+    }
+    CHECK(identical);
+    kokopop_audio_free(&from_ids);
+    kokopop_audio_free(&from_phonemes);
 }

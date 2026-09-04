@@ -2,7 +2,7 @@
 
 #include "kokopop.h"
 #include "model/model.h"
-#include "inference/kokoro.h"
+#include "arch/kokoro/kokoro.h"
 #include "synthesis/phonemizer.h"
 #include "core/utf8.h"
 #include "core/wav.h"

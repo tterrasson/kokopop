@@ -1,5 +1,5 @@
 #include "test_helpers.h"
-#include "inference/kokoro.h"
+#include "arch/kokoro/kokoro.h"
 #include "core/constants.h"
 #include "model/model.h"
 
@@ -14,7 +14,7 @@ using namespace kokopop;
 // These are not public API but needed for unit testing the STFT/ISTFT pipeline.
 namespace kokopop {
 const float * hann_window_20();
-bool cpu_istft(Model & model, const CpuTensor & post, std::vector<float> & out);
+bool cpu_istft(KokoroArch & model, const CpuTensor & post, std::vector<float> & out);
 } // namespace kokopop
 
 // ---------------------------------------------------------------------------
@@ -26,10 +26,11 @@ bool cpu_istft(Model & model, const CpuTensor & post, std::vector<float> & out);
 // state needed.
 // ---------------------------------------------------------------------------
 
-// Build a minimal Model for STFT/ISTFT testing.
-// cpu_istft only needs Model's temporary buffers, not the backend.
-static std::unique_ptr<Model> make_stft_test_model() {
-    return std::make_unique<Model>();
+// Build a minimal KokoroArch for STFT/ISTFT testing.
+// cpu_istft only needs the arch's temporary buffers, not the backend, so the
+// arch is used detached from any Model (`base` stays null).
+static std::unique_ptr<KokoroArch> make_stft_test_model() {
+    return std::make_unique<KokoroArch>();
 }
 
 // ---------------------------------------------------------------------------
@@ -46,8 +47,10 @@ TEST_CASE("stft_buffers_grow_monotonically") {
     // The STFT buffer fields start empty.
     CHECK(model->tmp_stft_source_f32.empty());
     CHECK(model->tmp_stft_har_f32.empty());
-    CHECK(model->tmp_istft_y_f32.empty());
-    CHECK(model->tmp_istft_denom_f32.empty());
+    CHECK(model->tmp_istft_real_f32.empty());
+    CHECK(model->tmp_istft_imag_f32.empty());
+    CHECK(model->istft_workspace.ola.empty());
+    CHECK(model->istft_workspace.envelope.empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -172,22 +175,24 @@ TEST_CASE("istft_buffer_reuse") {
     std::vector<float> out1;
     cpu_istft(*model, post, out1);
 
-    // Buffers should now be allocated.
-    CHECK(!model->tmp_istft_y_f32.empty());
-    CHECK(!model->tmp_istft_denom_f32.empty());
-    size_t y_size_after_1 = model->tmp_istft_y_f32.size();
-    size_t denom_size_after_1 = model->tmp_istft_denom_f32.size();
+    // The complex half-spectrum is sized by the frame count...
+    CHECK_EQ(model->tmp_istft_real_f32.size(), 11u * static_cast<size_t>(n_frames));
+    CHECK_EQ(model->tmp_istft_imag_f32.size(), 11u * static_cast<size_t>(n_frames));
+    // ...but the overlap-add scratch is not: the shared component accumulates
+    // in a ring the width of one window, so it stays O(n_fft) whatever the
+    // signal length. This is what makes a long chunk allocation-free.
+    CHECK_EQ(model->istft_workspace.ola.size(), static_cast<size_t>(KOKOPOP_STFT_N));
+    CHECK_EQ(model->istft_workspace.envelope.size(), static_cast<size_t>(KOKOPOP_STFT_N));
 
-    // Second call with same size — buffers should NOT grow.
+    // Second call with the same size — nothing reallocates.
     std::vector<float> data2(total, 0.1f);
     CpuTensor post2{22, n_frames, std::move(data2)};
     std::vector<float> out2;
     cpu_istft(*model, post2, out2);
+    CHECK_EQ(model->tmp_istft_real_f32.size(), 11u * static_cast<size_t>(n_frames));
+    CHECK_EQ(model->istft_workspace.ola.size(), static_cast<size_t>(KOKOPOP_STFT_N));
 
-    CHECK_EQ(model->tmp_istft_y_f32.size(), y_size_after_1);
-    CHECK_EQ(model->tmp_istft_denom_f32.size(), denom_size_after_1);
-
-    // Third call with larger frame count — buffers should grow.
+    // Third call with twice the frames: the spectrum grows, the ring does not.
     constexpr int64_t n_frames_big = 200;
     size_t total_big = static_cast<size_t>(22 * n_frames_big);
     std::vector<float> data_big(total_big, 0.0f);
@@ -195,8 +200,9 @@ TEST_CASE("istft_buffer_reuse") {
     std::vector<float> out3;
     cpu_istft(*model, post_big, out3);
 
-    CHECK_GT(model->tmp_istft_y_f32.size(), y_size_after_1);
-    CHECK_GT(model->tmp_istft_denom_f32.size(), denom_size_after_1);
+    CHECK_EQ(model->tmp_istft_real_f32.size(), 11u * static_cast<size_t>(n_frames_big));
+    CHECK_EQ(model->istft_workspace.ola.size(), static_cast<size_t>(KOKOPOP_STFT_N));
+    CHECK_EQ(out3.size(), static_cast<size_t>(n_frames_big - 1) * KOKOPOP_STFT_HOP);
 }
 
 // ---------------------------------------------------------------------------

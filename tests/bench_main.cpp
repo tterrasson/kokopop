@@ -1,7 +1,7 @@
 #include "kokopop.h"
 #include "core/backend_names.h"
 #include "model/model.h"
-#include "inference/kokoro.h"
+#include "arch/kokoro/kokoro.h"
 #include "synthesis/phonemizer.h"
 
 #include <algorithm>
