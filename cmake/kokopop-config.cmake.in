@@ -1,0 +1,30 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+set_and_check(KOKOPOP_INCLUDE_DIR "@PACKAGE_CMAKE_INSTALL_INCLUDEDIR@")
+set_and_check(KOKOPOP_LIBRARY "@PACKAGE_CMAKE_INSTALL_LIBDIR@/@KOKOPOP_LIBRARY_FILE@")
+
+find_dependency(Threads)
+
+if(NOT TARGET kokopop::kokopop)
+  add_library(kokopop::kokopop UNKNOWN IMPORTED)
+  set_target_properties(kokopop::kokopop PROPERTIES
+    IMPORTED_LOCATION "${KOKOPOP_LIBRARY}"
+    INTERFACE_INCLUDE_DIRECTORIES "${KOKOPOP_INCLUDE_DIR}"
+    # The API is C, the implementation is C++. Without this, a pure C
+    # consumer of the static library links without the C++ runtime.
+    IMPORTED_LINK_INTERFACE_LANGUAGES "CXX")
+
+  # A shared kokopop resolves its own dependencies. A static one leaves them
+  # to the consumer's link line, so the package brings them back here; the
+  # list is what the library was actually linked against.
+  if("@KOKOPOP_LIBRARY_TYPE@" STREQUAL "STATIC")
+    find_dependency(ggml)
+    find_dependency(yyjson)
+    set_property(TARGET kokopop::kokopop APPEND PROPERTY
+      INTERFACE_LINK_LIBRARIES "@KOKOPOP_STATIC_LINK_LIBRARIES@")
+  endif()
+endif()
+
+check_required_components(kokopop)

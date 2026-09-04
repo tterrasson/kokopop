@@ -29,7 +29,9 @@ std::shared_ptr<RequestContext> SynthesisScheduler::submit(
     int ogg_prebuffer_chunks,
     const ChunkConfig & chunk_config_override,
     bool has_chunk_config_override,
-    const KokoroDiffusionOptions & diffusion)
+    const KokoroDiffusionOptions & diffusion,
+    bool has_noise_seed,
+    uint64_t noise_seed)
 {
     auto ctx = std::make_shared<RequestContext>();
     ctx->request_id = next_request_id();
@@ -42,6 +44,8 @@ std::shared_ptr<RequestContext> SynthesisScheduler::submit(
     ctx->chunk_config = chunk_config_override;
     ctx->has_chunk_config = has_chunk_config_override;
     ctx->diffusion = diffusion;
+    ctx->has_noise_seed = has_noise_seed;
+    ctx->noise_seed = noise_seed;
     ctx->sample_rate = _model.sample_rate(voice);
 
     {
@@ -108,6 +112,8 @@ void SynthesisScheduler::_worker_loop() {
             options.chunk_config = ctx->chunk_config;
             options.has_chunk_config = ctx->has_chunk_config;
             options.diffusion = ctx->diffusion;
+            options.has_noise_seed = ctx->has_noise_seed;
+            options.noise_seed = ctx->noise_seed;
 
             ctx->synthesis.reset(new SynthesisSession(_model, options));
             if (!ctx->synthesis->push_text(ctx->text, error) ||

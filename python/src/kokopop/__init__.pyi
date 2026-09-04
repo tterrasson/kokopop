@@ -20,9 +20,12 @@ class AudioChunk(Audio):
 
 class Model:
     sample_rate: int
+    arch: str
+    voices: tuple[str, ...]
     def __init__(
         self, path: str, *, n_threads: int = 0, backend: str = "auto"
     ) -> None: ...
+    def voice_sample_rate(self, voice: str) -> int: ...
     def synthesize(
         self, text: str, *, voice: str = "", speed: float = 1.0
     ) -> Audio: ...

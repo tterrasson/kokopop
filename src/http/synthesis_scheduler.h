@@ -47,7 +47,9 @@ public:
         int ogg_prebuffer_chunks = 0,
         const ChunkConfig & chunk_config_override = ChunkConfig{},
         bool has_chunk_config_override = false,
-        const KokoroDiffusionOptions & diffusion = KokoroDiffusionOptions{});
+        const KokoroDiffusionOptions & diffusion = KokoroDiffusionOptions{},
+        bool has_noise_seed = false,
+        uint64_t noise_seed = 0);
 
     /// Stop the worker thread. Does not wait — call join() for that.
     void stop();

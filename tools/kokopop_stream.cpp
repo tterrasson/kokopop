@@ -63,6 +63,7 @@ void usage(const char * argv0) {
         "  --out PATH      Save full audio to WAV file (stdio mode)\n"
         "  --threads N     Number of threads (default: min(4, hw_concurrency))\n"
         "  --backend       Inference backend (default: auto)\n"
+        "  --seed N        sanoTTS noise seed (stdio mode); default: derived from the voice\n"
         "  --http          Run in HTTP server mode (async, event-driven)\n"
         "  --port N        HTTP server port (default: 8080)\n"
         "  --bind ADDR     HTTP server bind address (default: 127.0.0.1)\n"
@@ -95,8 +96,10 @@ const char * arg_value(int & i, int argc, char ** argv) {
 
 static int run_stdio_mode(kokopop::Model * model, const std::string & voice,
                           float speed, kokopop::StreamMode stream_mode,
-                          const std::string & out_path) {
-    kokopop::StdioStreamer streamer(*model, voice, speed, stream_mode, out_path);
+                          const std::string & out_path,
+                          bool has_noise_seed, uint64_t noise_seed) {
+    kokopop::StdioStreamer streamer(*model, voice, speed, stream_mode, out_path,
+                                    has_noise_seed, noise_seed);
     streamer.run();
     streamer.join();
     return 0;
@@ -120,7 +123,11 @@ using kokopop::json_error;
 // ---------------------------------------------------------------------------
 
 static bool handle_health(kokopop::Model * model, kokopop::HttpRequest & /*req*/, kokopop::HttpResponse & res) {
-    std::string json = "{\"status\":\"ready\",\"sample_rate\":" + std::to_string(model->sample_rate()) + "}";
+    // `sample_rate` is the default voice's; a pack that mixes rates reports
+    // the per-voice value on /voices.
+    std::string json = "{\"status\":\"ready\",\"arch\":\"";
+    json += model->arch ? model->arch->name() : "unknown";
+    json += "\",\"sample_rate\":" + std::to_string(model->sample_rate()) + "}";
     res.set_json_string(json);
     return true; // keep-alive
 }
@@ -134,11 +141,17 @@ static bool handle_voices(kokopop::Model * model, kokopop::HttpRequest & /*req*/
     yyjson_mut_val * root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
 
+    // File order, from the architecture's table: the model's lookup map is
+    // unordered, and a client picking a voice by index would get a different
+    // one from one run to the next.
     yyjson_mut_val * arr = yyjson_mut_arr(doc);
-    for (const auto & kv : model->voices) {
-        yyjson_mut_val * obj = yyjson_mut_obj(doc);
-        yyjson_mut_obj_add_str(doc, obj, "name", kv.second.name.c_str());
-        yyjson_mut_arr_append(arr, obj);
+    if (model->arch) {
+        for (const auto & voice : model->arch->voices()) {
+            yyjson_mut_val * obj = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_str(doc, obj, "name", voice.name.c_str());
+            yyjson_mut_obj_add_int(doc, obj, "sample_rate", voice.sample_rate);
+            yyjson_mut_arr_append(arr, obj);
+        }
     }
     yyjson_mut_obj_add_val(doc, root, "voices", arr);
 
@@ -291,6 +304,8 @@ int main(int argc, char ** argv) {
     int http_port = 8080;
     std::string http_bind = "127.0.0.1";
     int idle_unload_minutes = 0;
+    bool has_noise_seed = false;
+    uint64_t noise_seed = 0;
 
     try {
         for (int i = 1; i < argc; ++i) {
@@ -326,6 +341,11 @@ int main(int argc, char ** argv) {
                                  v, kokopop::backend_name_list());
                     return 2;
                 }
+            } else if (std::strcmp(argv[i], "--seed") == 0) {
+                const char * v = arg_value(i, argc, argv);
+                if (!v) { usage(argv[0]); return 2; }
+                noise_seed = std::stoull(v);
+                has_noise_seed = true;
             } else if (std::strcmp(argv[i], "--http") == 0) {
                 http_mode = true;
             } else if (std::strcmp(argv[i], "--port") == 0) {
@@ -410,5 +430,6 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "[kokopop] Warning: stdin is a terminal. Pipe JSON input or use --http mode.\n");
     }
 #endif
-    return run_stdio_mode(model, voice, speed, stream_mode, out_path);
+    return run_stdio_mode(model, voice, speed, stream_mode, out_path,
+                          has_noise_seed, noise_seed);
 }

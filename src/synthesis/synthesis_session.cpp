@@ -78,6 +78,8 @@ bool SynthesisSession::prepare(std::string & error) {
         _plan.mode = _options.mode;
         _plan.config = cfg;
         _plan.diffusion = _options.diffusion;
+        _plan.has_noise_seed = _options.has_noise_seed;
+        _plan.noise_seed = _options.noise_seed;
         _chunks_total = static_cast<int>(_plan.chunks.size());
     } else {
         _adaptative_units = prepare_chunk_units(_text, cfg,
@@ -90,6 +92,8 @@ bool SynthesisSession::prepare(std::string & error) {
         _plan.mode = _options.mode;
         _plan.config = cfg;
         _plan.diffusion = _options.diffusion;
+        _plan.has_noise_seed = _options.has_noise_seed;
+        _plan.noise_seed = _options.noise_seed;
         _adaptative_controller.min_tokens = cfg.target_min_tokens;
         _adaptative_controller.max_tokens = cfg.soft_max_tokens;
         _adaptative_controller.growth_max_tokens = cfg.target_max_tokens;
@@ -144,6 +148,8 @@ bool SynthesisSession::next(size_t max_chunks, size_t queued_requests,
             one_chunk_plan.mode = _options.mode;
             one_chunk_plan.config = _plan.config;
             one_chunk_plan.diffusion = _options.diffusion;
+            one_chunk_plan.has_noise_seed = _options.has_noise_seed;
+            one_chunk_plan.noise_seed = _options.noise_seed;
 
             const auto start = std::chrono::steady_clock::now();
             audio = infer_chunk(_model, one_chunk_plan, 0, _prev_tail, out_tail, error,

@@ -135,6 +135,8 @@ kokopop::SynthesisSessionOptions make_session_options(
     out.mode = options ? c_synthesis_mode(options->mode, mode_ok) : default_mode;
     out.has_chunk_config = fill_chunk_config_override(options, out.chunk_config);
     out.diffusion = make_diffusion_options(options);
+    out.has_noise_seed = options && options->has_sano_noise_seed != 0;
+    out.noise_seed = options ? options->sano_noise_seed : 0;
     return out;
 }
 
@@ -513,6 +515,37 @@ void kokopop_model_free(kokopop_model * model) {
 int kokopop_model_sample_rate(kokopop_model * model) {
     if (!model || !model->impl) return 0;
     return model->impl->sample_rate();
+}
+
+int32_t kokopop_model_arch(const kokopop_model * model) {
+    if (!model || !model->impl || !model->impl->arch) return KOKOPOP_ARCH_UNKNOWN;
+    return static_cast<int32_t>(model->impl->arch->arch());
+}
+
+const char * kokopop_model_arch_name(const kokopop_model * model) {
+    if (!model || !model->impl || !model->impl->arch) {
+        return kokopop::arch_name(kokopop::Arch::Unknown);
+    }
+    return model->impl->arch->name();
+}
+
+size_t kokopop_model_voice_count(const kokopop_model * model) {
+    if (!model || !model->impl || !model->impl->arch) return 0;
+    return model->impl->arch->voices().size();
+}
+
+const char * kokopop_model_voice_name(const kokopop_model * model, size_t i) {
+    if (!model || !model->impl || !model->impl->arch) return nullptr;
+    const auto & voices = model->impl->arch->voices();
+    if (i >= voices.size()) return nullptr;
+    return voices[i].name.c_str();
+}
+
+int32_t kokopop_model_voice_sample_rate(const kokopop_model * model, const char * voice) {
+    if (!model || !model->impl || !model->impl->arch) return 0;
+    const kokopop::VoiceDesc * desc =
+        model->impl->arch->find_voice(voice ? voice : "");
+    return desc ? desc->sample_rate : 0;
 }
 
 int32_t kokopop_model_backend(const kokopop_model * model) {

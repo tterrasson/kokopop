@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <thread>
@@ -20,11 +21,13 @@ namespace {
 void usage(const char * argv0) {
     std::fprintf(stderr,
         "usage: %s --model kokoro.gguf --voice ff_siwis (--text TEXT | --phonemes PHONEMES) "
-        "[--out out.wav | --play] [--speed 1.0] [--threads N] [--backend %s]\n"
+        "[--out out.wav | --play] [--speed 1.0] [--threads N] [--backend %s] [--seed N]\n"
         "\n"
         "  --out out.wav   Write audio to a WAV file\n"
         "  --play          Play audio directly (mutually exclusive with --out)\n"
-        "  --backend       Inference backend (default: auto)\n",
+        "  --backend       Inference backend (default: auto)\n"
+        "  --seed N        sanoTTS noise seed; default: derived from the voice.\n"
+        "                  Ignored with --phonemes and on a Kokoro model.\n",
         argv0,
         kokopop::backend_name_list());
 }
@@ -35,6 +38,59 @@ const char * arg_value(int & i, int argc, char ** argv) {
     }
     ++i;
     return argv[i];
+}
+
+/// Long-form synthesis through the session API, concatenated into one buffer.
+/// Only used when the caller pinned a noise seed.
+int synthesize_text_with_seed(kokopop_model * model, const std::string & text,
+                              const std::string & voice, float speed,
+                              uint64_t seed, kokopop_audio & out) {
+    kokopop_synthesis_options options{};
+    options.voice = voice.c_str();
+    options.speed = speed;
+    options.mode = KOKOPOP_SYNTH_LONG_FORM;
+    options.has_sano_noise_seed = 1;
+    options.sano_noise_seed = seed;
+
+    kokopop_synthesis * synthesis = nullptr;
+    int rc = kokopop_synthesis_create(model, &options, &synthesis);
+    if (rc != KOKOPOP_OK) return rc;
+
+    std::vector<float> samples;
+    int32_t sample_rate = 0;
+    rc = kokopop_synthesis_push_text(synthesis, text.c_str());
+    if (rc == KOKOPOP_OK) rc = kokopop_synthesis_finish_input(synthesis);
+    while (rc == KOKOPOP_OK) {
+        kokopop_audio_chunk * chunks = nullptr;
+        size_t n_chunks = 0;
+        rc = kokopop_synthesis_next(synthesis, 1, &chunks, &n_chunks);
+        if (rc != KOKOPOP_OK || n_chunks == 0) {
+            kokopop_audio_chunks_free(chunks, n_chunks);
+            break;
+        }
+        bool final_chunk = false;
+        for (size_t i = 0; i < n_chunks; ++i) {
+            sample_rate = chunks[i].sample_rate;
+            samples.insert(samples.end(), chunks[i].samples,
+                           chunks[i].samples + chunks[i].n_samples);
+            final_chunk = final_chunk || chunks[i].is_final != 0;
+        }
+        kokopop_audio_chunks_free(chunks, n_chunks);
+        if (final_chunk) break;
+    }
+    kokopop_synthesis_free(synthesis);
+    if (rc != KOKOPOP_OK) return rc;
+    if (samples.empty()) {
+        std::fprintf(stderr, "synthesis produced no audio\n");
+        return KOKOPOP_ERROR_INFERENCE;
+    }
+
+    out.samples = static_cast<float *>(std::malloc(samples.size() * sizeof(float)));
+    if (out.samples == nullptr) return KOKOPOP_ERROR_INFERENCE;
+    std::memcpy(out.samples, samples.data(), samples.size() * sizeof(float));
+    out.n_samples = samples.size();
+    out.sample_rate = sample_rate;
+    return KOKOPOP_OK;
 }
 
 } // namespace
@@ -49,6 +105,8 @@ int main(int argc, char ** argv) {
     float speed = 1.0f;
     int threads = std::min(4, static_cast<int>(std::thread::hardware_concurrency()));
     int32_t backend = KOKOPOP_BACKEND_AUTO;
+    bool has_seed = false;
+    uint64_t seed = 0;
 
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--model") == 0) {
@@ -89,6 +147,11 @@ int main(int argc, char ** argv) {
             const char * v = arg_value(i, argc, argv);
             if (!v) { usage(argv[0]); return 2; }
             threads = std::stoi(v);
+        } else if (std::strcmp(argv[i], "--seed") == 0) {
+            const char * v = arg_value(i, argc, argv);
+            if (!v) { usage(argv[0]); return 2; }
+            seed = std::stoull(v);
+            has_seed = true;
         } else if (std::strcmp(argv[i], "--backend") == 0) {
             const char * v = arg_value(i, argc, argv);
             if (!v) { usage(argv[0]); return 2; }
@@ -121,8 +184,22 @@ int main(int argc, char ** argv) {
         return rc;
     }
 
+    // The seeded session path does not reproduce the per-language chunk config
+    // `kokopop_synthesize_text()` applies (Mandarin Kokoro voices get wider
+    // chunks and different pauses). Taking it for a model that ignores the
+    // seed anyway would change the chunking, the pauses and the audio for
+    // nothing, so it is reserved for the architecture the seed belongs to.
+    const bool seeded = has_seed && !text.empty() &&
+                        kokopop_model_arch(model) == KOKOPOP_ARCH_SANOTTS;
+    if (has_seed && !seeded) {
+        std::fprintf(stderr,
+                     "warning: --seed applies to sanoTTS voices only, ignoring it\n");
+    }
+
     kokopop_audio audio{};
-    if (!text.empty()) {
+    if (seeded) {
+        rc = synthesize_text_with_seed(model, text, voice, speed, seed, audio);
+    } else if (!text.empty()) {
         rc = kokopop_synthesize_text(model, text.c_str(), voice.c_str(), speed, &audio);
     } else {
         rc = kokopop_synthesize_phonemes(model, phonemes.c_str(), voice.c_str(), speed, &audio);

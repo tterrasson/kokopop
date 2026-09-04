@@ -18,6 +18,11 @@ struct SynthesisSessionOptions {
     bool has_chunk_config = false;
     bool use_exact_chunk_config = false;
     KokoroDiffusionOptions diffusion{};
+
+    /// sanoTTS's deterministic noise seed, absent by default. The flag is
+    /// separate so that 0 stays a usable explicit seed.
+    bool     has_noise_seed = false;
+    uint64_t noise_seed     = 0;
 };
 
 struct SynthesisAudioChunk {

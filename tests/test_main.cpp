@@ -5,6 +5,7 @@
 
 // Include all test files
 #include "test_api.cpp"
+#include "test_model_api.cpp"
 #include "test_phonemizer.cpp"
 #include "test_utf8.cpp"
 #include "test_wav.cpp"
@@ -25,6 +26,7 @@
 #include "test_sanotts_duration.cpp"
 #include "test_sanotts_decoder.cpp"
 #include "test_sanotts_backends.cpp"
+#include "test_sanotts_http.cpp"
 #include "test_audio_utils.cpp"
 #include "test_lstm_fused.cpp"
 #include "test_diffusion_kernels.cpp"

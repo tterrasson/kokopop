@@ -23,6 +23,40 @@ Use `kokopop_synthesize_phonemes()` when your input is already phonemized.
 `kokopop_audio` owns its `samples` pointer and must be released with
 `kokopop_audio_free()`.
 
+## Model introspection
+
+One GGUF names the architecture it was converted for and carries one or more
+voices, which may run at different sample rates.
+
+```c
+kokopop_model *model = NULL;
+kokopop_model_load("models/sanotts-en.gguf", NULL, &model);
+
+if (kokopop_model_arch(model) == KOKOPOP_ARCH_SANOTTS) {
+    /* kokopop_model_arch_name() gives "sanotts", "kokoro-82m" or "unknown". */
+}
+
+for (size_t i = 0; i < kokopop_model_voice_count(model); ++i) {
+    const char *voice = kokopop_model_voice_name(model, i);
+    int32_t rate = kokopop_model_voice_sample_rate(model, voice);
+    /* rate is this voice's, in Hz: a sanoTTS pack mixes 22050 and 24000. */
+}
+```
+
+Voices come back in file order. The first is not necessarily the default: the
+default is `kokopop.default_voice` when the file declares one, otherwise the
+first entry, and it is the voice a request with an empty name resolves to.
+
+`kokopop_model_sample_rate()` answers for that default voice. Any caller that
+has resolved a voice should use `kokopop_model_voice_sample_rate()` instead,
+or read `sample_rate` off the `kokopop_audio` / `kokopop_audio_chunk` it got
+back, which always carries the rate of the voice that produced it.
+
+`kokopop_model_voice_name()` returns `NULL` past the end, and
+`kokopop_model_voice_sample_rate()` returns `0` for an unknown voice. The
+returned name points into the model and stays valid until
+`kokopop_model_free()`.
+
 ## Backend selection
 
 `kokopop_model_options.backend` picks the inference backend. `KOKOPOP_BACKEND_AUTO`
@@ -38,6 +72,10 @@ compiled in or not available at runtime.
 | `KOKOPOP_BACKEND_CUDA` | CUDA (NVIDIA) |
 | `KOKOPOP_BACKEND_VULKAN` | Vulkan |
 | `KOKOPOP_BACKEND_OPENCL` | OpenCL (Adreno / Android) |
+
+For a sanoTTS model, `AUTO` resolves to the CPU: those models are small enough
+that dispatch overhead dominates and no GPU backend is faster. An explicit
+`KOKOPOP_BACKEND_METAL` (or CUDA, Vulkan, OpenCL) is still honoured.
 
 `kokopop_model_backend()` reports which one a loaded model actually got, so a
 caller that passed `AUTO` can tell whether it ended up on the GPU:
@@ -129,8 +167,32 @@ audio. One-shot `kokopop_synthesize_text()` and
 `kokopop_synthesize_phonemes()` intentionally keep the stable path; use
 `kokopop_synthesis` when you need diffusion options.
 
-For v1, push all text before generation. After `kokopop_synthesis_finish_input()`
+Push all text before generation. After `kokopop_synthesis_finish_input()`
 and the first `kokopop_synthesis_next()`, further `push_text()` calls fail.
+
+### sanoTTS noise seed
+
+The sanoTTS noise seed is configured directly on
+`kokopop_synthesis_options`:
+
+```c
+kokopop_synthesis_options opts = {0};
+opts.voice = "heart";
+opts.mode = KOKOPOP_SYNTH_LONG_FORM;
+
+opts.has_sano_noise_seed = 1;
+opts.sano_noise_seed = 1234;
+
+kokopop_synthesis *synth = NULL;
+kokopop_synthesis_create(model, &opts, &synth);
+```
+
+`sano_noise_seed` pins the deterministic noise the sanoTTS decoders consume.
+`has_sano_noise_seed` is a separate flag so that `0` stays a usable seed
+instead of meaning "unset"; leave it at `0` to let the decoder derive a seed
+from the voice, which is already reproducible run to run. Kokoro voices ignore
+both fields. Zero-initialize the options structure before setting fields, as in
+the example above.
 
 ## Streaming audio encoding
 

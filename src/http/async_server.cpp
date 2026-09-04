@@ -598,6 +598,26 @@ void AsyncHttpServer::_dispatch_request(int fd, Connection & conn) {
             first_chunk_target_tokens = std::max(1, static_cast<int>(yyjson_get_int(fct_val)));
         }
 
+        // Optional sanoTTS noise seed. Absent means "derive one from the
+        // voice"; an explicit 0 is a valid seed, hence the separate flag.
+        bool     has_noise_seed = false;
+        uint64_t noise_seed     = 0;
+        yyjson_val * noise_seed_val = yyjson_obj_get(root, "noise_seed");
+        if (noise_seed_val && !yyjson_is_null(noise_seed_val)) {
+            // Deliberately `is_uint` and not `is_num`: yyjson stores a real
+            // and a negative integer in the same union, so `get_uint` on
+            // `1.5` would hand back the IEEE-754 bit pattern and on `-1`
+            // would hand back UINT64_MAX. Both are silently wrong seeds.
+            if (!yyjson_is_uint(noise_seed_val)) {
+                yyjson_doc_free(doc);
+                _send_error(fd, conn, 400, "Bad Request",
+                            json_error("'noise_seed' must be a non-negative integer"));
+                return;
+            }
+            has_noise_seed = true;
+            noise_seed = yyjson_get_uint(noise_seed_val);
+        }
+
         // Optional diffusion style sampling. Disabled by default; only the
         // "diffusion" boolean turns it on, the rest are optional tuning knobs.
         KokoroDiffusionOptions diffusion;  // defaults: disabled, steps=5, alpha=0.1, beta=0.5
@@ -720,7 +740,8 @@ void AsyncHttpServer::_dispatch_request(int fd, Connection & conn) {
         auto ctx = _scheduler->submit(
             text_str, current_voice, spd, current_mode, fmt,
             ogg_prebuffer_chunks,
-            chunk_cfg_override, has_chunk_cfg_override, diffusion);
+            chunk_cfg_override, has_chunk_cfg_override, diffusion,
+            has_noise_seed, noise_seed);
 
         _send_streaming_response(fd, conn, ctx);
         return;

@@ -528,3 +528,91 @@ if(KOKOPOP_BUILD_BENCH)
   )
   target_link_libraries(kokopop_bench PRIVATE kokopop ggml)
 endif()
+
+# ---------------------------------------------------------------------------
+# Install and export
+#
+# Off when kokopop is a subdirectory of another project (the Python bindings
+# build it that way): a consumer's `cmake --install` should not deposit this
+# library and its headers alongside its own.
+# ---------------------------------------------------------------------------
+option(KOKOPOP_INSTALL "Generate the kokopop install rules"
+       ${PROJECT_IS_TOP_LEVEL})
+if(KOKOPOP_INSTALL)
+  include(GNUInstallDirs)
+  include(CMakePackageConfigHelpers)
+
+  install(TARGETS kokopop
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+  )
+  install(FILES include/kokopop.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+  if(KOKOPOP_BUILD_TOOLS)
+    install(TARGETS kokopop_say kokopop_stream kokopop_play kokopop_probe
+      RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  endif()
+
+  # The package file declares the imported target by hand rather than going
+  # through `install(EXPORT)`.
+  #
+  # kokopop links ggml privately, and CMake records a private dependency in
+  # the export interface whatever the library type. `install(EXPORT)` then
+  # refuses the target, because ggml is in no export set: upstream installs it
+  # with a plain `install(TARGETS ggml LIBRARY PUBLIC_HEADER)` and hand-writes
+  # its own config file. Nothing downstream can add an upstream target to our
+  # export set after the fact, so the config below is written directly. It
+  # pulls ggml and yyjson back in only for a static build, where the consumer
+  # does need them on its link line.
+  if(BUILD_SHARED_LIBS)
+    set(KOKOPOP_LIBRARY_FILE
+        ${CMAKE_SHARED_LIBRARY_PREFIX}kokopop${CMAKE_SHARED_LIBRARY_SUFFIX})
+    set(KOKOPOP_LIBRARY_TYPE SHARED)
+  else()
+    set(KOKOPOP_LIBRARY_FILE
+        ${CMAKE_STATIC_LIBRARY_PREFIX}kokopop${CMAKE_STATIC_LIBRARY_SUFFIX})
+    set(KOKOPOP_LIBRARY_TYPE STATIC)
+  endif()
+
+  # What a static kokopop leaves to the consumer's link line: exactly the
+  # private dependencies above, named as the installed packages export them.
+  # `CMAKE_CXX_IMPLICIT_LINK_LIBRARIES` is what makes a *C* consumer of the
+  # static archive link: the API is C, the implementation is C++, and nothing
+  # in a C project pulls in the C++ runtime on its own.
+  set(KOKOPOP_STATIC_LINK_LIBRARIES
+      ggml::ggml yyjson::yyjson Threads::Threads
+      ${KOKOPOP_ESPEAK_LIBRARIES}
+      ${CMAKE_CXX_IMPLICIT_LINK_LIBRARIES})
+  if(KOKOPOP_ENABLE_OPUS)
+    list(APPEND KOKOPOP_STATIC_LINK_LIBRARIES
+      ${KOKOPOP_OPUSENC_LIBRARIES}
+      ${KOKOPOP_OPUS_LIBRARIES}
+      ${KOKOPOP_OGG_LIBRARIES})
+  endif()
+  if(APPLE AND KOKOPOP_HAS_COREAUDIO)
+    list(APPEND KOKOPOP_STATIC_LINK_LIBRARIES
+      "-framework AudioToolbox" "-framework CoreAudio")
+  endif()
+  if(KOKOPOP_ENABLE_METAL)
+    list(APPEND KOKOPOP_STATIC_LINK_LIBRARIES
+      "-framework Metal" "-framework Foundation")
+  endif()
+
+  set(KOKOPOP_CMAKE_DIR ${CMAKE_INSTALL_LIBDIR}/cmake/kokopop)
+
+  configure_package_config_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/kokopop-config.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/kokopop-config.cmake
+    INSTALL_DESTINATION ${KOKOPOP_CMAKE_DIR}
+    PATH_VARS CMAKE_INSTALL_INCLUDEDIR CMAKE_INSTALL_LIBDIR)
+
+  write_basic_package_version_file(
+    ${CMAKE_CURRENT_BINARY_DIR}/kokopop-config-version.cmake
+    COMPATIBILITY SameMinorVersion)
+
+  install(FILES
+    ${CMAKE_CURRENT_BINARY_DIR}/kokopop-config.cmake
+    ${CMAKE_CURRENT_BINARY_DIR}/kokopop-config-version.cmake
+    DESTINATION ${KOKOPOP_CMAKE_DIR})
+endif()

@@ -27,7 +27,8 @@ std::unique_ptr<Backend> create_backend(
     [[maybe_unused]] int32_t requested, int32_t n_threads, Arch arch_hint,
     [[maybe_unused]] std::string & error) {
 
-    // AUTO + sanoTTS -> CPU, for now.
+    // AUTO + sanoTTS -> CPU.
+    // An explicit `--backend metal` still selects Metal.
     if (requested == KOKOPOP_BACKEND_AUTO && arch_hint == Arch::SanoTTS) {
         requested = KOKOPOP_BACKEND_CPU;
     }

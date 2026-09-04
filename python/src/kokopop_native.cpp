@@ -208,6 +208,18 @@ int get_optional_u32(PyObject * kwargs, const char * key, uint32_t & out) {
     return 0;
 }
 
+int get_optional_u64(PyObject * kwargs, const char * key, uint64_t & out, bool & present) {
+    present = false;
+    if (kwargs == nullptr) return 0;
+    PyObject * value = PyDict_GetItemString(kwargs, key);
+    if (value == nullptr || value == Py_None) return 0;
+    unsigned long long v = PyLong_AsUnsignedLongLong(value);
+    if (PyErr_Occurred()) return -1;
+    out = static_cast<uint64_t>(v);
+    present = true;
+    return 0;
+}
+
 int get_optional_float(PyObject * kwargs, const char * key, float & out) {
     if (kwargs == nullptr) return 0;
     PyObject * value = PyDict_GetItemString(kwargs, key);
@@ -249,7 +261,7 @@ int fill_synthesis_options(PyObject * kwargs, kokopop_synthesis_options & opts) 
         "paragraph_pause_ms", "crossfade_ms", "max_silence_trim_ms",
         "trim_silence", "enable_diffusion", "diffusion_seed",
         "diffusion_steps", "diffusion_alpha", "diffusion_beta",
-        "diffusion_embedding_scale", "max_chunks", nullptr,
+        "diffusion_embedding_scale", "noise_seed", "max_chunks", nullptr,
     };
     if (reject_unknown_kwargs(kwargs, allowed) < 0) return -1;
 
@@ -276,6 +288,12 @@ int fill_synthesis_options(PyObject * kwargs, kokopop_synthesis_options & opts) 
     if (get_optional_float(kwargs, "diffusion_alpha", opts.diffusion_alpha) < 0) return -1;
     if (get_optional_float(kwargs, "diffusion_beta", opts.diffusion_beta) < 0) return -1;
     if (get_optional_float(kwargs, "diffusion_embedding_scale", opts.diffusion_embedding_scale) < 0) return -1;
+
+    bool has_noise_seed = false;
+    uint64_t noise_seed = 0;
+    if (get_optional_u64(kwargs, "noise_seed", noise_seed, has_noise_seed) < 0) return -1;
+    opts.has_sano_noise_seed = has_noise_seed ? 1 : 0;
+    opts.sano_noise_seed = noise_seed;
 
     PyObject * trim = kwargs ? PyDict_GetItemString(kwargs, "trim_silence") : nullptr;
     if (trim != nullptr && trim != Py_None) {
@@ -365,6 +383,37 @@ int Model_init(ModelObject * self, PyObject * args, PyObject * kwargs) {
 
 PyObject * Model_get_sample_rate(ModelObject * self, void *) {
     return PyLong_FromLong(kokopop_model_sample_rate(self->handle));
+}
+
+PyObject * Model_get_arch(ModelObject * self, void *) {
+    return PyUnicode_FromString(kokopop_model_arch_name(self->handle));
+}
+
+PyObject * Model_get_voices(ModelObject * self, void *) {
+    const size_t n = kokopop_model_voice_count(self->handle);
+    PyObject * tuple = PyTuple_New(static_cast<Py_ssize_t>(n));
+    if (tuple == nullptr) return nullptr;
+    for (size_t i = 0; i < n; ++i) {
+        const char * name = kokopop_model_voice_name(self->handle, i);
+        PyObject * item = PyUnicode_FromString(name ? name : "");
+        if (item == nullptr) {
+            Py_DECREF(tuple);
+            return nullptr;
+        }
+        PyTuple_SET_ITEM(tuple, static_cast<Py_ssize_t>(i), item);
+    }
+    return tuple;
+}
+
+PyObject * Model_voice_sample_rate(ModelObject * self, PyObject * args) {
+    const char * voice = nullptr;
+    if (!PyArg_ParseTuple(args, "s", &voice)) return nullptr;
+    const int32_t rate = kokopop_model_voice_sample_rate(self->handle, voice);
+    if (rate == 0) {
+        PyErr_Format(PyExc_KeyError, "unknown voice '%s'", voice);
+        return nullptr;
+    }
+    return PyLong_FromLong(rate);
 }
 
 PyObject * Model_synthesize_common(ModelObject * self, PyObject * args, PyObject * kwargs, bool phonemes) {
@@ -841,11 +890,14 @@ PyMethodDef Model_methods[] = {
     {"synthesize", _PyCFunction_CAST(Model_synthesize_py), METH_VARARGS | METH_KEYWORDS, nullptr},
     {"synthesize_phonemes", _PyCFunction_CAST(Model_synthesize_phonemes_py), METH_VARARGS | METH_KEYWORDS, nullptr},
     {"stream", _PyCFunction_CAST(Model_stream_py), METH_VARARGS | METH_KEYWORDS, nullptr},
+    {"voice_sample_rate", reinterpret_cast<PyCFunction>(Model_voice_sample_rate), METH_VARARGS, nullptr},
     {nullptr, nullptr, 0, nullptr},
 };
 
 PyGetSetDef Model_getset[] = {
     {"sample_rate", reinterpret_cast<getter>(Model_get_sample_rate), nullptr, nullptr, nullptr},
+    {"arch", reinterpret_cast<getter>(Model_get_arch), nullptr, nullptr, nullptr},
+    {"voices", reinterpret_cast<getter>(Model_get_voices), nullptr, nullptr, nullptr},
     {nullptr, nullptr, nullptr, nullptr, nullptr},
 };
 

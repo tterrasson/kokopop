@@ -55,6 +55,8 @@ struct RequestContext {
     ChunkConfig chunk_config;      // override fields (defaults = no-op)
     bool has_chunk_config = false;
     KokoroDiffusionOptions diffusion{};  // disabled by default
+    bool     has_noise_seed = false;     // sanoTTS deterministic noise
+    uint64_t noise_seed     = 0;
     std::unique_ptr<SynthesisSession> synthesis;
 
     bool is_streaming() const {

@@ -257,18 +257,21 @@ bool make_voice_frontend(Model & model, const std::string & requested_voice,
     out.voice = *desc;
 
     ModelArch * arch = model.arch.get();
-    // `out.voice` is owned by the caller's VoiceFrontend and outlives both
-    // closures; capturing a pointer into it avoids re-resolving per fragment.
-    const VoiceDesc * voice = &out.voice;
+    // The descriptor is captured by value, not as a pointer into `out.voice`.
+    // A caller may keep a closure past the VoiceFrontend it came from the
+    // adaptative session stores `tokenize` and calls it one chunk at a time,
+    // long after the frontend it was built from went out of scope and a
+    // pointer would dangle there. The copy is one per closure, not per call.
+    const VoiceDesc voice = *desc;
     out.phonemize = [arch, voice](const std::string & text,
                                   std::string & phonemes,
                                   std::string & err) {
-        return arch->phonemize(text, *voice, phonemes, err);
+        return arch->phonemize(text, voice, phonemes, err);
     };
     out.tokenize = [arch, voice](const std::string & phonemes,
                                  std::vector<uint32_t> & ids,
                                  std::string & err) {
-        return arch->tokenize(phonemes, *voice, ids, err);
+        return arch->tokenize(phonemes, voice, ids, err);
     };
     return true;
 }

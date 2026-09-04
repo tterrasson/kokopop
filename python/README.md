@@ -1,6 +1,7 @@
 # kokopop for Python
 
-Native Python bindings for running Kokoro GGUF models with the Kokopop runtime.
+Native Python bindings for running neural TTS models in GGUF format with the
+Kokopop runtime. Two architectures are supported: Kokoro and sanoTTS.
 
 ## Installation
 
@@ -52,6 +53,26 @@ model = kokopop.Model("../models/kokoro-md.gguf", backend="cpu")
 audio = model.synthesize("Hello!", voice="af_heart")
 audio.write_wav("hello.wav")
 ```
+
+## Inspecting a model
+
+One GGUF names its architecture and carries one or more voices, which may run
+at different sample rates.
+
+```python
+model = kokopop.Model("../models/sanotts-en.gguf", backend="cpu")
+
+model.arch                       # "sanotts" or "kokoro-82m"
+model.voices                     # ("heart", "heartnano", "amy", "kristin")
+model.voice_sample_rate("heart") # 24000
+model.voice_sample_rate("amy")   # 22050
+model.sample_rate                # the default voice's rate
+```
+
+`voices` is in file order; its first entry is not necessarily the default.
+`voice_sample_rate` raises `KeyError` for an unknown voice. Every `Audio` and
+`AudioChunk` already carries the rate of the voice that produced it, so reading
+`audio.sample_rate` is usually enough.
 
 ## One-shot synthesis
 
@@ -123,6 +144,18 @@ using the same names as the C API (`enable_diffusion`, `diffusion_seed`,
 `diffusion_steps`, `diffusion_alpha`, `diffusion_beta`,
 `diffusion_embedding_scale`). Leave `enable_diffusion=False` to use the stable
 default voice style path.
+
+`SynthesisSession` and `Model.stream()` also accept `noise_seed`, which pins
+the deterministic noise the sanoTTS decoders consume. Omit it to let the
+decoder derive a seed from the voice, which is already reproducible run to run;
+`noise_seed=0` is a real seed, not "unset". Kokoro voices ignore it.
+
+```python
+with kokopop.SynthesisSession(
+    model, voice="heart", mode="long_form", noise_seed=1234
+) as session:
+    ...
+```
 
 ## Streaming audio encoding
 

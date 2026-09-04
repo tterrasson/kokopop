@@ -81,6 +81,16 @@ struct SynthesisPlan {
     ChunkConfig config;
     KokoroDiffusionOptions diffusion;
 
+    /// sanoTTS's deterministic noise seed. Absent means "derive one from the
+    /// voice", which is what makes two runs of the same text sound identical
+    /// without the caller having to pick a number.
+    bool     has_noise_seed = false;
+    uint64_t noise_seed     = 0;
+
+    /// Architecture-specific inputs for the chunk at `seq_index` in the
+    /// utterance. `kokoro_style_len` is filled in by `synthesize_chunk()`.
+    SynthesisExtras chunk_extras(uint32_t seq_index) const;
+
     /// Estimate total output samples (rough: 0.035s per token / speed)
     size_t estimated_total_samples(int sample_rate) const;
 };
@@ -135,6 +145,9 @@ std::vector<float> infer_chunk(
 // Full streaming synthesis (backward-compatible wrapper)
 // ---------------------------------------------------------------------------
 
+/// `has_noise_seed` / `noise_seed` pin sanoTTS's deterministic noise for the
+/// whole utterance; leave them at their defaults to let the decoder derive a
+/// seed from the voice. Kokoro voices ignore them.
 StreamHandle stream_synthesize(
     kokopop::Model & model,
     const std::string & text,
@@ -142,7 +155,9 @@ StreamHandle stream_synthesize(
     float speed,
     StreamMode mode,
     AudioCallback callback,
-    void * user_data);
+    void * user_data,
+    bool has_noise_seed = false,
+    uint64_t noise_seed = 0);
 
 // ---------------------------------------------------------------------------
 // Incremental streaming — text arrives in fragments
@@ -156,7 +171,9 @@ public:
         float speed,
         StreamMode mode,
         AudioCallback callback,
-        void * user_data);
+        void * user_data,
+        bool has_noise_seed = false,
+        uint64_t noise_seed = 0);
 
     ~IncrementalStreamer();
 
@@ -179,6 +196,8 @@ private:
     StreamMode mode_;
     AudioCallback callback_;
     void * user_data_;
+    bool has_noise_seed_ = false;
+    uint64_t noise_seed_ = 0;
     std::string buffer_;
     std::atomic<bool> stopped_{false};
     int chunk_counter_ = 0;

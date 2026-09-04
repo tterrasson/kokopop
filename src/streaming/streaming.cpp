@@ -18,6 +18,15 @@ namespace kokopop {
 // SynthesisPlan helpers
 // ---------------------------------------------------------------------------
 
+SynthesisExtras SynthesisPlan::chunk_extras(uint32_t seq_index) const {
+    SynthesisExtras extras;
+    extras.diffusion      = diffusion;
+    extras.has_noise_seed = has_noise_seed;
+    extras.noise_seed     = noise_seed;
+    extras.chunk_index    = seq_index;
+    return extras;
+}
+
 size_t SynthesisPlan::estimated_total_samples(int sample_rate) const {
     // Rough estimate: ~0.035s per token at speed 1.0
     size_t total_tokens = 0;
@@ -118,8 +127,9 @@ std::vector<float> infer_chunk(
 
     kokopop_audio raw{};
     const int noise_index = seq_index >= 0 ? seq_index : chunk_idx;
-    if (!synthesize_chunk(model, chunk, plan.voice, plan.speed, plan.diffusion,
-                          static_cast<uint32_t>(noise_index), raw, error)) {
+    if (!synthesize_chunk(model, chunk, plan.voice, plan.speed,
+                          plan.chunk_extras(static_cast<uint32_t>(noise_index)),
+                          raw, error)) {
         return {};
     }
 
@@ -178,7 +188,9 @@ StreamHandle stream_synthesize(
     float speed,
     StreamMode mode,
     AudioCallback callback,
-    void * user_data) {
+    void * user_data,
+    bool has_noise_seed,
+    uint64_t noise_seed) {
 
     StreamHandle handle;
     handle.state = std::make_shared<StreamState>();
@@ -202,11 +214,13 @@ StreamHandle stream_synthesize(
     // explicitly below.
     handle.thread = std::make_shared<std::thread>(
         [model = &model, text_copy, voice_copy, cb_shared, state_shared,
-         speed, mode, user_data]() {
+         speed, mode, user_data, has_noise_seed, noise_seed]() {
 
             // Phase 1: prepare
             std::string error;
             auto plan = prepare_synthesis(*model, text_copy, voice_copy, speed, mode, error);
+            plan.has_noise_seed = has_noise_seed;
+            plan.noise_seed = noise_seed;
             if (plan.chunks.empty()) {
                 std::fprintf(stderr, "[kokopop] prepare_synthesis failed: %s\n", error.c_str());
                 state_shared->done.store(true);
@@ -242,8 +256,9 @@ StreamHandle stream_synthesize(
 
                 kokopop_audio raw{};
                 if (!synthesize_chunk(*model, chunk,
-                                      plan.voice, plan.speed, plan.diffusion,
-                                      static_cast<uint32_t>(idx), raw, r.error)) {
+                                      plan.voice, plan.speed,
+                                      plan.chunk_extras(static_cast<uint32_t>(idx)),
+                                      raw, r.error)) {
                     return r;
                 }
                 if (raw.n_samples > 0 && raw.samples != nullptr) {
@@ -340,13 +355,17 @@ IncrementalStreamer::IncrementalStreamer(
     float speed,
     StreamMode mode,
     AudioCallback callback,
-    void * user_data)
+    void * user_data,
+    bool has_noise_seed,
+    uint64_t noise_seed)
     : model_(model)
     , voice_(voice)
     , speed_(speed)
     , mode_(mode)
     , callback_(callback)
-    , user_data_(user_data) {
+    , user_data_(user_data)
+    , has_noise_seed_(has_noise_seed)
+    , noise_seed_(noise_seed) {
 }
 
 IncrementalStreamer::~IncrementalStreamer() {
@@ -366,6 +385,8 @@ void IncrementalStreamer::flush() {
     // Phase 1: prepare
     std::string error;
     auto plan = prepare_synthesis(model_, text, voice_, speed_, mode_, error);
+    plan.has_noise_seed = has_noise_seed_;
+    plan.noise_seed = noise_seed_;
     if (plan.chunks.empty()) {
         if (!error.empty()) {
             std::fprintf(stderr, "[kokopop] prepare error: %s\n", error.c_str());

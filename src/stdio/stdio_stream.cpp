@@ -44,12 +44,16 @@ StdioStreamer::StdioStreamer(
     const std::string & voice,
     float speed,
     StreamMode mode,
-    const std::string & out_path)
+    const std::string & out_path,
+    bool has_noise_seed,
+    uint64_t noise_seed)
     : _model(model)
     , _voice(voice)
     , _speed(speed)
     , _mode(mode)
     , _out_path(out_path)
+    , _has_noise_seed(has_noise_seed)
+    , _noise_seed(noise_seed)
     , _sample_rate(model.sample_rate(voice))
 {
     _wav_accum.path = out_path;
@@ -128,7 +132,9 @@ void StdioStreamer::_synthesize(const std::string & text) {
             static_cast<StdioStreamer *>(user_data)->_on_audio(data, n_samples, chunk_index, user_data);
             return true;
         },
-        this);
+        this,
+        _has_noise_seed,
+        _noise_seed);
 
     _handles.push_back(std::move(handle));
 }

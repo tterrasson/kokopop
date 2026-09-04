@@ -46,7 +46,9 @@ public:
         const std::string & voice,
         float speed,
         StreamMode mode,
-        const std::string & out_path);
+        const std::string & out_path,
+        bool has_noise_seed = false,
+        uint64_t noise_seed = 0);
 
     ~StdioStreamer();
 
@@ -67,6 +69,8 @@ private:
     float _speed;
     StreamMode _mode;
     std::string _out_path;
+    bool _has_noise_seed;
+    uint64_t _noise_seed;
 
     WavAccumulator _wav_accum;
     int _sample_rate;

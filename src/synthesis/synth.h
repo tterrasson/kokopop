@@ -27,13 +27,16 @@ bool synthesize_phonemes(
 /// here could yield a different one. `chunk.phonemes` is still read, for the
 /// code-point count that picks Kokoro's style row.
 ///
-/// `chunk_index` is the chunk's position in the utterance; it seeds sanoTTS's
-/// per-chunk noise, so two chunks with identical ids still decode differently.
+/// `extras` carries the architecture-specific inputs the caller owns:
+/// Kokoro's diffusion options, sanoTTS's noise seed, and `chunk_index`, the
+/// chunk's position in the utterance, which is folded into the per-chunk seed
+/// so two chunks with identical ids still decode differently.
+/// `kokoro_style_len` is derived from `chunk.phonemes` here and any value the
+/// caller set is ignored.
 bool synthesize_chunk(
     Model & model, const Chunk & chunk,
     const std::string & voice, float speed,
-    const KokoroDiffusionOptions & diffusion,
-    uint32_t chunk_index,
+    const SynthesisExtras & extras,
     kokopop_audio & out, std::string & error);
 
 } // namespace kokopop

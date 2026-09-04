@@ -23,6 +23,12 @@ typedef struct kokopop_synthesis kokopop_synthesis;
 typedef struct kokopop_audio_encoder kokopop_audio_encoder;
 
 enum {
+    KOKOPOP_ARCH_UNKNOWN = 0,
+    KOKOPOP_ARCH_KOKORO  = 1,
+    KOKOPOP_ARCH_SANOTTS = 2
+};
+
+enum {
     KOKOPOP_BACKEND_AUTO = 0,
     KOKOPOP_BACKEND_CPU = 1,
     KOKOPOP_BACKEND_METAL = 2,
@@ -93,6 +99,12 @@ typedef struct kokopop_synthesis_options {
     float diffusion_alpha;
     float diffusion_beta;
     float diffusion_embedding_scale;
+
+    /// sanoTTS only. `has_sano_noise_seed` is a separate flag so that the
+    /// value 0 stays a valid explicit seed rather than meaning "unset".
+    /// Ignored by Kokoro voices.
+    int32_t  has_sano_noise_seed;
+    uint64_t sano_noise_seed;
 } kokopop_synthesis_options;
 
 typedef struct kokopop_encoder_options {
@@ -167,8 +179,29 @@ KOKOPOP_API void kokopop_audio_free(kokopop_audio * audio);
 KOKOPOP_API void kokopop_model_free(kokopop_model * model);
 KOKOPOP_API const char * kokopop_last_error(void);
 
-/// Get the sample rate of the loaded model
+/// Sample rate of the model's default voice, in Hz. Use
+/// `kokopop_model_voice_sample_rate()` on a model that mixes rates.
 KOKOPOP_API int kokopop_model_sample_rate(kokopop_model * model);
+
+/// Architecture the model was converted for: one of KOKOPOP_ARCH_*.
+KOKOPOP_API int32_t kokopop_model_arch(const kokopop_model * model);
+
+/// Same, as the string the converter wrote into `kokopop.arch`
+/// ("kokoro-82m", "sanotts"). Never null; "unknown" for a null model.
+KOKOPOP_API const char * kokopop_model_arch_name(const kokopop_model * model);
+
+/// Number of voices the model carries.
+KOKOPOP_API size_t kokopop_model_voice_count(const kokopop_model * model);
+
+/// Name of voice `i` in file order, or null when `i` is out of range.
+/// The pointer stays valid until the model is freed.
+KOKOPOP_API const char * kokopop_model_voice_name(const kokopop_model * model, size_t i);
+
+/// Sample rate of one voice, in Hz. A model may mix rates: a sanoTTS pack
+/// carries 22050 Hz Piperlite voices next to 24000 Hz Vocos ones. Returns 0
+/// when the voice is unknown.
+KOKOPOP_API int32_t kokopop_model_voice_sample_rate(const kokopop_model * model,
+                                                    const char * voice);
 
 /// Backend the model actually loaded on, once AUTO has been resolved.
 /// Returns one of KOKOPOP_BACKEND_*, or KOKOPOP_BACKEND_CPU for a null model.

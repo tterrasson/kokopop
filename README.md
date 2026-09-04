@@ -1,9 +1,13 @@
-# kokopop: Standalone Kokoro GGML Runtime
+# kokopop: Standalone neural TTS runtime (Kokoro, sanoTTS)
 
-A standalone C++ library and toolkit for running [Kokoro](https://github.com/hexgrad/kokoro) text-to-speech models in GGUF format, with no Python dependencies.
+A standalone C++ library and toolkit for running neural text-to-speech models in
+GGUF format, with no Python dependencies. Two architectures are supported:
+[Kokoro](https://github.com/hexgrad/kokoro) (82M, 24 kHz) and
+[sanoTTS](https://github.com/Ampixa/sanoTTS) (0.3M to 1.5M, 22.05 or 24 kHz).
 
 ## Features
 
+- **Two model architectures** in one runtime and one API, see [Supported models](#supported-models)
 - **Zero dependencies beyond libespeak-ng and ggml:** no Python or heavy ML frameworks
 - **Inference backends**:
   - **CPU** with configurable thread count
@@ -15,8 +19,32 @@ A standalone C++ library and toolkit for running [Kokoro](https://github.com/hex
 - **Chunked synthesis** for long-form text processing
 - **WAV, PCM (float32/s16), and Ogg/Opus audio output**
 - **Full C & C++ API:** usable from C, C++, Rust, Go, and other languages via FFI
+- **Multi-voice GGUF** with per-voice sample rates
 
 📊 See [Benchmarks](#benchmarks)
+
+## Supported models
+
+One GGUF carries one architecture and one or more voices. `kokopop_probe`
+prints what a file contains; the C API exposes the same through
+`kokopop_model_arch()`, `kokopop_model_voice_count()` and
+`kokopop_model_voice_sample_rate()`.
+
+| Architecture | Voices | Decoder | Rate | Size | Frontend |
+|---|---|---|---|--:|---|
+| `kokoro-82m` | any subset of the Kokoro voice packs | ISTFTNet | 24000 Hz | ~157 MiB (F16, all voices in one file) | misaki via espeak-ng |
+| `sanotts` / `heart` | 1 | Vocos (F32) | 24000 Hz | 8.9 MiB | misaki via espeak-ng |
+| `sanotts` / `heartnano` | 1 | TinyVocos (int8 → F32) | 24000 Hz | 1.4 MiB | misaki via espeak-ng |
+| `sanotts` / `amy`, `kristin`, and equivalent Piperlite packs | 1 each | Piperlite | 22050 Hz | 2.7 – 3.1 MiB | Piper (NFD, interleaved PAD) |
+
+A single sanoTTS GGUF may hold several voices at **mixed sample rates** — the
+four above come to 15.6 MiB together. Everything downstream of the voice
+resolution (session, WAV writer, HTTP encoders) uses that voice's rate, not the
+model's.
+
+Not supported: the sanoTTS `chinese` voice (acoustic adapter), the `robot` / R7
+MCU variants, Piperlite decoders with `res_layers != 1`, an output adapter or
+`pre_tanh_repair`.
 
 ## Quick Start
 
@@ -47,6 +75,26 @@ Then build:
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
+
+### Install and use from another CMake project
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+cmake --install build --prefix /usr/local
+```
+
+The install ships `kokopop.h`, the library, the CLI tools and a CMake package:
+
+```cmake
+find_package(kokopop REQUIRED)
+target_link_libraries(my_app PRIVATE kokopop::kokopop)
+```
+
+This works from a shared or a static build; a static one adds ggml, yyjson,
+espeak-ng and the C++ runtime to your link line for you. Pass
+`-DKOKOPOP_INSTALL=OFF` to suppress the install rules when embedding kokopop as
+a subdirectory of another project.
 
 ### Build with Metal GPU support (macOS)
 
@@ -157,6 +205,39 @@ enabled with a model that has no diffusion tensors, or with a build that does
 not include a C++ sampler for them, synthesis fails with an explicit error
 instead of silently changing voice style or perturbing standard generation.
 
+### Export sanoTTS voices to GGUF format
+
+The converter downloads the voice packs from an immutable Hugging Face commit
+into `~/.cache/sanotts/`:
+
+```bash
+uv run python tools/convert_sanotts_to_gguf.py \
+  --output models/sanotts-en.gguf \
+  --voices heart,heartnano,amy,kristin
+```
+
+One voice per file works the same way, and `--dry-run` prints the tensor plan,
+its shapes and its sizes without writing anything:
+
+```bash
+uv run python tools/convert_sanotts_to_gguf.py \
+  --output /dev/null --voices heart --dry-run
+```
+
+The two input families are packaged very differently. A Piperlite pack is
+self-describing — its `manifest.json` gives every tensor's name, shape, dtype,
+offset and SHA-256, so the conversion is a validated copy. A Vocos pack is two
+nameless byte blobs plus a generated C header of offsets, so the converter
+reconstructs the layout from the declared dimensions and checks each
+reconstructed size against the next offset, the blob totals and the declared
+parameter count. A checkpoint whose operators are not covered is refused, not
+guessed at.
+
+> **Note:** `AUTO` backend selection resolves to **CPU** for sanoTTS. The
+> models are two orders of magnitude smaller than Kokoro's, so dispatch
+> overhead dominates and a GPU wins nothing, see [Benchmarks](#benchmarks).
+> `--backend metal` (or `cuda`, `vulkan`, `opencl`) still forces a GPU.
+
 ### Usage
 
 Synthesize text to a WAV file:
@@ -192,6 +273,41 @@ Adjust generation speed:
   --text "Hello John, how are you today?" \
   --speed 1.5 \
   --out fast.wav
+```
+
+The same tool reads a sanoTTS GGUF. `--voice` selects from the file, and the
+WAV is written at *that voice's* rate — 24000 Hz here, 22050 Hz for `amy` from
+the very same file:
+
+```bash
+./build/kokopop_say \
+  --model models/sanotts-en.gguf \
+  --voice heart \
+  --text "Hello world." \
+  --out hello.wav
+```
+
+sanoTTS decoders are driven by deterministic noise. Two runs of the same text
+already give the same audio; `--seed` pins the stream explicitly, which is what
+makes a rendering reproducible across voices and versions. It applies to
+sanoTTS models only, and warns rather than changing anything on a Kokoro one:
+
+```bash
+./build/kokopop_say \
+  --model models/sanotts-en.gguf \
+  --voice heart \
+  --text "Hello world." \
+  --seed 1234 \
+  --out hello.wav
+```
+
+Inspect what a GGUF contains, and what each stage produces for one utterance:
+
+```bash
+./build/kokopop_probe \
+  --model models/sanotts-en.gguf \
+  --voice heart \
+  --text "Hello world."
 ```
 
 ### Streaming mode
@@ -316,9 +432,15 @@ curl -X POST http://localhost:8080/tts \
 # Health check
 curl http://localhost:8080/health
 
-# List voices
+# List voices, in file order, each with its own sample rate
 curl http://localhost:8080/voices
+# {"voices":[{"name":"heart","sample_rate":24000},{"name":"amy","sample_rate":22050}]}
 ```
+
+`GET /health` reports the architecture alongside the default voice's rate:
+`{"status":"ready","arch":"sanotts","sample_rate":24000}`. On a pack that mixes
+rates, the per-voice value from `/voices` is the one a client must use to
+interpret a raw PCM stream.
 
 **POST /tts request body fields:**
 
@@ -331,6 +453,7 @@ curl http://localhost:8080/voices
 | `format` | string | `pcm` | Output format: `pcm` (raw float32 stream), `wav` (complete WAV file), or `ogg` (Ogg/Opus stream) |
 | `prebuffer_chunks` | int | `0` | For `ogg` format: number of server-side Ogg synthesis chunks to buffer before starting playback |
 | `first_chunk_target_tokens` | int | preset default | Override the first-chunk token target to reduce TTFB (e.g., `50` for faster initial audio) |
+| `noise_seed` | int | derived from the voice | sanoTTS only: pin the decoder's deterministic noise. Must be a non-negative integer; `0` is a valid seed, not "unset" |
 
 **Response formats:**
 
@@ -683,13 +806,35 @@ ctest --test-dir build --output-on-failure
 
 ## Benchmarks
 
-Build and run benchmarks (requires a Kokoro GGUF model):
+Build and run benchmarks (requires a GGUF model):
 
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DKOKOPOP_BUILD_BENCH=ON
 cmake --build build
 ./build/kokopop_bench --model models/kokoro.gguf
+./build/kokopop_bench --model models/sanotts-en.gguf
 ```
+
+`kokopop_bench` reads the architecture from the file and picks that
+architecture's preset voice, text and repeat count. A sanoTTS voice is
+50 to 500 times smaller than Kokoro, and Kokoro's reference chunk sizes do not
+carry over.
+
+### sanoTTS: CPU vs Metal
+
+**Hardware:** MacBook Pro M1, **Threads:** 4, ~63 tokens, 8 iterations,
+minimum of the per-iteration wall time for one full utterance.
+
+| Voice | Decoder | Audio | CPU | Metal | Peak RSS (CPU / Metal) |
+|---|---|--:|--:|--:|--:|
+| `heart` | Vocos | 3.77 s | 16.1 ms | 16.0 ms | 74 MB / 224 MB |
+| `heartnano` | TinyVocos | 3.62 s | 5.2 ms | 5.2 ms | 57 MB / 207 MB |
+| `amy` | Piperlite | 4.21 s | 157.0 ms | 157.2 ms | 432 MB / 583 MB |
+
+Metal buys nothing and costs ~150 MB of resident memory, which is why `AUTO`
+resolves to CPU for sanoTTS. On 4 CPU threads, `heartnano` runs at
+~700x real time, `heart` at ~230x, and the Piperlite decoder, which does far
+more work per frame, at ~27x.
 
 ### Runtime Benchmarks (`kokopop_rt`)
 
@@ -909,5 +1054,8 @@ Licensed under the [MIT License](LICENSE).
 ## Acknowledgements
 
 - [Kokoro](https://github.com/hexgrad/kokoro): Text-to-speech model
+- [sanoTTS](https://github.com/Ampixa/sanoTTS) by Ampixa: compact text-to-speech models and runtime
 - [ggml](https://github.com/ggerganov/ggml): Tensor library for ML inference
 - [espeak-ng](https://github.com/espeak-ng/espeak-ng): Speech synthesis engine for phonemization
+
+See [THIRD_PARTY.md](THIRD_PARTY.md) for the licence notices these require.

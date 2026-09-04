@@ -514,7 +514,7 @@ TEST_CASE("synthesize_chunk_matches_synthesize_phonemes_on_the_chunk_string") {
 
     kokopop_audio from_ids{};
     REQUIRE(kokopop::synthesize_chunk(*model, chunk, "af_heart", 1.0f,
-                                      kokopop::KokoroDiffusionOptions{}, 0,
+                                      kokopop::SynthesisExtras{},
                                       from_ids, error));
     kokopop_audio from_phonemes{};
     REQUIRE(kokopop::synthesize_phonemes(*model, chunk.phonemes, "af_heart", 1.0f,

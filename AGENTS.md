@@ -1,4 +1,6 @@
-Standalone C++ runtime for Kokoro text-to-speech models in GGUF format.
+Standalone C++ runtime for neural text-to-speech models in GGUF format. Two
+architectures: Kokoro (82M) and sanoTTS (0.3M to 1.5M, Piperlite and Vocos
+decoders, mixed sample rates in one file).
 
 ## Tech Stack
 
@@ -23,7 +25,10 @@ tools/
   kokopop_say              Synthesize text → WAV or play directly
   kokopop_stream           STDIO streaming (stdin → stdout) + async HTTP server
   kokopop_play             Play raw audio from stdin
+  kokopop_probe            Inspect a GGUF and dump each inference stage
+  kokopop_rt               Per-chunk real-time factor breakdown
   convert_kokoro_to_gguf.py  Export Kokoro PyTorch model → GGUF
+  convert_sanotts_to_gguf.py Export sanoTTS voice packs → multi-voice GGUF
   export_pinyin_dict.py      Generate pinyin dictionary for zh_g2p
 tests/            Unit & integration tests (doctest)
 models/           Pre-exported GGUF model files
@@ -51,6 +56,7 @@ cmake --build build
 | `KOKOPOP_OPENCL_PROFILING` | `OFF` | OpenCL profiling in ggml (debug only) |
 | `KOKOPOP_OPENCL_TARGET_VERSION` | `300` | OpenCL version ggml targets (`200` on older Adreno) |
 | `KOKOPOP_BUILD_BENCH` | `OFF` | Build benchmarks |
+| `KOKOPOP_INSTALL` | top-level | Generate install/export rules (`find_package(kokopop)` → `kokopop::kokopop`) |
 
 ## Run
 
@@ -59,6 +65,13 @@ cmake --build build
 ```bash
 # Synthesize text to WAV
 ./build/kokopop_say --model models/kokoro-md.gguf --voice af_heart --text "Hello!" --out hello.wav
+
+# Same, with a sanoTTS voice. The WAV gets that voice's rate, which a
+# multi-voice pack does not share across voices.
+./build/kokopop_say --model models/sanotts-en.gguf --voice heart --text "Hello!" --out hello.wav
+
+# Inspect a GGUF: arch, voices, frontend, decoder, rates, durations
+./build/kokopop_probe --model models/sanotts-en.gguf --voice heart --text "Hello!"
 
 # STDIO streaming (JSON on stdin → audio on stdout)
 echo '{"text": "Hello!"}' | ./build/kokopop_stream --model models/kokoro-md.gguf --voice af_heart --mode long_form
@@ -86,8 +99,12 @@ ctest --test-dir build --output-on-failure
 ### Benchmarks
 
 ```bash
-./build/kokopop_bench --model models/kokoro-md.gguf
+./build/kokopop_bench --model models/kokoro.gguf
+./build/kokopop_bench --model models/sanotts-en.gguf
 ```
+
+The benchmark reads the architecture from the file and uses that
+architecture's preset for voice, text and repeat count.
 
 ## Python / uv
 
@@ -98,4 +115,9 @@ All Python work uses **uv**
 uv run python tools/convert_kokoro_to_gguf.py \
   --output models/kokoro.gguf \
   --voices af_heart,ff_siwis,zf_xiaoni,im_nicola
+
+# Convert sanoTTS voices to a single multi-voice GGUF (mixed sample rates)
+uv run python tools/convert_sanotts_to_gguf.py \
+  --output models/sanotts-en.gguf \
+  --voices heart,heartnano,amy,kristin
 ```

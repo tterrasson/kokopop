@@ -109,6 +109,30 @@ def test_model_text_and_phoneme_synthesis(mock_gguf):
     assert abs(view[0]) < 1.0
 
 
+def test_model_arch_and_voice_table(mock_gguf):
+    model = kokopop.Model(str(mock_gguf), n_threads=1, backend="cpu")
+    assert model.arch == "kokoro-82m"
+    assert model.voices == ("af_heart",)
+    assert model.voice_sample_rate("af_heart") == 24000
+    with pytest.raises(KeyError):
+        model.voice_sample_rate("no_such_voice")
+
+
+def test_streaming_session_accepts_noise_seed(mock_gguf):
+    # Kokoro ignores the seed, but it must be accepted and reach the C API
+    # rather than being rejected as an unknown keyword.
+    model = kokopop.Model(str(mock_gguf), n_threads=1, backend="cpu")
+    with kokopop.SynthesisSession(
+        model, voice="af_heart", mode="long_form", noise_seed=0
+    ) as session:
+        session.push_text("Alpha sentence.")
+        session.finish_input()
+        assert session.next(1)
+
+    with pytest.raises(TypeError):
+        kokopop.SynthesisSession(model, voice="af_heart", not_an_option=1)
+
+
 def test_wav_helpers(mock_gguf, tmp_path):
     model = kokopop.Model(str(mock_gguf), backend="cpu")
     audio = model.synthesize_phonemes("abc", voice="af_heart")

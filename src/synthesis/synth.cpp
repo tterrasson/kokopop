@@ -88,8 +88,7 @@ bool run_real_synthesis(
 bool synthesize_chunk(
     Model & model, const Chunk & chunk,
     const std::string & voice, float speed,
-    const KokoroDiffusionOptions & diffusion,
-    uint32_t chunk_index,
+    const SynthesisExtras & extras_in,
     kokopop_audio & out, std::string & error) {
     if (speed <= 0.0f || speed > 4.0f || !std::isfinite(speed)) {
         error = "speed must be greater than 0 and at most 4";
@@ -105,7 +104,8 @@ bool synthesize_chunk(
     }
 
     if (model.is_mock) {
-        return synthesize_phonemes(model, chunk.phonemes, voice, speed, diffusion, out, error);
+        return synthesize_phonemes(model, chunk.phonemes, voice, speed, extras_in.diffusion,
+                                   out, error);
     }
 
     if (model.arch == nullptr) {
@@ -120,9 +120,7 @@ bool synthesize_chunk(
         return false;
     }
 
-    SynthesisExtras extras;
-    extras.diffusion = diffusion;
-    extras.chunk_index = chunk_index;
+    SynthesisExtras extras = extras_in;
     // The style row is selected by the phoneme code-point count, which is not
     // recoverable from the ids, so it travels through the extras.
     extras.kokoro_style_len = utf8_codepoint_count(chunk.phonemes);
