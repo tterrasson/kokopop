@@ -1,5 +1,7 @@
 #include "audio/istft.h"
 
+#include "audio/istft_kernels.h"
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -91,41 +93,51 @@ bool IstftPlan::create(const IstftConfig & config, IstftPlan & out,
     const uint32_t half = n / 2;
 
     if (kernel == Kernel::DirectDft) {
-        plan._dft_cos.resize(static_cast<size_t>(n) * bins);
-        plan._dft_sin.resize(static_cast<size_t>(n) * bins);
-        for (uint32_t i = 0; i < n; ++i) {
-            for (uint32_t k = 0; k < bins; ++k) {
+        plan._dft_cos.resize(static_cast<size_t>(bins) * n);
+        plan._dft_sin.resize(static_cast<size_t>(bins) * n);
+        for (uint32_t k = 0; k < bins; ++k) {
+            for (uint32_t i = 0; i < n; ++i) {
                 // Angle in double, rounded to float, then a float cos/sin —
                 // again matching Kokoro's existing StftTwiddles exactly.
                 const float a = static_cast<float>(
                     2.0 * M_PI * static_cast<double>(k * i) / static_cast<double>(n));
-                plan._dft_cos[static_cast<size_t>(i) * bins + k] = std::cos(a);
-                plan._dft_sin[static_cast<size_t>(i) * bins + k] = std::sin(a);
+                plan._dft_cos[static_cast<size_t>(k) * n + i] = std::cos(a);
+                plan._dft_sin[static_cast<size_t>(k) * n + i] = std::sin(a);
             }
         }
     } else {
-        // Bit-reversal permutation for the half-size complex IFFT.
+        // Bit-reversal permutation for the half-size complex IFFT, kept as the
+        // swaps it performs rather than as the permutation it comes from: the
+        // fixed points and the mirror of each pair are what the loop skipped.
         uint32_t log2_half = 0;
         while ((1u << log2_half) < half) {
             ++log2_half;
         }
-        plan._bit_reverse.resize(half);
         for (uint32_t i = 0; i < half; ++i) {
             uint32_t r = 0;
             for (uint32_t b = 0; b < log2_half; ++b) {
                 r = (r << 1) | ((i >> b) & 1u);
             }
-            plan._bit_reverse[i] = r;
+            if (r > i) {
+                plan._bit_reverse_pairs.push_back(i);
+                plan._bit_reverse_pairs.push_back(r);
+            }
         }
 
-        // Inverse-transform twiddles e^{+2*pi*i*j/half}, indexed by j.
-        plan._half_tw_cos.resize(half);
-        plan._half_tw_sin.resize(half);
-        for (uint32_t j = 0; j < half; ++j) {
-            const double a = 2.0 * M_PI * static_cast<double>(j) /
-                             static_cast<double>(half);
-            plan._half_tw_cos[j] = static_cast<float>(std::cos(a));
-            plan._half_tw_sin[j] = static_cast<float>(std::sin(a));
+        // Inverse-transform twiddles e^{+2*pi*i*j/half}, one contiguous run per
+        // stage. Stage `h` (h butterflies per block) reads entry k as
+        // e^{+2*pi*i*k/(2h)}, which is the j = k * half/(2h) of the flat table
+        // this replaces.
+        plan._stage_tw_cos.resize(half - 1);
+        plan._stage_tw_sin.resize(half - 1);
+        for (uint32_t h = 1; h < half; h <<= 1) {
+            const uint32_t step = half / (2 * h);
+            for (uint32_t k = 0; k < h; ++k) {
+                const double a = 2.0 * M_PI * static_cast<double>(k * step) /
+                                 static_cast<double>(half);
+                plan._stage_tw_cos[h - 1 + k] = static_cast<float>(std::cos(a));
+                plan._stage_tw_sin[h - 1 + k] = static_cast<float>(std::sin(a));
+            }
         }
 
         // e^{+2*pi*i*k/n_fft}, the factor that undoes the odd-sample phase
@@ -137,6 +149,15 @@ bool IstftPlan::create(const IstftConfig & config, IstftPlan & out,
                              static_cast<double>(n);
             plan._split_cos[k] = static_cast<float>(std::cos(a));
             plan._split_sin[k] = static_cast<float>(std::sin(a));
+        }
+
+        // The kernel writes the even samples and the odd samples as two
+        // separate arrays, so it wants the window in the same shape.
+        plan._window_even.resize(half);
+        plan._window_odd.resize(half);
+        for (uint32_t m = 0; m < half; ++m) {
+            plan._window_even[m] = plan._window[2 * m];
+            plan._window_odd[m]  = plan._window[2 * m + 1];
         }
     }
 
@@ -162,53 +183,6 @@ bool IstftPlan::output_samples(size_t frames, size_t & out) const {
     out = padded > trim ? padded - trim : 0;
     return true;
 }
-
-namespace {
-
-/// In-place radix-2 inverse complex FFT of size `m`, normalised by 1/m.
-///
-/// `re`/`im` are read in natural order and left in natural order; the
-/// bit-reversal is applied on the way in.
-void inverse_fft_complex(const std::vector<uint32_t> & bit_reverse,
-                         const std::vector<float> & tw_cos,
-                         const std::vector<float> & tw_sin,
-                         float * re, float * im, uint32_t m) {
-    for (uint32_t i = 0; i < m; ++i) {
-        const uint32_t j = bit_reverse[i];
-        if (j > i) {
-            std::swap(re[i], re[j]);
-            std::swap(im[i], im[j]);
-        }
-    }
-
-    for (uint32_t len = 2; len <= m; len <<= 1) {
-        const uint32_t half = len >> 1;
-        const uint32_t step = m / len;
-        for (uint32_t base = 0; base < m; base += len) {
-            for (uint32_t k = 0; k < half; ++k) {
-                const uint32_t t = k * step;
-                const float wc = tw_cos[t];
-                const float ws = tw_sin[t];
-                const uint32_t a = base + k;
-                const uint32_t b = a + half;
-                const float br = re[b] * wc - im[b] * ws;
-                const float bi = re[b] * ws + im[b] * wc;
-                re[b] = re[a] - br;
-                im[b] = im[a] - bi;
-                re[a] += br;
-                im[a] += bi;
-            }
-        }
-    }
-
-    const float scale = 1.0f / static_cast<float>(m);
-    for (uint32_t i = 0; i < m; ++i) {
-        re[i] *= scale;
-        im[i] *= scale;
-    }
-}
-
-} // namespace
 
 bool istft(const IstftPlan & plan, IstftWorkspace & workspace,
            ComplexSpectrumView spectrum, std::vector<float> & audio,
@@ -256,27 +230,47 @@ bool istft(const IstftPlan & plan, IstftWorkspace & workspace,
         workspace.spec_real.assign(half, 0.0f);
         workspace.spec_imag.assign(half, 0.0f);
     }
+    // A bin-major spectrum is read one bin per sample; gathering the frame's
+    // bins first turns n_fft strided reads per bin into one.
+    const bool gathered = spectrum.bin_stride != 1;
+    if (gathered) {
+        workspace.bin_real.assign(bins, 0.0f);
+        workspace.bin_imag.assign(bins, 0.0f);
+    }
+
+    float * const frame = workspace.frame.data();
+    float * const ola = workspace.ola.data();
+    float * const envelope = workspace.envelope.data();
+    const float * const window = plan._window.data();
+    const float * const window_sq = plan._window_sq.data();
 
     const size_t trim = cfg.center ? n / 2 : 0;
 
     // Emit every padded position strictly below `pending`, then free its ring
     // slot. Called before each frame is added, so the live range is always the
     // n_fft positions the current frame writes to.
+    //
+    // One run per pass through the ring rather than one iteration per sample:
+    // `emitted` advances over a contiguous slice of the ring, and the slice
+    // that also lands inside the output is a contiguous slice of `audio`.
     size_t emitted = 0;
     const auto flush_until = [&](size_t pending) {
-        for (; emitted < pending; ++emitted) {
+        while (emitted < pending) {
             const size_t slot = emitted % n;
-            if (emitted >= trim) {
-                const size_t index = emitted - trim;
-                if (index < out_len) {
-                    const float env = workspace.envelope[slot];
-                    audio[index] = env > MIN_ENVELOPE
-                                 ? workspace.ola[slot] / env
-                                 : 0.0f;
-                }
+            const size_t run = std::min(pending - emitted, static_cast<size_t>(n) - slot);
+
+            const size_t begin = std::max(emitted, trim);
+            const size_t end = std::min(emitted + run, trim + out_len);
+            if (begin < end) {
+                const size_t offset = begin - emitted;
+                istft_kernel::normalise(audio.data() + (begin - trim),
+                                        ola + slot + offset,
+                                        envelope + slot + offset,
+                                        end - begin, MIN_ENVELOPE);
             }
-            workspace.ola[slot] = 0.0f;
-            workspace.envelope[slot] = 0.0f;
+            std::fill_n(ola + slot, run, 0.0f);
+            std::fill_n(envelope + slot, run, 0.0f);
+            emitted += run;
         }
     };
 
@@ -286,26 +280,39 @@ bool istft(const IstftPlan & plan, IstftWorkspace & workspace,
 
         const float * re_col = spectrum.real + spectrum.frame_stride * static_cast<ptrdiff_t>(f);
         const float * im_col = spectrum.imag + spectrum.frame_stride * static_cast<ptrdiff_t>(f);
-        const auto bin_re = [&](size_t k) { return re_col[spectrum.bin_stride * static_cast<ptrdiff_t>(k)]; };
-        const auto bin_im = [&](size_t k) { return im_col[spectrum.bin_stride * static_cast<ptrdiff_t>(k)]; };
+        if (gathered) {
+            istft_kernel::gather_strided(workspace.bin_real.data(), re_col,
+                                         spectrum.bin_stride, bins);
+            istft_kernel::gather_strided(workspace.bin_imag.data(), im_col,
+                                         spectrum.bin_stride, bins);
+            re_col = workspace.bin_real.data();
+            im_col = workspace.bin_imag.data();
+        }
 
         if (plan.kernel() == IstftPlan::Kernel::DirectDft) {
             // x[i] = (1/N) * (X[0] + (-1)^i X[N/2]
             //                 + 2 * sum_{k=1}^{N/2-1} (Re X[k] cos - Im X[k] sin))
-            const float dc = bin_re(0);
-            const float nyquist = bin_re(bins - 1);
-            for (uint32_t i = 0; i < n; ++i) {
-                // (-1)^i without a branch. The cast to int matters: the
-                // subtraction would otherwise be unsigned and wrap.
-                const int sign = 1 - 2 * static_cast<int>(i & 1u);
-                float sample = dc + nyquist * static_cast<float>(sign);
-                const float * tc = plan._dft_cos.data() + static_cast<size_t>(i) * bins;
-                const float * ts = plan._dft_sin.data() + static_cast<size_t>(i) * bins;
-                for (uint32_t k = 1; k < half; ++k) {
-                    sample += 2.0f * (bin_re(k) * tc[k] - bin_im(k) * ts[k]);
-                }
-                workspace.frame[i] = sample * (1.0f / static_cast<float>(n));
+            //
+            // Summed bin by bin over the whole frame instead of sample by
+            // sample: the tables are [bin][sample], so each bin costs one
+            // contiguous pass, and every sample still adds its bins in
+            // ascending order — the same additions in the same order as the
+            // sample-major form.
+            const float dc = re_col[0];
+            const float nyquist = re_col[bins - 1];
+            for (uint32_t i = 0; i < n; i += 2) {
+                frame[i]     = dc + nyquist;  // (-1)^i = +1
+                frame[i + 1] = dc - nyquist;
             }
+            for (uint32_t k = 1; k < half; ++k) {
+                // Doubling the bin rather than the sum: a multiplication by two
+                // is exact, so this is the same value the inner 2 * (...) gave.
+                istft_kernel::accumulate_rotation(
+                    frame, 2.0f * re_col[k], plan._dft_cos.data() + static_cast<size_t>(k) * n,
+                    2.0f * im_col[k], plan._dft_sin.data() + static_cast<size_t>(k) * n, n);
+            }
+            istft_kernel::window_scaled(frame, frame, window,
+                                        1.0f / static_cast<float>(n), n);
         } else {
             // Real inverse FFT through a half-length complex one.
             //
@@ -317,43 +324,50 @@ bool istft(const IstftPlan & plan, IstftWorkspace & workspace,
             // Z[k] = E[k] + i*O[k] is the transform of
             // z[m] = x[2m] + i*x[2m+1], so one IFFT of size N/2 yields both
             // sample parities.
-            for (uint32_t k = 0; k < half; ++k) {
-                const float ar = bin_re(k);
-                const float ai = bin_im(k);
-                const float br = bin_re(half - k);
-                const float bi = -bin_im(half - k);  // conj
+            float * const zr = workspace.spec_real.data();
+            float * const zi = workspace.spec_imag.data();
 
-                const float er = 0.5f * (ar + br);
-                const float ei = 0.5f * (ai + bi);
-                const float dr = 0.5f * (ar - br);
-                const float di = 0.5f * (ai - bi);
+            // The 1/half the inverse transform owes rides in on the 1/2 of the
+            // split, which saves a pass over the spectrum: half is a power of
+            // two, so the scaling is exact.
+            istft_kernel::hermitian_split(re_col, im_col, plan._split_cos.data(),
+                                          plan._split_sin.data(),
+                                          0.5f / static_cast<float>(half),
+                                          zr, zi, half);
 
-                const float sc = plan._split_cos[k];
-                const float ss = plan._split_sin[k];
-                const float orr = dr * sc - di * ss;
-                const float oi  = dr * ss + di * sc;
-
-                // Z[k] = E[k] + i*O[k]
-                workspace.spec_real[k] = er - oi;
-                workspace.spec_imag[k] = ei + orr;
+            const uint32_t * pairs = plan._bit_reverse_pairs.data();
+            const size_t swaps = plan._bit_reverse_pairs.size() / 2;
+            for (size_t p = 0; p < swaps; ++p) {
+                const uint32_t i = pairs[2 * p];
+                const uint32_t j = pairs[2 * p + 1];
+                std::swap(zr[i], zr[j]);
+                std::swap(zi[i], zi[j]);
             }
 
-            inverse_fft_complex(plan._bit_reverse, plan._half_tw_cos,
-                                plan._half_tw_sin, workspace.spec_real.data(),
-                                workspace.spec_imag.data(), half);
-
-            for (uint32_t m = 0; m < half; ++m) {
-                workspace.frame[2 * m]     = workspace.spec_real[m];
-                workspace.frame[2 * m + 1] = workspace.spec_imag[m];
+            istft_kernel::fft_stage_pairs(zr, zi, half);
+            for (uint32_t h = 2; h < half; h <<= 1) {
+                istft_kernel::fft_stage(zr, zi, plan._stage_tw_cos.data() + (h - 1),
+                                        plan._stage_tw_sin.data() + (h - 1), half, h);
             }
+
+            // z[m] = x[2m] + i*x[2m+1]: the real part carries the even samples
+            // and the imaginary part the odd ones, each windowed by its own
+            // half of the window.
+            istft_kernel::interleave_windowed(frame, zr, zi,
+                                              plan._window_even.data(),
+                                              plan._window_odd.data(), half);
         }
 
-        const float * window = plan._window.data();
-        const float * window_sq = plan._window_sq.data();
-        for (uint32_t i = 0; i < n; ++i) {
-            const size_t slot = (base + i) % n;
-            workspace.ola[slot] += workspace.frame[i] * window[i];
-            workspace.envelope[slot] += window_sq[i];
+        // Overlap-add into the ring. The frame covers exactly n_fft positions
+        // starting at `base`, so it wraps at most once: two contiguous adds,
+        // no per-sample modulo.
+        const size_t start = base % n;
+        const size_t first = n - start;
+        istft_kernel::add_inplace(ola + start, frame, first);
+        istft_kernel::add_inplace(envelope + start, window_sq, first);
+        if (start != 0) {
+            istft_kernel::add_inplace(ola, frame + first, start);
+            istft_kernel::add_inplace(envelope, window_sq + first, start);
         }
     }
 

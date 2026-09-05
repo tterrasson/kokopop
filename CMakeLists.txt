@@ -525,8 +525,16 @@ if(KOKOPOP_BUILD_TESTS)
   set_tests_properties(kokopop_playback_tests PROPERTIES TIMEOUT 15)
 endif()
 
-option(KOKOPOP_BUILD_BENCH "Build kokopop benchmarks (requires kokoro.gguf)" OFF)
+option(KOKOPOP_BUILD_BENCH "Build kokopop benchmarks (kokopop_bench requires a GGUF)" OFF)
 if(KOKOPOP_BUILD_BENCH)
+  # iSTFT micro-benchmark: no model, no backend — just the two kernels at the
+  # sizes the two architectures use.
+  add_executable(kokopop_bench_istft tests/bench_istft.cpp)
+  target_include_directories(kokopop_bench_istft PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
+  target_link_libraries(kokopop_bench_istft PRIVATE kokopop)
+
   add_executable(kokopop_bench tests/bench_main.cpp)
   target_include_directories(kokopop_bench PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src

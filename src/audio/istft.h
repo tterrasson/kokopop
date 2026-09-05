@@ -81,18 +81,29 @@ private:
     std::vector<float> _window;     // [n_fft]
     std::vector<float> _window_sq;  // [n_fft], w^2
 
-    // DirectDft: row-major [n_fft][bins], so the inner k loop is contiguous.
+    // RealRadix2 only: the window split by sample parity, because the kernel
+    // produces the even and the odd samples in two separate arrays.
+    std::vector<float> _window_even; // [n_fft/2], w[2m]
+    std::vector<float> _window_odd;  // [n_fft/2], w[2m+1]
+
+    // DirectDft: row-major [bins][n_fft]. One bin's contribution is added to
+    // every sample of the frame in a single contiguous pass, so the transform
+    // runs bin by bin rather than sample by sample.
     std::vector<float> _dft_cos;
     std::vector<float> _dft_sin;
 
-    // RealRadix2: bit-reversal permutation and twiddles for the half-size
-    // complex IFFT, plus the e^{+2*pi*i*k/n_fft} factors of the real-input
-    // recombination.
-    std::vector<uint32_t> _bit_reverse;   // [n_fft/2]
-    std::vector<float> _half_tw_cos;      // [n_fft/2]
-    std::vector<float> _half_tw_sin;      // [n_fft/2]
-    std::vector<float> _split_cos;        // [n_fft/2]
-    std::vector<float> _split_sin;        // [n_fft/2]
+    // RealRadix2: the bit-reversal permutation as the (i, j) swaps it actually
+    // performs, the twiddles of the half-size complex IFFT laid out per stage,
+    // and the e^{+2*pi*i*k/n_fft} factors of the real-input recombination.
+    //
+    // A stage with `h` butterflies per block starts at offset h - 1 and owns
+    // h entries, which packs stages h = 1, 2, ... n_fft/4 into n_fft/2 - 1
+    // contiguous values and leaves every stage's twiddles unit-stride.
+    std::vector<uint32_t> _bit_reverse_pairs;  // [2 * swaps], flattened
+    std::vector<float> _stage_tw_cos;          // [n_fft/2 - 1]
+    std::vector<float> _stage_tw_sin;          // [n_fft/2 - 1]
+    std::vector<float> _split_cos;             // [n_fft/2]
+    std::vector<float> _split_sin;             // [n_fft/2]
 };
 
 /// Reusable scratch, sized O(n_fft) and independent of the frame count.
@@ -105,6 +116,8 @@ struct IstftWorkspace {
     std::vector<float> spec_imag;  // [n_fft/2]
     std::vector<float> ola;        // [n_fft]  overlap-add ring
     std::vector<float> envelope;   // [n_fft]  sum of w^2, same ring
+    std::vector<float> bin_real;   // [bins]   one frame, gathered contiguously
+    std::vector<float> bin_imag;   // [bins]
 };
 
 /// A strided view over a complex half-spectrum.

@@ -20,6 +20,7 @@
 #include "test_model_internal.cpp"
 #include "test_model_arch.cpp"
 #include "test_istft.cpp"
+#include "test_istft_kernels.cpp"
 #include "test_sanotts_noise.cpp"
 #include "test_sanotts_g2p.cpp"
 #include "test_sanotts_tokenizer.cpp"

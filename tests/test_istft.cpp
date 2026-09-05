@@ -407,6 +407,26 @@ TEST_CASE("istft_ring_overlap_add_equals_a_flat_accumulator") {
     CHECK(worst_abs_diff(got, want) < 5e-5);
 }
 
+// A hop that does not divide n_fft makes the ring wrap at a different offset
+// on every frame, so the frame no longer lands on the ring as one aligned
+// block. Every other size here divides evenly and would never notice.
+TEST_CASE("istft_ring_handles_a_hop_that_does_not_divide_n_fft") {
+    for (uint32_t hop : {7u, 25u, 63u}) {
+        const IstftPlan plan = make_plan(64, hop);
+        const Spectrum s = random_spectrum(plan.bins(), 37, 0x1234u);
+
+        IstftWorkspace ws;
+        std::vector<float> got;
+        std::string error;
+        REQUIRE(kokopop::istft(plan, ws, s.view(), got, error));
+
+        const std::vector<double> want = reference_istft(s, plan.config(), plan.window());
+        REQUIRE_EQ(got.size(), want.size());
+        INFO("hop " << hop);
+        CHECK(worst_abs_diff(got, want) < 5e-5);
+    }
+}
+
 // A constant signal is the cleanest way to see the window: after the Sum(w^2)
 // division the interior must be flat, with no scalloping at the frame seams.
 TEST_CASE("istft_envelope_normalisation_removes_the_window") {

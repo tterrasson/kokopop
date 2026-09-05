@@ -796,7 +796,7 @@ Kokopop supports the following languages:
 | `KOKOPOP_ENABLE_OPENCL` | `OFF` | Enable OpenCL GPU backend (Adreno / Android) |
 | `KOKOPOP_OPENCL_PROFILING` | `OFF` | Enable OpenCL profiling in ggml (adds CPU overhead) |
 | `KOKOPOP_OPENCL_TARGET_VERSION` | `300` | OpenCL version ggml targets (try `200` on older Adreno drivers) |
-| `KOKOPOP_BUILD_BENCH` | `OFF`   | Build benchmarks (requires a model) |
+| `KOKOPOP_BUILD_BENCH` | `OFF`   | Build benchmarks (`kokopop_bench` requires a model, `kokopop_bench_istft` does not) |
 
 ## Testing
 

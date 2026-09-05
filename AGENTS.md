@@ -101,10 +101,17 @@ ctest --test-dir build --output-on-failure
 ```bash
 ./build/kokopop_bench --model models/kokoro.gguf
 ./build/kokopop_bench --model models/sanotts-en.gguf
+
+# iSTFT kernels alone — no model needed
+./build/kokopop_bench_istft
 ```
 
-The benchmark reads the architecture from the file and uses that
+`kokopop_bench` reads the architecture from the file and uses that
 architecture's preset for voice, text and repeat count.
+
+`kokopop_bench_istft` times the inverse STFT at both architectures' sizes and
+checks each result against a double-precision inverse DFT, so a change to
+`src/audio/istft_kernels.h` can be validated on its own.
 
 ## Python / uv
 
