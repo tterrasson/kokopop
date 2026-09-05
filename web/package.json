@@ -1,0 +1,10 @@
+{
+  "name": "@kokopop/web",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Kokoro and sanoTTS GGUF inference in the browser",
+  "exports": { ".": { "types": "./index.d.ts", "import": "./index.js" }, "./*": "./*" },
+  "types": "./index.d.ts",
+  "files": ["*.js", "*.d.ts", "*.wasm", "*.data", "README.md", "LICENSE*"],
+  "sideEffects": false
+}

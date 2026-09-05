@@ -1,5 +1,6 @@
 #include "backend.h"
 #include "metal.h"
+#include "webgpu.h"
 #ifdef KOKOPOP_HAS_CUDA
 #include "cuda.h"
 #endif
@@ -16,13 +17,14 @@
 namespace kokopop {
 
 // Factory: create the requested backend.
-// KOKOPOP_BACKEND_AUTO  → try CUDA, then Metal, then Vulkan, then OpenCL,
+// KOKOPOP_BACKEND_AUTO  → try CUDA, then Metal, then Vulkan, then OpenCL, then WebGPU,
 //                         fall back to CPU
 // KOKOPOP_BACKEND_CPU   → CPU
 // KOKOPOP_BACKEND_METAL → Metal, fail if unavailable
 // KOKOPOP_BACKEND_CUDA  → CUDA, fail if unavailable
 // KOKOPOP_BACKEND_VULKAN → Vulkan, fail if unavailable
 // KOKOPOP_BACKEND_OPENCL → OpenCL, fail if unavailable
+// KOKOPOP_BACKEND_WEBGPU → WebGPU, fail if unavailable
 std::unique_ptr<Backend> create_backend(
     [[maybe_unused]] int32_t requested, int32_t n_threads, Arch arch_hint,
     [[maybe_unused]] std::string & error) {
@@ -101,6 +103,22 @@ std::unique_ptr<Backend> create_backend(
 #else
     if (requested == KOKOPOP_BACKEND_OPENCL) {
         error = "OpenCL backend requested but not compiled in";
+        return nullptr;
+    }
+#endif
+
+#ifdef KOKOPOP_HAS_WEBGPU
+    if (requested == KOKOPOP_BACKEND_AUTO || requested == KOKOPOP_BACKEND_WEBGPU) {
+        auto webgpu = create_webgpu_backend(n_threads);
+        if (webgpu) return webgpu;
+        if (requested == KOKOPOP_BACKEND_WEBGPU) {
+            error = "WebGPU backend requested but not available";
+            return nullptr;
+        }
+    }
+#else
+    if (requested == KOKOPOP_BACKEND_WEBGPU) {
+        error = "WebGPU backend requested but not compiled in";
         return nullptr;
     }
 #endif

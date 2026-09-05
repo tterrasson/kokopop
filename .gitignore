@@ -20,6 +20,8 @@ compile_commands.json
 *.a
 *.dylib
 *.out
+a.out.js
+a.out.wasm
 *.bin
 .cache
 

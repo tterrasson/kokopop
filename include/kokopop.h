@@ -34,7 +34,8 @@ enum {
     KOKOPOP_BACKEND_METAL = 2,
     KOKOPOP_BACKEND_CUDA = 3,
     KOKOPOP_BACKEND_VULKAN = 4,
-    KOKOPOP_BACKEND_OPENCL = 5
+    KOKOPOP_BACKEND_OPENCL = 5,
+    KOKOPOP_BACKEND_WEBGPU = 6
 };
 
 typedef struct kokopop_model_options {

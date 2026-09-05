@@ -313,6 +313,7 @@ bool load_model_from_gguf(
         case KOKOPOP_BACKEND_CUDA:
         case KOKOPOP_BACKEND_VULKAN:
         case KOKOPOP_BACKEND_OPENCL:
+        case KOKOPOP_BACKEND_WEBGPU:
             break;
         default:
             error = "invalid kokopop backend option";

@@ -263,7 +263,8 @@ std::unique_ptr<Backend> create_cpu_backend(int32_t n_threads);
 // Factory: create the backend for the given request.
 // requested: KOKOPOP_BACKEND_AUTO (0), KOKOPOP_BACKEND_CPU (1),
 //            KOKOPOP_BACKEND_METAL (2), KOKOPOP_BACKEND_CUDA (3),
-//            KOKOPOP_BACKEND_VULKAN (4), KOKOPOP_BACKEND_OPENCL (5)
+//            KOKOPOP_BACKEND_VULKAN (4), KOKOPOP_BACKEND_OPENCL (5),
+//            KOKOPOP_BACKEND_WEBGPU (6)
 //
 // `arch_hint` is the architecture declared by the GGUF being loaded. AUTO uses
 // it because the right answer differs per architecture: Kokoro is worth

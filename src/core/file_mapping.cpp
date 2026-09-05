@@ -17,7 +17,12 @@
 namespace kokopop {
 
 FileMapping::FileMapping(const std::string & path) {
-#if defined(_WIN32)
+#if defined(__EMSCRIPTEN__)
+    // MEMFS mmap duplicates the complete model into the wasm heap. Use the
+    // bounded fread path in the loader instead.
+    (void)path;
+    _error = "mmap disabled for MEMFS";
+#elif defined(_WIN32)
     HANDLE file = CreateFileA(
         path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);

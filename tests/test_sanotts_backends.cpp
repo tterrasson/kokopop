@@ -148,3 +148,7 @@ TEST_CASE("sanotts_rendering_does_not_depend_on_what_ran_before") {
     CHECK_EQ(again.durations, first.durations);
     CHECK_EQ(again.audio, first.audio);
 }
+
+TEST_CASE("sanotts_webgpu_matches_cpu") {
+    check_backend_matches_cpu(KOKOPOP_BACKEND_WEBGPU);
+}

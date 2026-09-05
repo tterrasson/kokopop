@@ -15,6 +15,7 @@ class Backend:
     CUDA = "cuda"
     VULKAN = "vulkan"
     OPENCL = "opencl"
+    WEBGPU = "webgpu"
 
 
 class Mode:

@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8" />
+<title>kokopop browser smoke test</title>
+
+<h1>kokopop browser smoke test</h1>
+<p>Model: models/sanotts-en.gguf. Each button tests all voices, checks finite, non-silent PCM and the voice sample rate.</p>
+<button id="cpu">Test CPU</button>
+<button id="gpu">Test WebGPU</button>
+<pre id="log"></pre>
+<div id="audio"></div>
+
+<script type="module">
+  const log = (line) => (document.querySelector('#log').textContent += line + '\n');
+  log(`WebGPU: ${!!navigator.gpu}; JSPI: ${typeof WebAssembly.Suspending === 'function'}`);
+
+  const outputs = new Map();
+
+  function encodeWav(samples, sampleRate) {
+    const bytes = new ArrayBuffer(44 + samples.length * 2);
+    const view = new DataView(bytes);
+    const str = (offset, value) => [...value].forEach((c, i) => view.setUint8(offset + i, c.charCodeAt(0)));
+
+    str(0, 'RIFF');
+    view.setUint32(4, bytes.byteLength - 8, true);
+    str(8, 'WAVEfmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    str(36, 'data');
+    view.setUint32(40, samples.length * 2, true);
+    samples.forEach((x, i) => view.setInt16(44 + i * 2, Math.round(Math.max(-1, Math.min(1, x)) * 32767), true));
+
+    return bytes;
+  }
+
+  function renderPlayer(backend, voice, samples, sampleRate) {
+    const bytes = encodeWav(samples, sampleRate);
+    const player = document.createElement('audio');
+    player.controls = true;
+    player.src = URL.createObjectURL(new Blob([bytes], { type: 'audio/wav' }));
+
+    const label = document.createElement('p');
+    label.textContent = `${backend}: ${voice}`;
+    document.querySelector('#audio').append(label, player);
+  }
+
+  function checkParity(backend, voice, samples) {
+    const reference = outputs.get(`${backend === 'cpu' ? 'webgpu' : 'cpu'}:${voice}`);
+    if (!reference) return;
+
+    if (samples.length !== reference.length) throw Error('CPU/GPU duration mismatch');
+
+    let xy = 0, xx = 0, yy = 0, error = 0;
+    samples.forEach((x, i) => {
+      const y = reference[i];
+      xy += x * y;
+      xx += x * x;
+      yy += y * y;
+      error += (x - y) ** 2;
+    });
+    const correlation = xy / Math.sqrt(xx * yy);
+    const rmsError = Math.sqrt(error / samples.length);
+
+    log(JSON.stringify({ parity: voice, correlation, rmsError }));
+    if (correlation < 0.999 || rmsError > 1e-3) throw Error('CPU/GPU parity failed');
+  }
+
+  async function testVoice(tts, backend, voice) {
+    const start = performance.now();
+    const { samples, sampleRate } = await tts.synthesize('Hello from the browser.', { voice: voice.name });
+    const rms = Math.sqrt(samples.reduce((sum, x) => sum + x * x, 0) / samples.length);
+
+    if (!samples.every(Number.isFinite) || samples.length < 1000 || !(rms > 1e-5) || sampleRate !== voice.sampleRate) {
+      throw Error(`Invalid audio: ${voice.name}`);
+    }
+    log(JSON.stringify({ voice: voice.name, sampleRate, samples: samples.length, rms, elapsedMs: Math.round(performance.now() - start) }));
+
+    outputs.set(`${backend}:${voice.name}`, samples);
+    checkParity(backend, voice.name, samples);
+    renderPlayer(backend, voice.name, samples, sampleRate);
+  }
+
+  async function testConcurrencyAndDisposal(tts, backend) {
+    // Exercise the real Worker queue while native calls suspend through JSPI.
+    const firstVoice = tts.voices[0].name;
+    const [a, b] = await Promise.all([
+      tts.synthesize('Hello.', { voice: firstVoice }),
+      tts.synthesize('Hello from the browser.', { voice: firstVoice }),
+    ]);
+    if (!a.samples.length || b.samples.length !== outputs.get(`${backend}:${firstVoice}`).length) {
+      throw Error('Concurrent synthesis failed');
+    }
+
+    let rejected = false;
+    try {
+      await tts.synthesize('Hello.', { voice: 'not-a-voice' });
+    } catch {
+      rejected = true;
+    }
+    if (!rejected) throw Error('Unknown voice was accepted');
+
+    await tts.synthesize('Hello.', { voice: firstVoice });
+    await tts.dispose();
+    await tts.dispose();
+
+    rejected = false;
+    try {
+      await tts.synthesize('Hello.');
+    } catch {
+      rejected = true;
+    }
+    if (!rejected) throw Error('Disposed instance accepted work');
+  }
+
+  async function run(backend) {
+    document.querySelectorAll('button').forEach((b) => (b.disabled = true));
+    let tts;
+    try {
+      const dist = backend === 'cpu' ? '../build-web-cpu/web/dist/index.js' : '../build-web/web/dist/index.js';
+      const { Kokopop } = await import(dist);
+
+      log(`Loading ${backend}…`);
+      tts = await Kokopop.create({ model: '../models/sanotts-en.gguf', backend });
+      log(JSON.stringify({ backend: tts.backend, architecture: tts.architecture, voices: tts.voices }));
+
+      for (const voice of tts.voices) {
+        await testVoice(tts, backend, voice);
+      }
+      await testConcurrencyAndDisposal(tts, backend);
+
+      log(`${backend}: PASS (audio, queue, error recovery, disposal)`);
+    } catch (error) {
+      log(`FAIL: ${error.stack || error}`);
+    } finally {
+      await tts?.dispose();
+      document.querySelectorAll('button').forEach((b) => (b.disabled = false));
+    }
+  }
+
+  document.querySelector('#cpu').onclick = () => run('cpu');
+  document.querySelector('#gpu').onclick = () => run('webgpu');
+</script>
+</html>

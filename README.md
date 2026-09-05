@@ -15,6 +15,8 @@ GGUF format, with no Python dependencies. Two architectures are supported:
   - **CUDA** (Linux/Windows) on NVIDIA GPUs
   - **Vulkan** (Linux/Windows/macOS via MoltenVK)
   - **OpenCL** (Android/Adreno, where Vulkan is unavailable)
+  - **WebGPU** (browser via Emdawnwebgpu; native via Dawn)
+- **WebAssembly / JS / TS** — ES module package with a dedicated inference Worker and bundled eSpeak data
 - **Streaming API** for real-time audio generation
 - **Chunked synthesis** for long-form text processing
 - **WAV, PCM (float32/s16), and Ogg/Opus audio output**
@@ -128,6 +130,39 @@ brew install vulkan-sdk vulkan-headers spirv-headers
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DKOKOPOP_ENABLE_VULKAN=ON
 cmake --build build
 ```
+
+### WebGPU and WebAssembly (JavaScript / TypeScript)
+
+```sh
+# Activate Emscripten 4.0.15 first, then build the browser package.
+emcmake cmake -S . -B build-web -DCMAKE_BUILD_TYPE=Release -DKOKOPOP_ENABLE_WEBGPU=ON
+cmake --build build-web --target kokopop_web --parallel 4
+# CPU-only alternative, for browsers without WebAssembly JSPI:
+emcmake cmake -S . -B build-web-cpu -DCMAKE_BUILD_TYPE=Release -DKOKOPOP_ENABLE_WEBGPU=OFF
+cmake --build build-web-cpu --target kokopop_web --parallel 4
+```
+
+The generated `build-web/web/dist/` directory is an installable ES module package
+with TypeScript declarations. It includes the runtime, Worker, `.wasm`, and
+eSpeak language `.data`; GGUF models are loaded separately. See
+[the web guide](web/README.md) for direct browser and Vite integration, deployment,
+requirements, and the CPU-only alternative.
+
+```ts
+import { Kokopop } from '@kokopop/web';
+const tts = await Kokopop.create({
+  model: '/models/sanotts-en.gguf', backend: 'webgpu',
+  workerUrl: '/kokopop/worker.js', assetsUrl: '/kokopop/',
+});
+const { samples, sampleRate } = await tts.synthesize('Hello!', { voice: 'heart' });
+await tts.dispose();
+```
+
+For native WebGPU, install Dawn with its CMake package and configure
+`-DKOKOPOP_ENABLE_WEBGPU=ON -DCMAKE_PREFIX_PATH=/path/to/dawn/install`.
+The CLI accepts `--backend webgpu`; the C API uses `KOKOPOP_BACKEND_WEBGPU`.
+Explicit requests report failure if unavailable. AUTO retains the existing
+sanoTTS CPU preference. Unsupported GPU operations run on the CPU sub-backend.
 
 ### Build with OpenCL support
 
@@ -793,6 +828,8 @@ Kokopop supports the following languages:
 | `KOKOPOP_VULKAN_DEBUG` | `OFF` | Enable Vulkan debug output in ggml |
 | `KOKOPOP_VULKAN_MEMORY_DEBUG` | `OFF` | Enable Vulkan memory debug output in ggml |
 | `KOKOPOP_VULKAN_SHADER_DEBUG_INFO` | `OFF` | Build Vulkan shaders with debug info |
+| `KOKOPOP_ENABLE_WEBGPU` | `OFF` | Enable WebGPU (Dawn / Emdawnwebgpu) |
+| `KOKOPOP_BUILD_WEB` | Emscripten | Build JS/TS package; requires Emscripten |
 | `KOKOPOP_ENABLE_OPENCL` | `OFF` | Enable OpenCL GPU backend (Adreno / Android) |
 | `KOKOPOP_OPENCL_PROFILING` | `OFF` | Enable OpenCL profiling in ggml (adds CPU overhead) |
 | `KOKOPOP_OPENCL_TARGET_VERSION` | `300` | OpenCL version ggml targets (try `200` on older Adreno drivers) |

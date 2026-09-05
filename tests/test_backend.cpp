@@ -18,7 +18,8 @@ TEST_CASE("backend_options") {
               + (model->backend_type == KOKOPOP_BACKEND_METAL)
               + (model->backend_type == KOKOPOP_BACKEND_CUDA)
               + (model->backend_type == KOKOPOP_BACKEND_VULKAN)
-              + (model->backend_type == KOKOPOP_BACKEND_OPENCL);
+              + (model->backend_type == KOKOPOP_BACKEND_OPENCL)
+              + (model->backend_type == KOKOPOP_BACKEND_WEBGPU);
     CHECK_EQ(valid, 1);
 }
 
@@ -37,7 +38,7 @@ TEST_CASE("backend_auto_selects_available") {
     CHECK_NE(model->backend_type, KOKOPOP_BACKEND_AUTO);
     // backend_type should be a concrete backend enum value.
     CHECK_GE(model->backend_type, KOKOPOP_BACKEND_CPU);
-    CHECK_LE(model->backend_type, KOKOPOP_BACKEND_OPENCL);
+    CHECK_LE(model->backend_type, KOKOPOP_BACKEND_WEBGPU);
     // The actual backend is non-null.
     CHECK(model->backend != nullptr);
 }
@@ -199,6 +200,7 @@ TEST_CASE("backend_names_round_trip") {
         KOKOPOP_BACKEND_CUDA,
         KOKOPOP_BACKEND_VULKAN,
         KOKOPOP_BACKEND_OPENCL,
+        KOKOPOP_BACKEND_WEBGPU,
     };
 
     for (int32_t value : values) {
@@ -222,4 +224,27 @@ TEST_CASE("backend_names_reject_unknown") {
     const std::string list = kokopop::backend_name_list();
     CHECK(list.find("opencl") != std::string::npos);
     CHECK(list.find("vulkan") != std::string::npos);
+}
+
+TEST_CASE("backend_webgpu_request_is_explicit") {
+    const std::string & gguf = shared_mock_gguf();
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        std::string error;
+        std::unique_ptr<kokopop::Model> model;
+        kokopop_model_options opts{1, KOKOPOP_BACKEND_WEBGPU};
+        const bool ok = kokopop::load_model_from_gguf(gguf, &opts, model, error);
+#ifdef KOKOPOP_HAS_WEBGPU
+        if (ok) {
+            REQUIRE(model != nullptr);
+            CHECK_EQ(model->backend_type, KOKOPOP_BACKEND_WEBGPU);
+        } else {
+            CHECK(model == nullptr);
+            CHECK(!error.empty());
+        }
+#else
+        CHECK_FALSE(ok);
+        CHECK(model == nullptr);
+        CHECK(error.find("not compiled in") != std::string::npos);
+#endif
+    }
 }

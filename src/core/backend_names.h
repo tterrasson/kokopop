@@ -10,7 +10,7 @@
 
 namespace kokopop {
 
-// Parse a --backend value ("cpu", "metal", "cuda", "vulkan", "opencl").
+// Parse a --backend value ("cpu", "metal", "cuda", "vulkan", "opencl", "webgpu").
 // Returns false and leaves `out` untouched for an unknown name.
 bool backend_from_name(const char * name, int32_t & out);
 
@@ -20,7 +20,7 @@ const char * backend_name(int32_t backend);
 // Display name for a resolved backend ("CPU", "Metal", "CUDA", ...).
 const char * backend_display_name(int32_t backend);
 
-// Comma-separated list of accepted --backend values, for usage and errors.
+// Pipe-separated list of accepted --backend values, for usage and errors.
 const char * backend_name_list();
 
 } // namespace kokopop

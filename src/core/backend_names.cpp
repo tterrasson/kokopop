@@ -1,6 +1,7 @@
 #include "backend_names.h"
 
 #include <cstring>
+#include <string>
 
 namespace kokopop {
 namespace {
@@ -17,6 +18,7 @@ constexpr BackendName k_backend_names[] = {
     { "metal",  "Metal",  KOKOPOP_BACKEND_METAL  },
     { "cuda",   "CUDA",   KOKOPOP_BACKEND_CUDA   },
     { "vulkan", "Vulkan", KOKOPOP_BACKEND_VULKAN },
+    { "webgpu", "WebGPU", KOKOPOP_BACKEND_WEBGPU },
     { "opencl", "OpenCL", KOKOPOP_BACKEND_OPENCL },
 };
 
@@ -54,7 +56,17 @@ const char * backend_display_name(int32_t backend) {
 }
 
 const char * backend_name_list() {
-    return "cpu|metal|cuda|vulkan|opencl";
+    static const std::string list = [] {
+        std::string joined;
+        for (const BackendName & entry : k_backend_names) {
+            if (!joined.empty()) {
+                joined += '|';
+            }
+            joined += entry.name;
+        }
+        return joined;
+    }();
+    return list.c_str();
 }
 
 } // namespace kokopop
