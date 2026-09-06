@@ -1,0 +1,5 @@
+set(DATA_SOURCE "@KOKOPOP_ESPEAK_DATA_DIR@")
+set(DATA_DEST "@_data_dir@")
+set(DICT_SOURCE "@espeak_SOURCE_DIR@/dictsource")
+set(LANGUAGES "@KOKOPOP_WEB_LANGUAGES@")
+include("@CMAKE_CURRENT_SOURCE_DIR@/select-espeak-data.cmake")

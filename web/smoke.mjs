@@ -4,7 +4,7 @@ import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import assert from 'node:assert/strict';
 
-const [dist = 'build-web-cpu/web/dist', model = 'models/sanotts-en.gguf'] = process.argv.slice(2);
+const [dist = 'build-web-cpu/web/dist', model = 'models/sanotts-en.gguf', architecture = 'sanotts'] = process.argv.slice(2);
 const url = (name) => pathToFileURL(resolve(dist, name)).href;
 
 function encodeWav(samples, sampleRate) {
@@ -27,7 +27,7 @@ function encodeWav(samples, sampleRate) {
 
 async function testVoice(runtime, voice) {
   const start = performance.now();
-  const audio = await runtime.synthesize('Hello from the browser.', { voice: voice.name });
+  const audio = await runtime.synthesize(voice.name.startsWith('ff_') ? 'Bonjour, comment allez-vous ?' : 'Hello from the browser.', { voice: voice.name });
 
   assert.equal(audio.sampleRate, voice.sampleRate);
   assert.ok(audio.samples.length > 1000);
@@ -50,6 +50,8 @@ async function testVoice(runtime, voice) {
 }
 
 async function main() {
+  const packageInfo = JSON.parse(readFileSync(resolve(dist, 'package.json'), 'utf8'));
+  assert.equal(packageInfo.name, '@kokopop/web');
   const { default: createModule } = await import(url('kokopop-runtime.js'));
   const { Runtime } = await import(url('runtime.js'));
 
@@ -61,7 +63,7 @@ async function main() {
   const runtime = new Runtime(module);
 
   const info = await runtime.load(readFileSync(model), 1);
-  assert.equal(info.architecture, 'sanotts');
+  assert.equal(info.architecture, architecture);
   assert.equal(info.backend, 'cpu');
   assert.ok(info.voices.length > 0);
   console.log(JSON.stringify(info));
