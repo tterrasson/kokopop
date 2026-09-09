@@ -134,7 +134,8 @@ cmake --build build
 ### WebGPU and WebAssembly (JavaScript / TypeScript)
 
 ```sh
-# Activate Emscripten 4.0.15 first, then build the browser package.
+# Activate Emscripten first, then build the browser package.
+# source /path/to/emsdk_env.sh
 emcmake cmake -S . -B build-web -DCMAKE_BUILD_TYPE=Release -DKOKOPOP_ENABLE_WEBGPU=ON
 cmake --build build-web --target kokopop_web --parallel 4
 # CPU-only alternative, for browsers without WebAssembly JSPI:
