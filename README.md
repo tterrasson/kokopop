@@ -889,13 +889,6 @@ Run `kokopop_rt` to get a detailed per-chunk real-time factor breakdown:
 **Hardware:** MacBook Air M5, **Backend:** CPU, **Threads:** 8
 
 ```
-~/w/n/kokopop ❯❯❯ ./build/kokopop_rt \
-  --model models/sanotts-en.gguf \
-  --voice heart \
-  --backend cpu \
-  --threads 8 \
-  --seed 1234 2>/dev/null
-
   Backend:     CPU
   Voice:       heart
   Threads:     8
