@@ -4,6 +4,7 @@
 #include "synthesis/chunker/text_splitter.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -75,6 +76,45 @@ ChunkConfig merge_chunk_config(ChunkConfig base, ChunkConfig overrides) {
     if (overrides.max_silence_trim_ms != def.max_silence_trim_ms)
         base.max_silence_trim_ms = overrides.max_silence_trim_ms;
     return base;
+}
+
+ChunkConfig scale_chunk_budgets(ChunkConfig cfg, int ids_per_phoneme,
+                                int capacity_tokens) {
+    const int scale = std::max(1, ids_per_phoneme);
+    const ChunkConfig preset = cfg;  // the preset's own proportions
+
+    // Model capacity is an unscaled token-id ceiling.
+    int hard = cfg.hard_max_tokens;
+    if (capacity_tokens > 0) {
+        hard = std::min(hard, capacity_tokens);
+    }
+    cfg.hard_max_tokens = std::max(1, hard);
+
+    // Keep the soft boundary ceiling within capacity.
+    cfg.soft_max_tokens = std::min(preset.soft_max_tokens, cfg.hard_max_tokens);
+
+    // Scale the text target within the soft ceiling.
+    cfg.target_max_tokens =
+        std::min(preset.target_max_tokens * scale, cfg.soft_max_tokens);
+
+    // Preserve lower-budget proportions when the target is capped.
+    const int preset_target = std::max(1, preset.target_max_tokens);
+    auto sub_budget = [&](int preset_value) {
+        if (preset_value <= 0) return preset_value;  // 0 keeps its "unset" meaning
+        const long fitted = std::lround(static_cast<double>(preset_value) / preset_target
+                                        * cfg.target_max_tokens);
+        const long value = std::min<long>(static_cast<long>(preset_value) * scale, fitted);
+        return static_cast<int>(std::min<long>(value, cfg.target_max_tokens));
+    };
+    cfg.target_min_tokens = sub_budget(preset.target_min_tokens);
+    cfg.first_chunk_target_max_tokens = sub_budget(preset.first_chunk_target_max_tokens);
+
+    // Keep boundary-search overshoot within capacity.
+    cfg.target_overshoot_tokens =
+        std::min(preset.target_overshoot_tokens * scale,
+                 std::max(0, cfg.hard_max_tokens - cfg.target_max_tokens));
+
+    return cfg;
 }
 
 // ---------------------------------------------------------------------------

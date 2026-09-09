@@ -60,6 +60,12 @@ ChunkConfig make_long_form_config();
 /// defaults replace the base value, so a client can send a partial config.
 ChunkConfig merge_chunk_config(ChunkConfig base, ChunkConfig overrides);
 
+/// Scale text budgets for frontend framing (1 for Misaki, 2 for Piper).
+/// Clamp ceilings to positive capacity_tokens; scales below 1 use 1.
+/// Preserve relative minimum/first-chunk budgets when the target is capped.
+/// Zero budgets remain unset.
+ChunkConfig scale_chunk_budgets(ChunkConfig cfg, int ids_per_phoneme, int capacity_tokens);
+
 // ---------------------------------------------------------------------------
 // Unit: a text fragment with its phonemes (pre-chunking)
 // ---------------------------------------------------------------------------

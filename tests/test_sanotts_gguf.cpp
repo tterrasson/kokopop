@@ -247,6 +247,43 @@ TEST_CASE("sanotts_gguf_chunk_budget_follows_the_voice") {
     const kokopop::ChunkConfig amy =
         arch->adjust_chunk_config(preset, *arch->find_voice("amy"));
     CHECK(amy.hard_max_tokens > heart.hard_max_tokens);
+    CHECK(amy.soft_max_tokens <= amy.hard_max_tokens);
+    CHECK(amy.target_max_tokens <= amy.soft_max_tokens);
+    // The capacity truncates the long-form budget for both, but the lower
+    // budgets must not collapse onto it.
+    CHECK(amy.target_min_tokens < amy.target_max_tokens);
+    CHECK(heart.target_min_tokens < heart.target_max_tokens);
+}
+
+TEST_CASE("sanotts_chunk_budget_follows_the_voice_framing") {
+    const std::string path = kokopop::test::sanotts_model_path("mixed");
+    if (path.empty()) {
+        MESSAGE("skipped: " << kokopop::test::sanotts_model_hint("mixed"));
+        return;
+    }
+    std::unique_ptr<kokopop::Model> model;
+    std::string error;
+    REQUIRE_MESSAGE(load(path, model, error), error);
+
+    kokopop::SanoArch * arch = kokopop::sano_arch(*model);
+    REQUIRE(arch != nullptr);
+
+    const kokopop::VoiceDesc * heart_voice = arch->find_voice("heart");
+    const kokopop::VoiceDesc * amy_voice = arch->find_voice("amy");
+    REQUIRE(heart_voice != nullptr);
+    REQUIRE(amy_voice != nullptr);
+    REQUIRE_EQ(heart_voice->frontend, kokopop::FrontendKind::Misaki);
+    REQUIRE_EQ(amy_voice->frontend, kokopop::FrontendKind::Piper);
+
+    // Both voices can hold the adaptive target, including Piper padding.
+    const kokopop::ChunkConfig preset = kokopop::make_adaptative_config();
+    const kokopop::ChunkConfig heart = arch->adjust_chunk_config(preset, *heart_voice);
+    const kokopop::ChunkConfig amy = arch->adjust_chunk_config(preset, *amy_voice);
+
+    CHECK_EQ(heart.target_max_tokens, preset.target_max_tokens);
+    CHECK_EQ(amy.target_max_tokens, preset.target_max_tokens * 2);
+    CHECK_EQ(amy.target_min_tokens, preset.target_min_tokens * 2);
+    CHECK(amy.target_max_tokens + amy.target_overshoot_tokens <= amy.hard_max_tokens);
 }
 
 TEST_CASE("sanotts_gguf_rejects_an_unsupported_file_version") {

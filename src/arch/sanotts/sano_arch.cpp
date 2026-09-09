@@ -308,23 +308,19 @@ bool SanoArch::tokenize(const std::string & phonemes, const VoiceDesc & voice,
     return sano::tokenize_misaki(phonemes, resolved->tokens, ids, error);
 }
 
+namespace {
+
+// Piper adds a PAD after each tokenized symbol.
+int ids_per_phoneme(FrontendKind frontend) {
+    return frontend == FrontendKind::Piper ? 2 : 1;
+}
+
+} // namespace
+
 ChunkConfig SanoArch::adjust_chunk_config(ChunkConfig cfg,
                                           const VoiceDesc & voice) const {
-    // The duration model was trained at a fixed maximum token count, and its
-    // `length_hint` feature is a function of that ceiling: exceeding it does
-    // not degrade gracefully, it moves the model off its training manifold.
-    const int limit = voice.max_tokens;
-    if (limit <= 0) {
-        return cfg;
-    }
-
-    cfg.hard_max_tokens = std::min(cfg.hard_max_tokens, limit);
-    cfg.soft_max_tokens = std::min(cfg.soft_max_tokens, cfg.hard_max_tokens);
-    cfg.target_max_tokens = std::min(cfg.target_max_tokens, cfg.soft_max_tokens);
-    cfg.target_min_tokens = std::min(cfg.target_min_tokens, cfg.target_max_tokens);
-    cfg.first_chunk_target_max_tokens =
-        std::min(cfg.first_chunk_target_max_tokens, cfg.target_max_tokens);
-    return cfg;
+    // Account for frontend framing within the training token limit.
+    return scale_chunk_budgets(cfg, ids_per_phoneme(voice.frontend), voice.max_tokens);
 }
 
 // ---------------------------------------------------------------------------

@@ -1,8 +1,6 @@
 #include "test_helpers.h"
-#include "synthesis/chunker/chunker.h"
 #include "streaming/streaming.h"
-
-#include <algorithm>
+#include "synthesis/chunker/chunker.h"
 
 // Phonemize using Kokoro's voice-name convention, as the chunker did before
 // the text frontend moved behind ModelArch.
@@ -58,6 +56,83 @@ TEST_CASE("merge_chunk_config_multiple_overrides") {
     CHECK_EQ(merged.sentence_pause_ms, 50);
     // Unset fields keep base values
     CHECK_EQ(merged.hard_max_tokens, base.hard_max_tokens);
+}
+
+// ---- ChunkConfig budget scaling (frontend framing + voice capacity) ----
+
+TEST_CASE("scale_chunk_budgets_is_the_identity_for_misaki_within_capacity") {
+    const kokopop::ChunkConfig base = kokopop::make_adaptative_config();
+    const kokopop::ChunkConfig out = kokopop::scale_chunk_budgets(base, 1, 0);
+    CHECK_EQ(out.target_min_tokens,   base.target_min_tokens);
+    CHECK_EQ(out.target_max_tokens,   base.target_max_tokens);
+    CHECK_EQ(out.soft_max_tokens,     base.soft_max_tokens);
+    CHECK_EQ(out.hard_max_tokens,     base.hard_max_tokens);
+    CHECK_EQ(out.target_overshoot_tokens, base.target_overshoot_tokens);
+    CHECK_EQ(out.first_chunk_target_max_tokens, base.first_chunk_target_max_tokens);
+}
+
+TEST_CASE("scale_chunk_budgets_doubles_the_text_budgets_for_the_piper_framing") {
+    const kokopop::ChunkConfig base = kokopop::make_adaptative_config();
+    // Capacity well above the scaled preset: nothing has to be truncated.
+    const kokopop::ChunkConfig out = kokopop::scale_chunk_budgets(base, 2, 4096);
+
+    // Piper spends two ids per phoneme, so twice the ids buy the same text.
+    CHECK_EQ(out.target_max_tokens, base.target_max_tokens * 2);
+    CHECK_EQ(out.target_min_tokens, base.target_min_tokens * 2);
+    CHECK_EQ(out.target_overshoot_tokens, base.target_overshoot_tokens * 2);
+    // Ceilings are id counts, not text: they stay put.
+    CHECK_EQ(out.hard_max_tokens, base.hard_max_tokens);
+    CHECK_EQ(out.soft_max_tokens, base.soft_max_tokens);
+}
+
+TEST_CASE("scale_chunk_budgets_keeps_an_unset_first_chunk_budget_at_zero") {
+    kokopop::ChunkConfig base = kokopop::make_adaptative_config();
+    REQUIRE_EQ(base.first_chunk_target_max_tokens, 0);  // 0 = flush at first boundary
+    const kokopop::ChunkConfig out = kokopop::scale_chunk_budgets(base, 2, 4096);
+    CHECK_EQ(out.first_chunk_target_max_tokens, 0);
+}
+
+TEST_CASE("scale_chunk_budgets_never_exceeds_the_voice_capacity") {
+    const int capacity = 265;  // a real sanoTTS Piper voice ceiling
+    for (const kokopop::ChunkConfig base :
+         {kokopop::make_adaptative_config(), kokopop::make_long_form_config()}) {
+        for (int scale : {1, 2}) {
+            const kokopop::ChunkConfig out =
+                kokopop::scale_chunk_budgets(base, scale, capacity);
+            CHECK(out.hard_max_tokens <= capacity);
+            CHECK(out.soft_max_tokens <= out.hard_max_tokens);
+            CHECK(out.target_max_tokens <= out.soft_max_tokens);
+            CHECK(out.target_min_tokens <= out.target_max_tokens);
+            CHECK(out.first_chunk_target_max_tokens <= out.target_max_tokens);
+            // A chunk is allowed to reach target + overshoot.
+            CHECK(out.target_max_tokens + out.target_overshoot_tokens
+                  <= out.hard_max_tokens);
+        }
+    }
+}
+
+TEST_CASE("scale_chunk_budgets_keeps_proportions_when_the_capacity_truncates") {
+    // Capping the target must preserve room for tiny-chunk rebalancing.
+    const kokopop::ChunkConfig base = kokopop::make_long_form_config();
+    const kokopop::ChunkConfig out = kokopop::scale_chunk_budgets(base, 2, 265);
+
+    CHECK_EQ(out.target_max_tokens, 265);
+    CHECK(out.target_min_tokens < out.target_max_tokens);
+    CHECK(out.first_chunk_target_max_tokens < out.target_max_tokens);
+    // Same share of target_max as in the preset, within rounding.
+    const double preset_share =
+        static_cast<double>(base.target_min_tokens) / base.target_max_tokens;
+    const double out_share =
+        static_cast<double>(out.target_min_tokens) / out.target_max_tokens;
+    CHECK(std::abs(out_share - preset_share) < 0.01);
+}
+
+TEST_CASE("scale_chunk_budgets_treats_a_scale_below_one_as_one") {
+    const kokopop::ChunkConfig base = kokopop::make_adaptative_config();
+    CHECK_EQ(kokopop::scale_chunk_budgets(base, 0, 0).target_max_tokens,
+             kokopop::scale_chunk_budgets(base, 1, 0).target_max_tokens);
+    CHECK_EQ(kokopop::scale_chunk_budgets(base, -3, 0).target_max_tokens,
+             kokopop::scale_chunk_budgets(base, 1, 0).target_max_tokens);
 }
 
 // ---- prepare_synthesis respects chunk config override ----
