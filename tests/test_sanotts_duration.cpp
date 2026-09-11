@@ -68,7 +68,8 @@ TEST_CASE("sanotts_duration_matches_the_heart_golden_fixture_exactly") {
         const kokopop::SanoVoice * weights = loaded.arch->voice_for(*voice);
         REQUIRE(weights != nullptr);
         REQUIRE_MESSAGE(kokopop::sano_run_duration(*loaded.arch, *weights, as_ids(ids),
-                                                   voice->length_scale, got, error),
+                                                   voice->length_scale,
+                                                   kokopop::SanoStyle{}, got, error),
                         error);
 
         CHECK_EQ(got, expected);
@@ -105,9 +106,9 @@ TEST_CASE("sanotts_duration_scales_monotonically_with_speed") {
     std::vector<int32_t> normal;
     std::vector<int32_t> fast;
     std::string error;
-    REQUIRE(kokopop::sano_run_duration(*loaded.arch, *weights, as_ids(ids), 1.5f, slow, error));
-    REQUIRE(kokopop::sano_run_duration(*loaded.arch, *weights, as_ids(ids), 1.0f, normal, error));
-    REQUIRE(kokopop::sano_run_duration(*loaded.arch, *weights, as_ids(ids), 0.5f, fast, error));
+    REQUIRE(kokopop::sano_run_duration(*loaded.arch, *weights, as_ids(ids), 1.5f, kokopop::SanoStyle{}, slow, error));
+    REQUIRE(kokopop::sano_run_duration(*loaded.arch, *weights, as_ids(ids), 1.0f, kokopop::SanoStyle{}, normal, error));
+    REQUIRE(kokopop::sano_run_duration(*loaded.arch, *weights, as_ids(ids), 0.5f, kokopop::SanoStyle{}, fast, error));
 
     for (size_t i = 0; i < normal.size(); ++i) {
         CHECK(slow[i] >= normal[i]);
@@ -136,12 +137,12 @@ TEST_CASE("sanotts_duration_rejects_a_sequence_past_the_voice_ceiling") {
     std::vector<int32_t> durations;
     std::string error;
     CHECK_FALSE(kokopop::sano_run_duration(*loaded.arch, *weights, too_many, 1.0f,
-                                           durations, error));
+                                           kokopop::SanoStyle{}, durations, error));
     CHECK(error.find("exceeds") != std::string::npos);
 
     error.clear();
     CHECK_FALSE(kokopop::sano_run_duration(*loaded.arch, *weights, {}, 1.0f,
-                                           durations, error));
+                                           kokopop::SanoStyle{}, durations, error));
     CHECK(error.find("empty") != std::string::npos);
 }
 
@@ -189,7 +190,8 @@ TEST_CASE("sanotts_duration_matches_the_piperlite_reference") {
             std::vector<int32_t> got;
             std::string error;
             REQUIRE_MESSAGE(kokopop::sano_run_duration(*loaded.arch, *weights, as_ids(ids),
-                                                       voice->length_scale, got, error),
+                                                       voice->length_scale,
+                                                       kokopop::SanoStyle{}, got, error),
                             error);
             REQUIRE(got.size() == expected.size());
             tokens += static_cast<int>(got.size());

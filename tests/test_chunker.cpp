@@ -201,7 +201,7 @@ TEST_CASE("chunk_text_adds_terminal_sentence_boundary_for_complete_text") {
     auto chunks = kokopop::chunk_text(
         "Hello world",
         kokopop::make_long_form_config(), kokoro_phonemizer("af_heart"),
-        tokenize, error);
+        tokenize, {}, error);
 
     REQUIRE_EQ(chunks.size(), 1);
     CHECK_EQ(chunks.front().text, std::string("Hello world."));
@@ -221,7 +221,7 @@ TEST_CASE("adaptative_first_chunk_stops_at_short_natural_pause") {
     auto cfg = kokopop::make_adaptative_config();
     auto units = kokopop::prepare_chunk_units(
         "Bonjour, comment allez-vous ?", cfg,
-        kokoro_phonemizer("ff_siwis"), tokenize, error);
+        kokoro_phonemizer("ff_siwis"), tokenize, {}, error);
     REQUIRE(units.size() >= 2);
 
     size_t next = 0;
@@ -243,7 +243,7 @@ TEST_CASE("adaptative_first_chunk_keeps_long_clause_until_first_pause") {
     auto cfg = kokopop::make_adaptative_config();
     auto units = kokopop::prepare_chunk_units(
         "Bonjour Monsieur Jean qui aime les fraises, comment allez-vous ?",
-        cfg, kokoro_phonemizer("ff_siwis"), tokenize, error);
+        cfg, kokoro_phonemizer("ff_siwis"), tokenize, {}, error);
     REQUIRE(units.size() >= 2);
 
     size_t next = 0;

@@ -1,9 +1,10 @@
 #include "test_helpers.h"
 #include "http/http_server.h"
 
-#include <chrono>
-#include <thread>
 #include <atomic>
+#include <chrono>
+#include <future>
+#include <thread>
 
 #ifndef _WIN32
 #  include <sys/socket.h>
@@ -122,6 +123,39 @@ TEST_CASE("http_server_routes_and_lifecycle") {
     server.stop();
     server.join();
     CHECK(!server.is_running());
+}
+
+TEST_CASE("http_server_stops_while_idle") {
+    // The regression this guards: `stop()` used to close the listening socket
+    // to end the accept loop, and on Linux that does not wake a thread already
+    // blocked in `accept()`. With no traffic to unblock it, `join()` never
+    // returned and the whole test binary hung rather than failed — which is
+    // why this waits on a future instead of calling join() directly.
+    // Heap-allocated and shut down from a detached thread on purpose: if the
+    // bug comes back, nothing in this test case may block on that thread, or
+    // the whole binary hangs again instead of reporting the failure. The
+    // server is then deliberately leaked, threads and all.
+    auto * server = new kokopop::HttpServer();
+    REQUIRE(server->start("127.0.0.1", find_free_port()));
+    CHECK(server->is_running());
+
+    auto finished = std::make_shared<std::promise<void>>();
+    std::future<void> done = finished->get_future();
+    std::thread([server, finished] {
+        server->stop();
+        server->join();
+        finished->set_value();
+    }).detach();
+
+    const bool stopped =
+        done.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+    CHECK_MESSAGE(stopped, "HttpServer::join() did not return after stop() on an "
+                           "idle server: the accept loop is not interruptible");
+    if (!stopped) {
+        return;
+    }
+    CHECK(!server->is_running());
+    delete server;
 }
 
 TEST_CASE("http_server_invalid_port") {

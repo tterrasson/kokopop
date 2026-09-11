@@ -107,7 +107,7 @@ TEST_CASE("real_kokoro_text_frontend_adds_stable_end_for_short_unpunctuated_text
 
     auto chunks = kokopop::chunk_text(
         "Hello world",
-        kokopop::make_long_form_config(), phonemize_fn, tokenize_fn, error);
+        kokopop::make_long_form_config(), phonemize_fn, tokenize_fn, {}, error);
     REQUIRE_EQ(chunks.size(), 1);
     CHECK_EQ(chunks.front().boundary_after, kokopop::Boundary::Sentence);
     CHECK(chunks.front().phonemes.find('.') != std::string::npos);
@@ -443,7 +443,7 @@ TEST_CASE("chunk_tokens_are_the_canonical_sequence_long_form") {
     cfg.target_max_tokens = 40;
     cfg.soft_max_tokens   = 60;
     auto chunks = kokopop::chunk_text(text, cfg, frontend.phonemize,
-                                      frontend.tokenize, error);
+                                      frontend.tokenize, frontend.style_tag, error);
     REQUIRE(chunks.size() > 1);
 
     for (const auto & chunk : chunks) {
@@ -478,7 +478,8 @@ TEST_CASE("chunk_tokens_are_the_canonical_sequence_adaptative") {
 
     auto cfg = kokopop::make_adaptative_config();
     auto units = kokopop::prepare_chunk_units(text, cfg, frontend.phonemize,
-                                              frontend.tokenize, error);
+                                              frontend.tokenize,
+                                              frontend.style_tag, error);
     REQUIRE(units.size() > 1);
 
     size_t next = 0;
@@ -508,7 +509,7 @@ TEST_CASE("synthesize_chunk_matches_synthesize_phonemes_on_the_chunk_string") {
     auto cfg = kokopop::make_long_form_config();
     auto chunks = kokopop::chunk_text(
         "Hello world, this is a chunk. And here is a second one.",
-        cfg, frontend.phonemize, frontend.tokenize, error);
+        cfg, frontend.phonemize, frontend.tokenize, frontend.style_tag, error);
     REQUIRE(!chunks.empty());
     const auto & chunk = chunks.front();
 

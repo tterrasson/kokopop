@@ -26,6 +26,7 @@
 #include "test_sanotts_tokenizer.cpp"
 #include "test_sanotts_gguf.cpp"
 #include "test_sanotts_duration.cpp"
+#include "test_sanotts_emotion.cpp"
 #include "test_sanotts_decoder.cpp"
 #include "test_sanotts_backends.cpp"
 #include "test_sanotts_http.cpp"
