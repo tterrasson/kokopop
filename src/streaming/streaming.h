@@ -81,15 +81,20 @@ struct SynthesisPlan {
     ChunkConfig config;
     KokoroDiffusionOptions diffusion;
 
+    /// sanoTTS's emotion style for chunks that carry none of their own, i.e.
+    /// every chunk of a text without `[style]` tags. Empty means the voice's
+    /// own declared default.
+    std::string style;
+
     /// sanoTTS's deterministic noise seed. Absent means "derive one from the
     /// voice", which is what makes two runs of the same text sound identical
     /// without the caller having to pick a number.
     bool     has_noise_seed = false;
     uint64_t noise_seed     = 0;
 
-    /// Architecture-specific inputs for the chunk at `seq_index` in the
+    /// Architecture-specific inputs for `chunk`, at `seq_index` in the
     /// utterance. `kokoro_style_len` is filled in by `synthesize_chunk()`.
-    SynthesisExtras chunk_extras(uint32_t seq_index) const;
+    SynthesisExtras chunk_extras(uint32_t seq_index, const Chunk & chunk) const;
 
     /// Estimate total output samples (rough: 0.035s per token / speed)
     size_t estimated_total_samples(int sample_rate) const;
@@ -148,6 +153,9 @@ std::vector<float> infer_chunk(
 /// `has_noise_seed` / `noise_seed` pin sanoTTS's deterministic noise for the
 /// whole utterance; leave them at their defaults to let the decoder derive a
 /// seed from the voice. Kokoro voices ignore them.
+///
+/// `style` is sanoTTS's emotion style for text carrying no `[style]` tag of
+/// its own; empty is the voice's declared default.
 StreamHandle stream_synthesize(
     kokopop::Model & model,
     const std::string & text,
@@ -157,7 +165,8 @@ StreamHandle stream_synthesize(
     AudioCallback callback,
     void * user_data,
     bool has_noise_seed = false,
-    uint64_t noise_seed = 0);
+    uint64_t noise_seed = 0,
+    const std::string & style = std::string());
 
 // ---------------------------------------------------------------------------
 // Incremental streaming — text arrives in fragments
@@ -173,7 +182,8 @@ public:
         AudioCallback callback,
         void * user_data,
         bool has_noise_seed = false,
-        uint64_t noise_seed = 0);
+        uint64_t noise_seed = 0,
+        const std::string & style = std::string());
 
     ~IncrementalStreamer();
 
@@ -196,6 +206,7 @@ private:
     StreamMode mode_;
     AudioCallback callback_;
     void * user_data_;
+    std::string style_;
     bool has_noise_seed_ = false;
     uint64_t noise_seed_ = 0;
     std::string buffer_;

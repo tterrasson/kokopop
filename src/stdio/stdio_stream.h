@@ -48,7 +48,8 @@ public:
         StreamMode mode,
         const std::string & out_path,
         bool has_noise_seed = false,
-        uint64_t noise_seed = 0);
+        uint64_t noise_seed = 0,
+        const std::string & style = std::string());
 
     ~StdioStreamer();
 
@@ -71,6 +72,8 @@ private:
     std::string _out_path;
     bool _has_noise_seed;
     uint64_t _noise_seed;
+    /// sanoTTS emotion style for lines carrying no `[style]` tag.
+    std::string _style;
 
     WavAccumulator _wav_accum;
     int _sample_rate;

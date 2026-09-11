@@ -13,6 +13,7 @@
 
 #include <array>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 struct ggml_tensor;
@@ -51,6 +52,48 @@ struct SanoDurationWeights {
     std::vector<SanoResBlock> blocks;
     ggml_tensor * output_w = nullptr;
     ggml_tensor * output_b = nullptr;
+};
+
+/// The utterance style space and the duration model's style residual.
+///
+/// One capability, `sanofr.utterance-emotion.v1`, in its `concat` shape: the
+/// style vector is a constant per utterance, concatenated to the acoustic
+/// model's two input projections — which is why nothing here touches the
+/// acoustic weights, they are simply `dim` channels wider — and the duration
+/// model keeps a separate residual branch on top of its frozen neutral self.
+///
+/// `dim == 0` means the voice carries no emotion pack. A style vector of all
+/// zeros is the neutral one and bypasses the duration residual exactly: the
+/// branch is zero-init in the style vector and every term is multiplied by it.
+struct SanoEmotionWeights {
+    uint32_t dim = 0;
+    uint32_t hidden = 0;
+
+    /// Bound on the log-duration ratio the residual may apply, in either
+    /// direction: the branch closes on `tanh(...) * max_log_ratio`.
+    float max_log_ratio = 0.0f;
+
+    /// `[dur.hidden + dim, hidden]`: the frozen model's token embedding, with
+    /// the utterance's style vector concatenated to every token. Both
+    /// projections are pointwise, so a token's residual reads that token only.
+    ggml_tensor * input_proj_w = nullptr;
+    ggml_tensor * input_proj_b = nullptr;
+
+    /// `[hidden, 1]`: one log-duration ratio per token.
+    ggml_tensor * output_w = nullptr;
+    ggml_tensor * output_b = nullptr;
+
+    /// Style names and their vectors, `dim` values each, style-major.
+    std::vector<std::string> styles;
+    std::vector<float>       vectors;
+
+    /// Extra spellings a caller may use, parallel arrays into `styles`.
+    std::vector<std::string> alias_names;
+    std::vector<std::string> alias_styles;
+
+    std::string default_style;
+
+    bool enabled() const { return dim > 0; }
 };
 
 struct SanoAcousticWeights {

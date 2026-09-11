@@ -95,4 +95,20 @@ inline bool gguf_get_u32_array(gguf_context * ctx, const char * key,
     return true;
 }
 
+inline bool gguf_get_f32_array(gguf_context * ctx, const char * key,
+                               std::vector<float> & out) {
+    const int idx = gguf_find_key(ctx, key);
+    if (idx < 0 || gguf_get_kv_type(ctx, idx) != GGUF_TYPE_ARRAY) {
+        return false;
+    }
+    if (gguf_get_arr_type(ctx, idx) != GGUF_TYPE_FLOAT32) {
+        return false;
+    }
+    const int64_t n = gguf_get_arr_n(ctx, idx);
+    const float * data = static_cast<const float *>(gguf_get_arr_data(ctx, idx));
+    out.clear();
+    if (n != 0) out.assign(data, data + n);
+    return true;
+}
+
 } // namespace kokopop

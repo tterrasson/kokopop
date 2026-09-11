@@ -121,6 +121,7 @@ def test_writer_round_trips_every_kv_type(tmp_path: Path) -> None:
     writer.add_string("a.str", "héllo")
     writer.add_string_array("a.strs", ["x", "ɑ", ""])
     writer.add_u32_array("a.u32s", [0, 1, 4294967295])
+    writer.add_f32_array("a.f32s", [0.0, -1.25, 2.5])
     writer.add_tensor("t.f32", np.arange(6, dtype=np.float32).reshape(2, 3), conv.GGML_TYPE_F32)
     writer.add_tensor("t.f16", np.ones((4,), dtype=np.float32), conv.GGML_TYPE_F16)
     writer.write()
@@ -133,6 +134,7 @@ def test_writer_round_trips_every_kv_type(tmp_path: Path) -> None:
     assert kv["a.str"] == "héllo"
     assert kv["a.strs"] == ["x", "ɑ", ""]
     assert kv["a.u32s"] == [0, 1, 4294967295]
+    assert kv["a.f32s"] == pytest.approx([0.0, -1.25, 2.5])
 
     by_logical = logical_tensors(kv, tensors)
     # GGUF stores dimensions innermost-first, so a numpy [2, 3] becomes (3, 2).
@@ -669,7 +671,7 @@ def test_piperlite_refuses_an_unknown_manifest_format(tmp_path: Path) -> None:
         pytest.skip(SKIP_HINT)
     source = _artifacts() / conv.PIPERLITE_PACKAGES["amy"]
     manifest = json.loads((source / "manifest.json").read_text(encoding="utf-8"))
-    manifest["format"] = "roota.raw-fp16.v2"
+    manifest["format"] = "roota.raw-fp16.v3"
     (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     (tmp_path / "weights.fp16.bin").write_bytes((source / "weights.fp16.bin").read_bytes())
     (tmp_path / "piper-phoneme-config.json").write_bytes(
@@ -677,6 +679,203 @@ def test_piperlite_refuses_an_unknown_manifest_format(tmp_path: Path) -> None:
     )
     with pytest.raises(conv.ConversionError, match="unsupported manifest format"):
         conv.load_voice_pack("amy", tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# The emotion capability
+# ---------------------------------------------------------------------------
+
+
+def style_space(**overrides) -> dict:
+    space = {
+        "format": "sanofr.style-space.v1",
+        "dim": 2,
+        "default": "neutral",
+        "vectors": {"neutral": [0.0, 0.0], "sad": [0.0, 1.0], "laughing": [1.0, 0.0]},
+    }
+    space.update(overrides)
+    return space
+
+
+def emotion_manifest(**overrides) -> dict:
+    emotion = {
+        "capability": "sanofr.utterance-emotion.v1",
+        "style_space": style_space(),
+        "acoustic_architecture": "emotion_token_context_v1",
+        "duration_architecture": "emotion_duration_residual_v1",
+        "max_log_ratio": 0.6931471805599453,
+        "neutral_duration_bypass": True,
+        "neutral_acoustic_bypass": False,
+        "rounding": "nearest-even-clamp-1-max_duration",
+        "max_duration": 80,
+    }
+    emotion.update(overrides)
+    return {"inference": {"emotion": emotion}}
+
+
+def test_emotion_contract_reads_the_style_space() -> None:
+    contract = conv.emotion_contract("v", emotion_manifest())
+    assert contract["dim"] == 2
+    assert contract["styles"] == ["neutral", "sad", "laughing"]
+    assert contract["vectors"] == [0.0, 0.0, 0.0, 1.0, 1.0, 0.0]
+    assert contract["default"] == "neutral"
+
+
+def test_a_pack_without_an_emotion_block_is_a_neutral_pack() -> None:
+    assert conv.emotion_contract("v", {"inference": {}}) is None
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        ({"capability": "sanofr.utterance-emotion.v2"}, "capability"),
+        # The paired route is a different pair of students; reconstructing it
+        # from whichever tensors are in the blob is exactly what must not happen.
+        ({"acoustic_architecture": "emotion_paired_residual_v1"}, "acoustic architecture"),
+        ({"duration_architecture": "emotion_duration_context_v1"}, "duration architecture"),
+        ({"rounding": "floor"}, "rounding"),
+        ({"neutral_duration_bypass": False}, "neutral duration bypass"),
+        ({"max_log_ratio": 0.0}, "max_log_ratio"),
+        # A declared post-decoder effect this runtime cannot apply. Optional is
+        # a warning; required is a voice missing an axis, so it is refused.
+        (
+            {"prosody": {"capability": "sanofr.post-decoder-prosody.v1", "required": True}},
+            "post-decoder prosody",
+        ),
+    ],
+)
+def test_emotion_contract_refuses_what_the_runtime_does_not_implement(
+    overrides, message
+) -> None:
+    with pytest.raises(conv.ConversionError, match=message):
+        conv.emotion_contract("v", emotion_manifest(**overrides))
+
+
+def test_an_optional_prosody_effect_is_ignored_rather_than_refused() -> None:
+    contract = conv.emotion_contract(
+        "v",
+        emotion_manifest(
+            prosody={"capability": "sanofr.post-decoder-prosody.v1", "required": False}
+        ),
+    )
+    assert contract["dim"] == 2
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        ({"format": "sanofr.style-space.v2"}, "style space format"),
+        ({"dim": 0}, "positive integer"),
+        ({"vectors": {"sad": [0.0, 1.0]}}, "no 'neutral' vector"),
+        ({"vectors": {"neutral": [0.0, 0.0], "sad": [1.0]}}, "width 2"),
+        ({"vectors": {"neutral": [0.0, 0.0], "sad": [0.0, float("nan")]}}, "nonfinite"),
+        # The runtime bypasses the duration branch on the neutral vector, and
+        # every caller reads "neutral" as "the voice the baseline trained".
+        ({"vectors": {"neutral": [0.1, 0.0]}}, "not exactly zero"),
+        ({"default": "wistful"}, "default style"),
+    ],
+)
+def test_style_space_validation(overrides, message) -> None:
+    with pytest.raises(conv.ConversionError, match=message):
+        conv.validate_style_space("v", style_space(**overrides))
+
+
+def emotion_tensors(dim: int = 2, hidden: int = 4,
+                    dur_hidden: int = 8) -> dict[str, np.ndarray]:
+    def full(*shape):
+        return np.full(shape, 0.25, dtype=np.float32)
+
+    return {
+        "input_proj.weight": full(hidden, dur_hidden + dim, 1),
+        "input_proj.bias": full(hidden),
+        "output.weight": full(1, hidden, 1),
+        "output.bias": full(1),
+    }
+
+
+def emotion_build(style_aliases=None, dur_cfg_overrides=None, tensors=None):
+    build = conv.VoiceBuild(
+        name="fr", aliases=[], sample_rate=22050, length_scale=1.0,
+        espeak_voice="roa/fr", normalization_lang="a", frontend="piper",
+        decoder="piperlite", max_tokens=510, token_symbols=[], token_ids=[],
+        bos_id=0, eos_id=1, pad_id=2, fallback_id=3,
+    )
+    dur_cfg = {"hidden": 4, "max_log_ratio": 0.6931471805599453}
+    dur_cfg.update(dur_cfg_overrides or {})
+    conv._add_emotion(
+        build, "fr", conv.emotion_contract("fr", emotion_manifest()), dur_cfg,
+        emotion_tensors() if tensors is None else tensors, 8, style_aliases,
+    )
+    return build
+
+
+def test_emotion_emits_the_residual_branch_and_the_style_space() -> None:
+    build = emotion_build()
+    names = {t.suffix for t in build.tensors}
+    assert names == {
+        "emo.dur.input_proj.weight", "emo.dur.input_proj.bias",
+        "emo.dur.output.weight", "emo.dur.output.bias",
+    }
+    # Every tensor of the branch is F32: it ends in the same exp/round step
+    # function the neutral duration model does.
+    assert all(t.f32 for t in build.tensors)
+
+    by_name = {t.suffix: t for t in build.tensors}
+    # [OC, IC, K] flattened to [OC, IC*K], kokopop's kernel layout. The input
+    # is the frozen embedding widened by the style vector.
+    assert by_name["emo.dur.input_proj.weight"].data.shape == (4, 10)
+    assert by_name["emo.dur.output.weight"].data.shape == (1, 4)
+
+    assert build.scalar_meta["emotion.dim"] == 2
+    assert build.scalar_meta["emotion.dur.hidden"] == 4
+    assert build.float_meta["emotion.dur.max_log_ratio"] == 0.6931471805599453
+    assert build.string_array_meta["emotion.styles"] == ["neutral", "sad", "laughing"]
+    assert build.float_array_meta["emotion.style_vectors"] == [0.0, 0.0, 0.0, 1.0, 1.0, 0.0]
+    assert build.string_meta["emotion.default_style"] == "neutral"
+
+
+def test_emotion_emits_only_the_aliases_this_pack_can_honour() -> None:
+    build = emotion_build()
+    aliases = dict(
+        zip(build.string_array_meta["emotion.alias_names"],
+            build.string_array_meta["emotion.alias_styles"])
+    )
+    # `laughing` is in this space, so its tags are; `joyful` is not, so
+    # `[excited]` resolves to nothing rather than to a style it has no vector for.
+    assert aliases == {"chuckles": "laughing", "laugh": "laughing", "laughs": "laughing"}
+
+
+def test_emotion_style_aliases_must_name_a_style_of_the_pack() -> None:
+    build = emotion_build(style_aliases={"giggles": "laughing"})
+    assert "giggles" in build.string_array_meta["emotion.alias_names"]
+    with pytest.raises(conv.ConversionError, match="names no style"):
+        emotion_build(style_aliases={"giggles": "joyful"})
+    with pytest.raises(conv.ConversionError, match="already a style name"):
+        emotion_build(style_aliases={"sad": "laughing"})
+
+
+def test_emotion_refuses_a_branch_that_does_not_fit_its_declared_shape() -> None:
+    tensors = emotion_tensors()
+    # A branch trained against a wider style space than the pack declares.
+    tensors["input_proj.weight"] = np.zeros((4, 11, 1), dtype=np.float32)
+    with pytest.raises(conv.ConversionError, match="expected"):
+        emotion_build(tensors=tensors)
+
+    missing = emotion_tensors()
+    del missing["output.bias"]
+    with pytest.raises(conv.ConversionError, match="missing emotion tensor"):
+        emotion_build(tensors=missing)
+
+
+def test_emotion_refuses_a_bound_the_checkpoint_and_the_manifest_disagree_on() -> None:
+    with pytest.raises(conv.ConversionError, match="bounds the residual"):
+        emotion_build(dur_cfg_overrides={"max_log_ratio": 1.0})
+
+
+def test_style_alias_parsing() -> None:
+    assert conv.parse_style_alias(" Giggles = laughing ") == ("giggles", "laughing")
+    with pytest.raises(conv.ConversionError, match="alias=style"):
+        conv.parse_style_alias("giggles")
 
 
 # ---------------------------------------------------------------------------

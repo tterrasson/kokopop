@@ -45,6 +45,7 @@ import argparse
 import hashlib
 import json
 import logging
+import math
 import re
 import struct
 import sys
@@ -177,6 +178,13 @@ class GgufWriter:
     def add_string_array(self, key: str, values: Iterable[str]) -> None:
         self.kv.append((key, GGUF_TYPE_ARRAY, (GGUF_TYPE_STRING, list(values))))
 
+    def add_f32_array(self, key: str, values: Iterable[float]) -> None:
+        items = [float(v) for v in values]
+        for v in items:
+            if not math.isfinite(v):
+                raise ConversionError(f"{key}: {v} is not finite")
+        self.kv.append((key, GGUF_TYPE_ARRAY, (GGUF_TYPE_FLOAT32, items)))
+
     def add_u32_array(self, key: str, values: Iterable[int]) -> None:
         items = [int(v) for v in values]
         for v in items:
@@ -254,6 +262,8 @@ class GgufWriter:
                         out += self._string(item)
                     elif item_type == GGUF_TYPE_UINT32:
                         out += struct.pack("<I", item)
+                    elif item_type == GGUF_TYPE_FLOAT32:
+                        out += struct.pack("<f", item)
                     else:
                         raise ConversionError(f"unsupported array item type {item_type}")
             else:
@@ -471,6 +481,10 @@ ESPEAK_NAME_MAP = {
     "ne": "inc/ne",
     "zh": "sit/cmn",
     "cmn": "sit/cmn",
+    # Piper's French voices declare either the bare language or the full tag;
+    # espeak-ng ships one French (France) voice for both, at lang/roa/fr.
+    "fr": "roa/fr",
+    "fr-fr": "roa/fr",
 }
 
 
@@ -500,6 +514,153 @@ CONV1D_3D_SUFFIXES = (
     "in_conv.weight",
     "out_conv.weight",
 )
+
+
+# `v2` is `v1` plus `inference.emotion`: the same three components, with the
+# style vector concatenated to the acoustic model's two input projections and a
+# residual branch on the duration model. Everything else about the layout —
+# one flat blob, one manifest naming every tensor — is unchanged, so a v2 pack
+# without the emotion block would convert as a v1 pack.
+PACK_FORMATS = ("roota.raw-fp16.v1", "roota.raw-fp16.v2")
+
+EMOTION_CAPABILITY = "sanofr.utterance-emotion.v1"
+EMOTION_ACOUSTIC_ARCH = "emotion_token_context_v1"
+EMOTION_DURATION_ARCH = "emotion_duration_residual_v1"
+
+# Tags a writer is likely to reach for, mapped onto the style names the pack
+# actually carries. They are ElevenLabs audio tags because that is what
+# directed the donor corpus these packs are trained from (`[chuckles]` over
+# `[laughs]`: it colours a reading instead of interrupting it), and a writer
+# who used them to *produce* the corpus will use them to drive the voice.
+# Only aliases whose target the pack declares are emitted, and a name the pack
+# already uses is never shadowed.
+DEFAULT_STYLE_ALIASES = {
+    "chuckles": "laughing",
+    "laughs": "laughing",
+    "laugh": "laughing",
+    "excited": "joyful",
+    "happy": "joyful",
+}
+
+
+def parse_style_alias(value: str) -> tuple[str, str]:
+    alias, separator, style = value.partition("=")
+    if not separator or not alias.strip() or not style.strip():
+        raise ConversionError(f"--style-alias expects 'alias=style', got {value!r}")
+    return alias.strip().lower(), style.strip()
+
+
+def validate_style_space(voice: str, space: Any) -> tuple[int, list[str], list[float], str]:
+    """`sanofr.style-space.v1`: a dimension, named vectors, a zero neutral.
+
+    Returned flat, style-major, which is how the GGUF carries it and how the
+    runtime indexes it.
+    """
+    if not isinstance(space, dict) or space.get("format") != "sanofr.style-space.v1":
+        raise ConversionError(
+            f"{voice}: unsupported style space format {space.get('format')!r} "
+            "(expected 'sanofr.style-space.v1')"
+            if isinstance(space, dict)
+            else f"{voice}: the emotion block carries no style space"
+        )
+    dim = space.get("dim")
+    if not isinstance(dim, int) or isinstance(dim, bool) or dim < 1:
+        raise ConversionError(f"{voice}: style dimension {dim!r} is not a positive integer")
+    vectors = space.get("vectors")
+    if not isinstance(vectors, dict) or "neutral" not in vectors:
+        raise ConversionError(f"{voice}: the style space has no 'neutral' vector")
+    names, flat = [], []
+    for style, vector in vectors.items():
+        if not isinstance(style, str) or not style.strip():
+            raise ConversionError(f"{voice}: a style name is empty")
+        if not isinstance(vector, list) or len(vector) != dim:
+            raise ConversionError(f"{voice}: style {style!r} is not a vector of width {dim}")
+        for value in vector:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ConversionError(f"{voice}: style {style!r} has a nonnumeric component")
+            if not math.isfinite(float(value)):
+                raise ConversionError(f"{voice}: style {style!r} has a nonfinite component")
+        names.append(style)
+        flat.extend(float(value) for value in vector)
+    # The runtime relies on this to bypass the whole emotion path: a request
+    # for the neutral style must be the voice this pack's baseline trained.
+    if any(flat[names.index("neutral") * dim : (names.index("neutral") + 1) * dim]):
+        raise ConversionError(f"{voice}: the 'neutral' style vector is not exactly zero")
+    default = space.get("default", "neutral")
+    if default not in vectors:
+        raise ConversionError(f"{voice}: default style {default!r} is not in the style space")
+    return dim, names, flat, str(default)
+
+
+def emotion_contract(voice: str, manifest: dict[str, Any]) -> dict[str, Any] | None:
+    """Validate `inference.emotion`, or return None for a neutral-only pack."""
+    emotion = manifest.get("inference", {}).get("emotion")
+    if emotion is None:
+        return None
+    if not isinstance(emotion, dict):
+        raise ConversionError(f"{voice}: inference.emotion is not an object")
+    if emotion.get("capability") != EMOTION_CAPABILITY:
+        raise ConversionError(
+            f"{voice}: emotion capability {emotion.get('capability')!r} is not supported "
+            f"(only {EMOTION_CAPABILITY!r})"
+        )
+    # `paired_residual` carries a different pair of students — a bounded latent
+    # residual with a channel gain and a donor-axis projection — and none of it
+    # is implemented here. Refusing it by name beats reconstructing a graph out
+    # of whichever tensors happen to be in the blob.
+    if emotion.get("acoustic_architecture") != EMOTION_ACOUSTIC_ARCH:
+        raise ConversionError(
+            f"{voice}: emotion acoustic architecture "
+            f"{emotion.get('acoustic_architecture')!r} is not supported "
+            f"(only {EMOTION_ACOUSTIC_ARCH!r})"
+        )
+    # Same for the duration side: `emotion_duration_context_v1` is a different
+    # student — a global tempo, dilated blocks over the neutral prediction, a
+    # calibrated per-axis gain and a duration-weighted centering — and its
+    # tensors would load into this graph without meaning the same thing.
+    if emotion.get("duration_architecture") != EMOTION_DURATION_ARCH:
+        raise ConversionError(
+            f"{voice}: emotion duration architecture "
+            f"{emotion.get('duration_architecture')!r} is not supported "
+            f"(only {EMOTION_DURATION_ARCH!r})"
+        )
+    if emotion.get("rounding") != "nearest-even-clamp-1-max_duration":
+        raise ConversionError(
+            f"{voice}: emotion duration rounding {emotion.get('rounding')!r} is not the "
+            "rule this runtime implements (nearest-even-clamp-1-max_duration)"
+        )
+    if emotion.get("neutral_duration_bypass") is not True:
+        raise ConversionError(
+            f"{voice}: the pack does not declare an exact neutral duration bypass"
+        )
+    prosody = emotion.get("prosody")
+    if isinstance(prosody, dict):
+        # A declared post-decoder pitch/level shift. kokopop does not apply it,
+        # so a pack that *requires* it would render a voice missing an axis.
+        if prosody.get("required"):
+            raise ConversionError(
+                f"{voice}: the pack requires the post-decoder prosody effect "
+                f"({prosody.get('capability')!r}), which kokopop does not apply"
+            )
+        logger.warning(
+            "%s: ignoring the optional post-decoder prosody effect (%s); the styles "
+            "will render without their declared pitch and level shift",
+            voice, prosody.get("capability"),
+        )
+    max_log_ratio = float(emotion.get("max_log_ratio") or 0.0)
+    if not math.isfinite(max_log_ratio) or max_log_ratio <= 0.0:
+        raise ConversionError(
+            f"{voice}: emotion max_log_ratio {emotion.get('max_log_ratio')!r} "
+            "must be finite and positive"
+        )
+    dim, names, vectors, default = validate_style_space(voice, emotion.get("style_space"))
+    return {
+        "dim": dim,
+        "styles": names,
+        "vectors": vectors,
+        "default": default,
+        "max_log_ratio": max_log_ratio,
+    }
 
 
 @dataclass
@@ -560,9 +721,10 @@ def load_voice_pack(name: str, directory: Path) -> VoicePack:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
     fmt = manifest.get("format")
-    if fmt != "roota.raw-fp16.v1":
+    if fmt not in PACK_FORMATS:
         raise ConversionError(
-            f"{directory}: unsupported manifest format {fmt!r}, expected 'roota.raw-fp16.v1'"
+            f"{directory}: unsupported manifest format {fmt!r}, expected one of "
+            + ", ".join(repr(f) for f in PACK_FORMATS)
         )
 
     weights_path = directory / manifest["weights_file"]
@@ -703,6 +865,9 @@ class VoiceBuild:
     scalar_meta: dict[str, int] = field(default_factory=dict)
     float_meta: dict[str, float] = field(default_factory=dict)
     array_meta: dict[str, list[int]] = field(default_factory=dict)
+    string_meta: dict[str, str] = field(default_factory=dict)
+    string_array_meta: dict[str, list[str]] = field(default_factory=dict)
+    float_array_meta: dict[str, list[float]] = field(default_factory=dict)
     tensors: list[VoiceTensor] = field(default_factory=list)
     sources: dict[str, str] = field(default_factory=dict)
 
@@ -726,23 +891,39 @@ def flatten_conv1d(name: str, array: np.ndarray) -> np.ndarray:
 
 
 def build_piperlite_voice(
-    name: str, pack: VoicePack, aliases: Sequence[str]
+    name: str,
+    pack: VoicePack,
+    aliases: Sequence[str],
+    style_aliases: dict[str, str] | None = None,
 ) -> VoiceBuild:
     manifest = pack.manifest
     dur_cfg = pack.component("duration")["config"]
     ac_cfg = pack.component("acoustic")["config"]
     dec_cfg = pack.component("decoder")["config"]
+    emotion = emotion_contract(name, manifest)
+
+    # An emotion pack wraps the neutral duration model it was trained around:
+    # the shapes come from its `base_config` and its tensors are under `base.`,
+    # while the acoustic model is the same module widened by the style vector.
+    dur_base_cfg = dur_cfg["base_config"] if emotion else dur_cfg
+    dur_prefix = "base." if emotion else ""
+    style_dim = emotion["dim"] if emotion else 0
 
     # -- refuse what the runtime does not implement -------------------------
-    if str(dur_cfg.get("architecture")) != "duration_conv":
+    if emotion and str(dur_cfg.get("architecture")) != EMOTION_DURATION_ARCH:
         raise ConversionError(
-            f"{name}: duration architecture {dur_cfg.get('architecture')!r} is not supported "
-            "(only 'duration_conv')"
+            f"{name}: duration checkpoint declares {dur_cfg.get('architecture')!r} while "
+            f"the manifest declares {EMOTION_DURATION_ARCH!r}"
         )
-    if str(ac_cfg.get("architecture")) != "token_context":
+    if str(dur_base_cfg.get("architecture")) != "duration_conv":
+        raise ConversionError(
+            f"{name}: duration architecture {dur_base_cfg.get('architecture')!r} is not "
+            "supported (only 'duration_conv')"
+        )
+    if str(ac_cfg.get("architecture")) != (EMOTION_ACOUSTIC_ARCH if emotion else "token_context"):
         raise ConversionError(
             f"{name}: acoustic architecture {ac_cfg.get('architecture')!r} is not supported "
-            "(only 'token_context')"
+            f"(only {EMOTION_ACOUSTIC_ARCH if emotion else 'token_context'!r})"
         )
     if str(dec_cfg.get("variant")) != "piperlite":
         raise ConversionError(
@@ -783,10 +964,10 @@ def build_piperlite_voice(
 
     table = parse_piper_phoneme_config(name, pack.phoneme_config)
 
-    dur_vocab = int(dur_cfg["vocab_size"])
-    dur_hidden = int(dur_cfg["hidden"])
-    dur_depth = int(dur_cfg["depth"])
-    dur_kernel = int(dur_cfg.get("kernel_size") or 5)
+    dur_vocab = int(dur_base_cfg["vocab_size"])
+    dur_hidden = int(dur_base_cfg["hidden"])
+    dur_depth = int(dur_base_cfg["depth"])
+    dur_kernel = int(dur_base_cfg.get("kernel_size") or 5)
     ac_vocab = int(ac_cfg["vocab_size"])
     ac_hidden = int(ac_cfg["hidden"])
     ac_depth = int(ac_cfg["depth"])
@@ -808,7 +989,7 @@ def build_piperlite_voice(
         normalization_lang="a",
         frontend="piper",
         decoder="piperlite",
-        max_tokens=int(dur_cfg["max_tokens"]),
+        max_tokens=int(dur_base_cfg["max_tokens"]),
         token_symbols=table.symbols,
         token_ids=table.ids,
         bos_id=table.bos_id,
@@ -826,8 +1007,8 @@ def build_piperlite_voice(
             "dur.hidden": dur_hidden,
             "dur.depth": dur_depth,
             "dur.kernel": dur_kernel,
-            "dur.max_tokens": int(dur_cfg["max_tokens"]),
-            "dur.max_duration": int(dur_cfg["max_duration"]),
+            "dur.max_tokens": int(dur_base_cfg["max_tokens"]),
+            "dur.max_duration": int(dur_base_cfg["max_duration"]),
             "ac.vocab": ac_vocab,
             "ac.hidden": ac_hidden,
             "ac.token_depth": ac_token_depth,
@@ -865,7 +1046,7 @@ def build_piperlite_voice(
         VoiceTensor(
             "dur.embedding.weight",
             expect(
-                take(dur_tensors, "embedding.weight", "duration"),
+                take(dur_tensors, dur_prefix + "embedding.weight", "duration"),
                 (dur_vocab, dur_hidden),
                 "dur.embedding.weight",
             ),
@@ -878,7 +1059,7 @@ def build_piperlite_voice(
             flatten_conv1d(
                 "dur.input_proj.weight",
                 expect(
-                    take(dur_tensors, "input_proj.weight", "duration"),
+                    take(dur_tensors, dur_prefix + "input_proj.weight", "duration"),
                     (dur_hidden, dur_hidden + 3, 1),
                     "dur.input_proj.weight",
                 ),
@@ -889,7 +1070,7 @@ def build_piperlite_voice(
         VoiceTensor(
             "dur.input_proj.bias",
             expect(
-                take(dur_tensors, "input_proj.bias", "duration"),
+                take(dur_tensors, dur_prefix + "input_proj.bias", "duration"),
                 (dur_hidden,),
                 "dur.input_proj.bias",
             ),
@@ -897,7 +1078,8 @@ def build_piperlite_voice(
         )
     )
     _add_residual_blocks(
-        build, name, dur_tensors, "blocks", "dur.blocks", dur_depth, dur_hidden, dur_kernel
+        build, name, dur_tensors, dur_prefix + "blocks", "dur.blocks",
+        dur_depth, dur_hidden, dur_kernel,
     )
     # dur.output stays F32 and its matmul runs on CPU: round(exp(x)) is a step
     # function, so a fp16 backend difference here changes the audio *length*
@@ -908,7 +1090,7 @@ def build_piperlite_voice(
             flatten_conv1d(
                 "dur.output.weight",
                 expect(
-                    take(dur_tensors, "output.weight", "duration"),
+                    take(dur_tensors, dur_prefix + "output.weight", "duration"),
                     (1, dur_hidden, 1),
                     "dur.output.weight",
                 ),
@@ -919,7 +1101,11 @@ def build_piperlite_voice(
     add(
         VoiceTensor(
             "dur.output.bias",
-            expect(take(dur_tensors, "output.bias", "duration"), (1,), "dur.output.bias"),
+            expect(
+                take(dur_tensors, dur_prefix + "output.bias", "duration"),
+                (1,),
+                "dur.output.bias",
+            ),
             f32=True,
         )
     )
@@ -947,7 +1133,7 @@ def build_piperlite_voice(
                     f"{dst}.weight",
                     expect(
                         take(ac_tensors, f"{src}.weight", "acoustic"),
-                        (ac_hidden, ac_hidden + extra, 1),
+                        (ac_hidden, ac_hidden + extra + style_dim, 1),
                         f"{dst}.weight",
                     ),
                 ),
@@ -1084,6 +1270,11 @@ def build_piperlite_voice(
 
     _add_post_filter(build, name, dec_tensors, dec_cfg)
 
+    if emotion:
+        _add_emotion(
+            build, name, emotion, dur_cfg, dur_tensors, dur_hidden, style_aliases,
+        )
+
     build.sources = {
         "package": str(manifest.get("package_name") or name),
         "weights_sha256": str(manifest.get("weights_sha256") or ""),
@@ -1094,6 +1285,85 @@ def build_piperlite_voice(
     build.declared_parameters = int(manifest.get("total_parameters") or 0)
     check_parameter_count(build)
     return build
+
+
+def _add_emotion(
+    build: VoiceBuild,
+    voice: str,
+    emotion: dict[str, Any],
+    dur_cfg: dict[str, Any],
+    dur_tensors: dict[str, np.ndarray],
+    dur_hidden: int,
+    style_aliases: dict[str, str] | None,
+) -> None:
+    """The style space, and the duration model's style residual.
+
+    The acoustic side needs nothing here: its two input projections are already
+    `style_dim` channels wider, and the runtime fills those rows with the style
+    vector. The duration side is a separate branch on top of the frozen neutral
+    model — `tanh(output(silu(input_proj([embedding; style])))) * max_log_ratio`,
+    both projections pointwise — so all of its tensors are new.
+    """
+    dim = int(emotion["dim"])
+    styles = list(emotion["styles"])
+    hidden = int(dur_cfg["hidden"])
+    max_log_ratio = float(dur_cfg["max_log_ratio"])
+    if max_log_ratio != emotion["max_log_ratio"]:
+        raise ConversionError(
+            f"{voice}: the duration checkpoint bounds the residual at {max_log_ratio:g} "
+            f"and the manifest at {emotion['max_log_ratio']:g}"
+        )
+    if hidden < 1:
+        raise ConversionError(f"{voice}: emotion duration hidden must be positive")
+
+    def take(key: str, shape: tuple[int, ...]) -> None:
+        if key not in dur_tensors:
+            raise ConversionError(f"{voice}: duration is missing emotion tensor {key!r}")
+        array = dur_tensors[key]
+        if tuple(array.shape) != shape:
+            raise ConversionError(
+                f"{voice}: emo.dur.{key} has shape {tuple(array.shape)}, expected {shape}"
+            )
+        build.tensors.append(
+            VoiceTensor(
+                f"emo.dur.{key}",
+                flatten_conv1d(key, array) if array.ndim == 3 else array,
+                # F32 like the neutral duration model: this branch ends in the
+                # same exp/round step function, where an F16 difference of 1e-3
+                # near a tie changes the frame count and the audio length.
+                f32=True,
+            )
+        )
+
+    # The style vector is concatenated to the frozen model's token embedding,
+    # so the branch reads `dur_hidden + dim` channels and writes one log ratio.
+    take("input_proj.weight", (hidden, dur_hidden + dim, 1))
+    take("input_proj.bias", (hidden,))
+    take("output.weight", (1, hidden, 1))
+    take("output.bias", (1,))
+
+    resolved: dict[str, str] = {}
+    for alias, style in DEFAULT_STYLE_ALIASES.items():
+        if style in styles and alias not in styles:
+            resolved[alias] = style
+    for alias, style in (style_aliases or {}).items():
+        if style not in styles:
+            raise ConversionError(
+                f"{voice}: --style-alias {alias}={style} names no style of this pack "
+                f"({', '.join(styles)})"
+            )
+        if alias in styles:
+            raise ConversionError(f"{voice}: --style-alias {alias} is already a style name")
+        resolved[alias] = style
+
+    build.scalar_meta.update({"emotion.dim": dim, "emotion.dur.hidden": hidden})
+    build.float_meta["emotion.dur.max_log_ratio"] = max_log_ratio
+    build.string_meta["emotion.default_style"] = str(emotion["default"])
+    build.string_array_meta["emotion.styles"] = styles
+    build.string_array_meta["emotion.alias_names"] = sorted(resolved)
+    build.string_array_meta["emotion.alias_styles"] = [resolved[a] for a in sorted(resolved)]
+    # Style-major, `dim` values per style, in the order of `emotion.styles`.
+    build.float_array_meta["emotion.style_vectors"] = list(emotion["vectors"])
 
 
 def _schwa_fallback_id(table: PhonemeTable) -> int:
@@ -1917,6 +2187,12 @@ def emit(
             writer.add_f32(prefix + key, value)
         for key, value in sorted(build.array_meta.items()):
             writer.add_u32_array(prefix + key, value)
+        for key, value in sorted(build.string_meta.items()):
+            writer.add_string(prefix + key, value)
+        for key, value in sorted(build.string_array_meta.items()):
+            writer.add_string_array(prefix + key, value)
+        for key, value in sorted(build.float_array_meta.items()):
+            writer.add_f32_array(prefix + key, value)
         for key, value in sorted(build.sources.items()):
             writer.add_string(prefix + "source." + key, value)
 
@@ -2003,15 +2279,39 @@ def load_vocos_vocabulary(path: Path | None) -> dict[str, int]:
     return out
 
 
-def resolve_requested(voices: Sequence[str]) -> list[str]:
+# A voice name becomes a GGUF metadata value and the prefix of every tensor
+# this voice contributes, so a locally converted pack may not name itself with
+# whitespace, separators or anything else that would make those keys ambiguous.
+_LOCAL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+
+
+def resolve_requested(voices: Sequence[str], local: bool = False) -> list[str]:
+    """Map command-line voice names onto canonical ones.
+
+    The tables only describe what can be *downloaded*. A `--voice-dir` pack is
+    self-describing — its manifest names, shapes and hashes every tensor, and
+    the conversion validates all of it — so under `local` an unknown name is a
+    voice trained outside this table rather than a typo.
+    """
     resolved: list[str] = []
     for raw in voices:
         name = VOICE_ALIASES.get(raw, raw)
         if name in resolved:
             continue
         if name not in PIPERLITE_PACKAGES and name not in VOCOS_VOICES:
-            known = ", ".join(sorted({*PIPERLITE_PACKAGES, *VOCOS_VOICES, *VOICE_ALIASES}))
-            raise ConversionError(f"unknown voice {raw!r}; known voices: {known}")
+            if not local:
+                known = ", ".join(
+                    sorted({*PIPERLITE_PACKAGES, *VOCOS_VOICES, *VOICE_ALIASES})
+                )
+                raise ConversionError(
+                    f"unknown voice {raw!r}; known voices: {known}. Pass --voice-dir "
+                    "to convert a voice pack that is not one of these."
+                )
+            if not _LOCAL_NAME_RE.match(name):
+                raise ConversionError(
+                    f"invalid voice name {raw!r}; use lowercase letters, digits, "
+                    "'.', '_' or '-', starting with a letter or digit"
+                )
         resolved.append(name)
     return resolved
 
@@ -2054,14 +2354,23 @@ def build_voice(
             load_vocos_vocabulary(vocabulary_path),
         )
 
-    package = PIPERLITE_PACKAGES[name]
     if args.voice_dir:
+        # Either a shipped voice read from disk, or one this table has never
+        # heard of: the manifest describes both the same way.
         directory = Path(args.voice_dir).expanduser().resolve()
-    else:
+    elif name in PIPERLITE_PACKAGES:
+        package = PIPERLITE_PACKAGES[name]
         directory = artifact_cache(cache_dir, revision) / package
         for filename in ("manifest.json", "piper-phoneme-config.json", "weights.fp16.bin"):
             fetch(f"{package}/{filename}", cache_dir, revision)
-    return build_piperlite_voice(name, load_voice_pack(name, directory), aliases)
+    else:
+        raise ConversionError(
+            f"{name!r} is not a downloadable voice; pass --voice-dir with its pack"
+        )
+    return build_piperlite_voice(
+        name, load_voice_pack(name, directory), aliases,
+        dict(parse_style_alias(value) for value in (args.style_alias or [])),
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -2075,7 +2384,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument(
         "--voice-dir",
-        help="local directory for the single requested voice, instead of downloading",
+        help="local directory for the single requested voice, instead of "
+             "downloading; with it the voice name is free, so a pack trained "
+             "outside the shipped tables converts under its own name",
+    )
+    parser.add_argument(
+        "--style-alias",
+        action="append",
+        metavar="ALIAS=STYLE",
+        help="extra text tag for an emotion style, e.g. --style-alias giggles=laughing; "
+             "the style must be one the pack declares. Repeatable.",
     )
     parser.add_argument(
         "--default-voice",
@@ -2111,7 +2429,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not requested:
         parser.error("at least one voice is required (--voices or --voice)")
 
-    names = resolve_requested(requested)
+    names = resolve_requested(requested, local=bool(args.voice_dir))
     if args.voice_dir and len(names) != 1:
         parser.error("--voice-dir applies to a single voice")
 

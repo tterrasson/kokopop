@@ -454,8 +454,19 @@ bool load_duration(const VoiceMeta & meta, TensorLoader & loader, Backend & back
     return error.empty();
 }
 
+/// `emotion.dim`, or 0 for a voice that declares no emotion capability. Read
+/// before the acoustic weights because it is what widens their two input
+/// projections; validated in `load_emotion`.
+uint32_t declared_style_dim(const VoiceMeta & meta) {
+    uint32_t dim = 0;
+    if (!gguf_get_u32(meta.ctx, (meta.prefix + "emotion.dim").c_str(), dim)) {
+        return 0;
+    }
+    return dim;
+}
+
 bool load_acoustic(const VoiceMeta & meta, TensorLoader & loader, Backend & backend,
-                   SanoAcousticWeights & w, std::string & error) {
+                   uint32_t style_dim, SanoAcousticWeights & w, std::string & error) {
     if (!meta.u32("ac.vocab", w.vocab, error) ||
         !meta.u32("ac.hidden", w.hidden, error) ||
         !meta.u32("ac.token_depth", w.token_depth, error) ||
@@ -474,10 +485,13 @@ bool load_acoustic(const VoiceMeta & meta, TensorLoader & loader, Backend & back
     }
 
     const int64_t hidden = static_cast<int64_t>(w.hidden);
+    // The style vector, when there is one, is concatenated to both stages'
+    // features: that is the whole of the acoustic conditioning.
+    const int64_t style = static_cast<int64_t>(style_dim);
     w.embedding     = loader.get("ac.embedding.weight", hidden, w.vocab);
-    w.token_proj_w  = loader.get("ac.token_input_proj.weight", hidden + 2, hidden);
+    w.token_proj_w  = loader.get("ac.token_input_proj.weight", hidden + 2 + style, hidden);
     w.token_proj_b  = loader.get_f32("ac.token_input_proj.bias", hidden);
-    w.frame_proj_w  = loader.get("ac.frame_input_proj.weight", hidden + 3, hidden);
+    w.frame_proj_w  = loader.get("ac.frame_input_proj.weight", hidden + 3 + style, hidden);
     w.frame_proj_b  = loader.get_f32("ac.frame_input_proj.bias", hidden);
     if (!error.empty()) {
         return false;
@@ -491,6 +505,109 @@ bool load_acoustic(const VoiceMeta & meta, TensorLoader & loader, Backend & back
     w.output_w = loader.get("ac.output.weight", hidden, w.out_channels);
     w.output_b = loader.get_f32("ac.output.bias", w.out_channels);
     return error.empty();
+}
+
+/// The emotion capability, or nothing at all.
+///
+/// Presence is decided by `emotion.dim`: a voice without that key is a plain
+/// neutral voice and must carry none of the tensors below, which is what keeps
+/// a half-written pack from loading as a voice that silently ignores styles.
+bool load_emotion(const VoiceMeta & meta, TensorLoader & loader,
+                  const SanoDurationWeights & dur, uint32_t dim,
+                  SanoEmotionWeights & w, std::string & error) {
+    if (dim == 0) {
+        if (loader.has_prefix("emo.")) {
+            error = meta.where("emotion.dim")
+                  + " is missing, but the voice carries emotion tensors";
+            return false;
+        }
+        return true;
+    }
+    if (!meta.u32("emotion.dur.hidden", w.hidden, error) ||
+        !meta.f32("emotion.dur.max_log_ratio", w.max_log_ratio, error)) {
+        return false;
+    }
+    if (!in_range(dim, SANO_MAX_DIM, "emotion.dim", meta, error) ||
+        !in_range(w.hidden, SANO_MAX_DIM, "emotion.dur.hidden", meta, error)) {
+        return false;
+    }
+    w.dim = dim;
+    if (!std::isfinite(w.max_log_ratio) || w.max_log_ratio <= 0.0f) {
+        error = meta.where("emotion.dur.max_log_ratio")
+              + " must be a positive finite bound";
+        return false;
+    }
+
+    const int64_t e_hidden = static_cast<int64_t>(w.hidden);
+    const int64_t dur_hidden = static_cast<int64_t>(dur.hidden);
+    // Every tensor of this branch stays F32: it ends in the same exp/round
+    // step function the neutral duration model does, where an F16 difference
+    // of 1e-3 near a tie changes the frame count.
+    w.input_proj_w = loader.get_f32("emo.dur.input_proj.weight",
+                                    dur_hidden + static_cast<int64_t>(dim), e_hidden);
+    w.input_proj_b = loader.get_f32("emo.dur.input_proj.bias", e_hidden);
+    w.output_w = loader.get_f32("emo.dur.output.weight", e_hidden, 1);
+    w.output_b = loader.get_f32("emo.dur.output.bias", 1);
+    if (!error.empty()) {
+        return false;
+    }
+
+    // -- the style space ---------------------------------------------------
+    if (!gguf_get_str_array(meta.ctx, (meta.prefix + "emotion.styles").c_str(), w.styles) ||
+        !gguf_get_f32_array(meta.ctx, (meta.prefix + "emotion.style_vectors").c_str(),
+                            w.vectors) ||
+        !gguf_get_str_array(meta.ctx, (meta.prefix + "emotion.alias_names").c_str(),
+                            w.alias_names) ||
+        !gguf_get_str_array(meta.ctx, (meta.prefix + "emotion.alias_styles").c_str(),
+                            w.alias_styles)) {
+        error = meta.where("emotion.styles") + ": missing or mistyped style space arrays";
+        return false;
+    }
+    if (!meta.str("emotion.default_style", w.default_style, error)) {
+        return false;
+    }
+    if (w.styles.empty() || w.vectors.size() != w.styles.size() * dim ||
+        w.alias_names.size() != w.alias_styles.size()) {
+        error = meta.where("emotion.styles") + ": "
+              + std::to_string(w.styles.size()) + " styles do not match "
+              + std::to_string(w.vectors.size()) + " vector components";
+        return false;
+    }
+    for (const float value : w.vectors) {
+        if (!std::isfinite(value)) {
+            error = meta.where("emotion.style_vectors") + " is not finite";
+            return false;
+        }
+    }
+    bool has_default = false;
+    for (size_t i = 0; i < w.styles.size(); ++i) {
+        if (w.styles[i].empty()) {
+            error = meta.where("emotion.styles") + " contains an empty name";
+            return false;
+        }
+        for (size_t j = 0; j < i; ++j) {
+            if (w.styles[i] == w.styles[j]) {
+                error = meta.where("emotion.styles") + " lists " + w.styles[i] + " twice";
+                return false;
+            }
+        }
+        has_default = has_default || w.styles[i] == w.default_style;
+    }
+    if (!has_default) {
+        error = meta.where("emotion.default_style") + " = " + w.default_style
+              + " is not one of the voice's styles";
+        return false;
+    }
+    for (size_t i = 0; i < w.alias_names.size(); ++i) {
+        const bool known = std::find(w.styles.begin(), w.styles.end(),
+                                     w.alias_styles[i]) != w.styles.end();
+        if (w.alias_names[i].empty() || !known) {
+            error = meta.where("emotion.alias_names") + ": " + w.alias_names[i]
+                  + " does not name a style of this voice";
+            return false;
+        }
+    }
+    return true;
 }
 
 bool load_piperlite(const VoiceMeta & meta, TensorLoader & loader, Backend & backend,
@@ -870,10 +987,14 @@ bool SanoArch::load(Model & base_model, std::string & error) {
         }
 
         TensorLoader loader(base_model, info.prefix, declared, error);
+        const uint32_t style_dim = declared_style_dim(info);
         if (!load_duration(info, loader, *backend, voice.dur, error) ||
-            !load_acoustic(info, loader, *backend, voice.ac, error)) {
+            !load_acoustic(info, loader, *backend, style_dim, voice.ac, error) ||
+            !load_emotion(info, loader, voice.dur, style_dim, voice.emo, error)) {
             return false;
         }
+        voice.desc.styles = voice.emo.styles;
+        voice.desc.default_style = voice.emo.default_style;
         if (voice.dur.max_tokens != max_tokens) {
             error = info.where("dur.max_tokens") + " disagrees with max_tokens";
             return false;
@@ -975,6 +1096,12 @@ SanoGraphBudget sano_duration_budget(const SanoVoice & voice) {
                   SANO_NODES_PER_RES_BLOCK * voice.dur.depth);
 }
 
+SanoGraphBudget sano_duration_residual_budget(const SanoVoice &) {
+    // Two pointwise projections and a SiLU between them: no convolutions at
+    // all, so the frontend's own nodes are the whole graph.
+    return budget(SANO_FRONTEND_BASE_NODES);
+}
+
 SanoGraphBudget sano_acoustic_token_budget(const SanoVoice & voice) {
     return budget(SANO_FRONTEND_BASE_NODES +
                   SANO_NODES_PER_RES_BLOCK * voice.ac.token_depth);
@@ -1001,6 +1128,92 @@ SanoGraphBudget sano_vocos_budget(const SanoVoice & voice) {
     // block a depthwise convolution, a norm, two pointwise projections and the
     // LayerScale residual.
     return budget(128 + SANO_NODES_PER_RES_BLOCK * voice.vocos.blocks);
+}
+
+// ---------------------------------------------------------------------------
+// Styles
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// ASCII case folding. Style names come from a pack's own style space and are
+/// lowercase identifiers; a caller who writes `[Sad]` at the start of a
+/// sentence means the same style.
+std::string ascii_lower(std::string_view text) {
+    std::string out(text);
+    for (char & c : out) {
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    }
+    return out;
+}
+
+/// Index of `name` in the voice's styles, through its aliases, or -1.
+int64_t style_index(const SanoEmotionWeights & emo, const std::string & name) {
+    const std::string wanted = ascii_lower(name);
+    for (size_t i = 0; i < emo.styles.size(); ++i) {
+        if (ascii_lower(emo.styles[i]) == wanted) return static_cast<int64_t>(i);
+    }
+    for (size_t i = 0; i < emo.alias_names.size(); ++i) {
+        if (ascii_lower(emo.alias_names[i]) != wanted) continue;
+        for (size_t j = 0; j < emo.styles.size(); ++j) {
+            if (emo.styles[j] == emo.alias_styles[i]) return static_cast<int64_t>(j);
+        }
+    }
+    return -1;
+}
+
+} // namespace
+
+bool SanoArch::resolve_style(const SanoVoice & voice, const std::string & name,
+                             SanoStyle & style, std::string & error) const {
+    style = SanoStyle{};
+    if (!voice.emo.enabled()) {
+        if (name.empty()) {
+            return true;
+        }
+        error = "voice " + voice.desc.name + " carries no emotion pack, so the style \""
+              + name + "\" cannot be rendered";
+        return false;
+    }
+
+    const std::string wanted = name.empty() ? voice.emo.default_style : name;
+    const int64_t index = style_index(voice.emo, wanted);
+    if (index < 0) {
+        std::string known;
+        for (const auto & candidate : voice.emo.styles) {
+            known += (known.empty() ? "" : ", ") + candidate;
+        }
+        error = "voice " + voice.desc.name + " has no style \"" + wanted
+              + "\"; it declares " + known;
+        return false;
+    }
+
+    const size_t dim = voice.emo.dim;
+    const float * vector = voice.emo.vectors.data() + static_cast<size_t>(index) * dim;
+    style.name = voice.emo.styles[static_cast<size_t>(index)];
+    style.vector.assign(vector, vector + dim);
+
+    // The duration residual is zero-initialised in the style vector and every
+    // term is multiplied by it, so a zero vector produces an exactly zero
+    // residual: the declared neutral bypass, taken here by never building the
+    // graph. The acoustic model is conditioned on the vector either way.
+    style.neutral = std::none_of(style.vector.begin(), style.vector.end(),
+                                 [](float value) { return value != 0.0f; });
+    return true;
+}
+
+bool SanoArch::resolve_style_tag(const VoiceDesc & desc, std::string_view tag,
+                                 std::string & style) const {
+    const SanoVoice * voice = voice_for(desc);
+    if (voice == nullptr || !voice->emo.enabled()) {
+        return false;
+    }
+    const int64_t index = style_index(voice->emo, std::string(tag));
+    if (index < 0) {
+        return false;
+    }
+    style = voice->emo.styles[static_cast<size_t>(index)];
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1034,6 +1247,11 @@ bool SanoArch::run(const std::vector<uint32_t> & ids, const VoiceDesc & desc,
     // every token.
     const float length_scale = desc.length_scale / speed;
 
+    SanoStyle style;
+    if (!resolve_style(*voice, extras.style, style, error)) {
+        return false;
+    }
+
     if (!extras.dur_override.empty()) {
         if (extras.dur_override.size() != ids.size()) {
             error = "sanoTTS synthesis: dur_override has "
@@ -1050,7 +1268,8 @@ bool SanoArch::run(const std::vector<uint32_t> & ids, const VoiceDesc & desc,
             }
         }
         probe.durations = extras.dur_override;
-    } else if (!sano_run_duration(*this, *voice, ids, length_scale, probe.durations, error)) {
+    } else if (!sano_run_duration(*this, *voice, ids, length_scale, style,
+                                  probe.durations, error)) {
         return false;
     }
 
@@ -1071,13 +1290,14 @@ bool SanoArch::run(const std::vector<uint32_t> & ids, const VoiceDesc & desc,
     probe.n_tokens = static_cast<int64_t>(ids.size());
     probe.frames = frames;
 
-    if (!sano_run_acoustic_token(*this, *voice, ids, probe.durations, probe.token_ctx, error)) {
+    if (!sano_run_acoustic_token(*this, *voice, ids, probe.durations, style,
+                                 probe.token_ctx, error)) {
         return false;
     }
 
     std::vector<float> frame_input;
     sano_expand_to_frames(probe.token_ctx, probe.n_tokens, voice->ac.hidden,
-                          probe.durations, frames, frame_input);
+                          probe.durations, frames, style.vector, frame_input);
 
     if (!sano_run_acoustic_frame(*this, *voice, frame_input, frames, probe.latent, error)) {
         return false;

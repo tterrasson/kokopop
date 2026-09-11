@@ -57,6 +57,21 @@ back, which always carries the rate of the voice that produced it.
 returned name points into the model and stays valid until
 `kokopop_model_free()`.
 
+A sanoTTS voice trained with an emotion pack also declares the styles it can be
+asked for:
+
+```c
+for (size_t i = 0; i < kokopop_model_voice_style_count(model, voice); ++i) {
+    const char *style = kokopop_model_voice_style(model, voice, i);
+    /* "neutral", "angry", "sad", "joyful", "laughing", ... */
+}
+const char *fallback = kokopop_model_voice_default_style(model, voice);
+```
+
+The count is `0` for a voice without an emotion pack and for an unknown one;
+`kokopop_model_voice_default_style()` is never `NULL` and is `""` in the same
+cases. Aliases a voice also accepts are not listed.
+
 ## Backend selection
 
 `kokopop_model_options.backend` picks the inference backend. `KOKOPOP_BACKEND_AUTO`
@@ -193,6 +208,35 @@ instead of meaning "unset"; leave it at `0` to let the decoder derive a seed
 from the voice, which is already reproducible run to run. Kokoro voices ignore
 both fields. Zero-initialize the options structure before setting fields, as in
 the example above.
+
+### sanoTTS emotion style
+
+```c
+kokopop_synthesis_options opts = {0};
+opts.voice = "fr-upmc";
+opts.mode = KOKOPOP_SYNTH_LONG_FORM;
+opts.style = "sad";   /* untagged text is spoken in this style */
+
+kokopop_synthesis *synth = NULL;
+kokopop_synthesis_create(model, &opts, &synth);
+```
+
+`style` applies to every chunk whose text carries no `[style]` tag of its own;
+a tag wins over it, sentence by sentence. `NULL` or `""` selects the voice's
+declared default, which is what
+`kokopop_model_voice_default_style()` reports.
+
+A style the voice does not declare fails the request — `kokopop_last_error()`
+then names the styles it does have, as does any style at all on a voice
+without an emotion pack, Kokoro voices included. Rendering such a request
+neutral instead would return a voice the caller did not ask for.
+
+Tags in the text need no option at all, so they work through
+`kokopop_synthesize_text()` too:
+
+```c
+kokopop_synthesize_text(model, "Bonjour. [sad] Il est parti.", "fr-upmc", 1.0f, &audio);
+```
 
 ## Streaming audio encoding
 

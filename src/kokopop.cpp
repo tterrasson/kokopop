@@ -137,6 +137,7 @@ kokopop::SynthesisSessionOptions make_session_options(
     out.diffusion = make_diffusion_options(options);
     out.has_noise_seed = options && options->has_sano_noise_seed != 0;
     out.noise_seed = options ? options->sano_noise_seed : 0;
+    out.style = options && options->style ? options->style : "";
     return out;
 }
 
@@ -546,6 +547,27 @@ int32_t kokopop_model_voice_sample_rate(const kokopop_model * model, const char 
     const kokopop::VoiceDesc * desc =
         model->impl->arch->find_voice(voice ? voice : "");
     return desc ? desc->sample_rate : 0;
+}
+
+size_t kokopop_model_voice_style_count(const kokopop_model * model, const char * voice) {
+    if (!model || !model->impl || !model->impl->arch) return 0;
+    const kokopop::VoiceDesc * desc = model->impl->arch->find_voice(voice ? voice : "");
+    return desc ? desc->styles.size() : 0;
+}
+
+const char * kokopop_model_voice_style(const kokopop_model * model,
+                                       const char * voice, size_t i) {
+    if (!model || !model->impl || !model->impl->arch) return nullptr;
+    const kokopop::VoiceDesc * desc = model->impl->arch->find_voice(voice ? voice : "");
+    if (!desc || i >= desc->styles.size()) return nullptr;
+    return desc->styles[i].c_str();
+}
+
+const char * kokopop_model_voice_default_style(const kokopop_model * model,
+                                               const char * voice) {
+    if (!model || !model->impl || !model->impl->arch) return "";
+    const kokopop::VoiceDesc * desc = model->impl->arch->find_voice(voice ? voice : "");
+    return desc ? desc->default_style.c_str() : "";
 }
 
 int32_t kokopop_model_backend(const kokopop_model * model) {

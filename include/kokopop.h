@@ -106,6 +106,14 @@ typedef struct kokopop_synthesis_options {
     /// Ignored by Kokoro voices.
     int32_t  has_sano_noise_seed;
     uint64_t sano_noise_seed;
+
+    /// sanoTTS only, the emotion style for text that carries no `[style]`
+    /// tag of its own. NULL or empty selects the voice's declared default.
+    ///
+    /// A name the voice does not declare fails the request rather than
+    /// rendering it neutral, as does any name at all on a voice without an
+    /// emotion pack. `kokopop_model_voice_styles()` lists what a voice has.
+    const char * style;
 } kokopop_synthesis_options;
 
 typedef struct kokopop_encoder_options {
@@ -203,6 +211,25 @@ KOKOPOP_API const char * kokopop_model_voice_name(const kokopop_model * model, s
 /// when the voice is unknown.
 KOKOPOP_API int32_t kokopop_model_voice_sample_rate(const kokopop_model * model,
                                                     const char * voice);
+
+/// Number of emotion styles a voice declares, 0 for a voice without an
+/// emotion pack or an unknown one.
+KOKOPOP_API size_t kokopop_model_voice_style_count(const kokopop_model * model,
+                                                   const char * voice);
+
+/// Name of style `i` of one voice, or null when either is out of range.
+/// The pointer stays valid until the model is freed.
+///
+/// These are the names accepted by `kokopop_synthesis_options.style` and by a
+/// `[style]` tag in the text; a voice may also accept aliases, which are not
+/// listed here.
+KOKOPOP_API const char * kokopop_model_voice_style(const kokopop_model * model,
+                                                   const char * voice, size_t i);
+
+/// The style a voice uses when a request names none. Empty string for a voice
+/// without an emotion pack; never null.
+KOKOPOP_API const char * kokopop_model_voice_default_style(const kokopop_model * model,
+                                                           const char * voice);
 
 /// Backend the model actually loaded on, once AUTO has been resolved.
 /// Returns one of KOKOPOP_BACKEND_*, or KOKOPOP_BACKEND_CPU for a null model.

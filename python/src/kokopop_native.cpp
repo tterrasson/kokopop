@@ -261,7 +261,7 @@ int fill_synthesis_options(PyObject * kwargs, kokopop_synthesis_options & opts) 
         "paragraph_pause_ms", "crossfade_ms", "max_silence_trim_ms",
         "trim_silence", "enable_diffusion", "diffusion_seed",
         "diffusion_steps", "diffusion_alpha", "diffusion_beta",
-        "diffusion_embedding_scale", "noise_seed", "max_chunks", nullptr,
+        "diffusion_embedding_scale", "noise_seed", "style", "max_chunks", nullptr,
     };
     if (reject_unknown_kwargs(kwargs, allowed) < 0) return -1;
 
@@ -294,6 +294,9 @@ int fill_synthesis_options(PyObject * kwargs, kokopop_synthesis_options & opts) 
     if (get_optional_u64(kwargs, "noise_seed", noise_seed, has_noise_seed) < 0) return -1;
     opts.has_sano_noise_seed = has_noise_seed ? 1 : 0;
     opts.sano_noise_seed = noise_seed;
+
+    // sanoTTS emotion style for text carrying no `[style]` tag of its own.
+    if (get_optional_string(kwargs, "style", opts.style) < 0) return -1;
 
     PyObject * trim = kwargs ? PyDict_GetItemString(kwargs, "trim_silence") : nullptr;
     if (trim != nullptr && trim != Py_None) {
@@ -414,6 +417,25 @@ PyObject * Model_voice_sample_rate(ModelObject * self, PyObject * args) {
         return nullptr;
     }
     return PyLong_FromLong(rate);
+}
+
+/// The emotion styles a voice declares, empty for a voice without a pack.
+PyObject * Model_voice_styles(ModelObject * self, PyObject * args) {
+    const char * voice = nullptr;
+    if (!PyArg_ParseTuple(args, "s", &voice)) return nullptr;
+    const size_t count = kokopop_model_voice_style_count(self->handle, voice);
+    PyObject * tuple = PyTuple_New(static_cast<Py_ssize_t>(count));
+    if (tuple == nullptr) return nullptr;
+    for (size_t i = 0; i < count; ++i) {
+        const char * name = kokopop_model_voice_style(self->handle, voice, i);
+        PyObject * item = PyUnicode_FromString(name != nullptr ? name : "");
+        if (item == nullptr) {
+            Py_DECREF(tuple);
+            return nullptr;
+        }
+        PyTuple_SET_ITEM(tuple, static_cast<Py_ssize_t>(i), item);
+    }
+    return tuple;
 }
 
 PyObject * Model_synthesize_common(ModelObject * self, PyObject * args, PyObject * kwargs, bool phonemes) {
@@ -891,6 +913,7 @@ PyMethodDef Model_methods[] = {
     {"synthesize_phonemes", _PyCFunction_CAST(Model_synthesize_phonemes_py), METH_VARARGS | METH_KEYWORDS, nullptr},
     {"stream", _PyCFunction_CAST(Model_stream_py), METH_VARARGS | METH_KEYWORDS, nullptr},
     {"voice_sample_rate", reinterpret_cast<PyCFunction>(Model_voice_sample_rate), METH_VARARGS, nullptr},
+    {"voice_styles", reinterpret_cast<PyCFunction>(Model_voice_styles), METH_VARARGS, nullptr},
     {nullptr, nullptr, 0, nullptr},
 };
 

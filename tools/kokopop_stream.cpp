@@ -65,6 +65,8 @@ void usage(const char * argv0) {
         "  --threads N     Number of threads (default: min(4, hw_concurrency))\n"
         "  --backend       Inference backend (default: auto)\n"
         "  --seed N        sanoTTS noise seed (stdio mode); default: derived from the voice\n"
+        "  --style NAME    sanoTTS emotion style for untagged text (stdio mode);\n"
+        "                  the text can also switch style inline: \"[sad] ...\"\n"
         "  --http          Run in HTTP server mode (async, event-driven)\n"
         "  --port N        HTTP server port (default: 8080)\n"
         "  --bind ADDR     HTTP server bind address (default: 127.0.0.1)\n"
@@ -98,9 +100,10 @@ const char * arg_value(int & i, int argc, char ** argv) {
 static int run_stdio_mode(kokopop::Model * model, const std::string & voice,
                           float speed, kokopop::StreamMode stream_mode,
                           const std::string & out_path,
-                          bool has_noise_seed, uint64_t noise_seed) {
+                          bool has_noise_seed, uint64_t noise_seed,
+                          const std::string & style) {
     kokopop::StdioStreamer streamer(*model, voice, speed, stream_mode, out_path,
-                                    has_noise_seed, noise_seed);
+                                    has_noise_seed, noise_seed, style);
     streamer.run();
     streamer.join();
     return 0;
@@ -307,6 +310,7 @@ int main(int argc, char ** argv) {
     int idle_unload_minutes = 0;
     bool has_noise_seed = false;
     uint64_t noise_seed = 0;
+    std::string style;
 
     try {
         for (int i = 1; i < argc; ++i) {
@@ -350,6 +354,10 @@ int main(int argc, char ** argv) {
                     return 2;
                 }
                 has_noise_seed = true;
+            } else if (std::strcmp(argv[i], "--style") == 0) {
+                const char * v = arg_value(i, argc, argv);
+                if (!v) { usage(argv[0]); return 2; }
+                style = v;
             } else if (std::strcmp(argv[i], "--http") == 0) {
                 http_mode = true;
             } else if (std::strcmp(argv[i], "--port") == 0) {
@@ -435,5 +443,5 @@ int main(int argc, char ** argv) {
     }
 #endif
     return run_stdio_mode(model, voice, speed, stream_mode, out_path,
-                          has_noise_seed, noise_seed);
+                          has_noise_seed, noise_seed, style);
 }

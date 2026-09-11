@@ -18,6 +18,7 @@
 #include "arch/sanotts/sano_graph.h"
 #include "backend/backend.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -116,6 +117,7 @@ ggml_tensor * residual_stack(ggml_context * ctx, ggml_tensor * x_ct,
 
 bool sano_run_duration(SanoArch & arch, const SanoVoice & voice,
                        const std::vector<uint32_t> & ids, float length_scale,
+                       const SanoStyle & style,
                        std::vector<int32_t> & durations, std::string & error) {
     const SanoDurationWeights & w = voice.dur;
     const int64_t n_tokens = static_cast<int64_t>(ids.size());
@@ -198,6 +200,19 @@ bool sano_run_duration(SanoArch & arch, const SanoVoice & voice,
                              log_durations.size() * sizeof(float));
     ggml_free(ctx);
 
+    // The style acts in log space, as a bounded per-token correction of the
+    // frozen model's own prediction. A neutral style is skipped rather than
+    // computed: every term of that branch is provably zero for it.
+    if (!style.neutral) {
+        std::vector<float> residual;
+        if (!sano_run_duration_residual(arch, voice, ids, style, residual, error)) {
+            return false;
+        }
+        for (int64_t t = 0; t < n_tokens; ++t) {
+            log_durations[static_cast<size_t>(t)] += residual[static_cast<size_t>(t)];
+        }
+    }
+
     durations.resize(static_cast<size_t>(n_tokens));
     for (int64_t t = 0; t < n_tokens; ++t) {
         const float raw = std::exp(log_durations[static_cast<size_t>(t)]);
@@ -209,17 +224,114 @@ bool sano_run_duration(SanoArch & arch, const SanoVoice & voice,
 }
 
 // ---------------------------------------------------------------------------
+// Graph 1b — duration, style residual
+// ---------------------------------------------------------------------------
+
+bool sano_run_duration_residual(SanoArch & arch, const SanoVoice & voice,
+                                const std::vector<uint32_t> & ids,
+                                const SanoStyle & style,
+                                std::vector<float> & residual, std::string & error) {
+    const SanoEmotionWeights & w = voice.emo;
+    const SanoDurationWeights & dur = voice.dur;
+    const int64_t n_tokens = static_cast<int64_t>(ids.size());
+    const int64_t dim = static_cast<int64_t>(w.dim);
+
+    if (!w.enabled() || style.vector.size() != w.dim) {
+        error = "sanoTTS duration residual: the voice carries no style of this width";
+        return false;
+    }
+
+    std::vector<uint32_t> clamped;
+    if (!sano::clamp_ids_to_vocab(ids, dur.vocab, voice.tokens, "duration", clamped, error)) {
+        return false;
+    }
+
+    const SanoGraphBudget budget = sano_duration_residual_budget(voice);
+    const size_t bytes = arch.backend->graph_context_bytes(budget.tensors, budget.nodes);
+    ggml_context * ctx = sano_graph_context(arch.graph_scratch, bytes, "duration residual", error);
+    if (ctx == nullptr) {
+        return false;
+    }
+
+    arch.backend->set_input_tokens(static_cast<int>(n_tokens));
+    arch.backend->set_active_label("sanotts_duration_residual");
+
+    // The branch reads the *frozen* model's embedding: it refines a neutral
+    // timing rather than producing one. Its only other input is the style,
+    // one constant vector concatenated to every token.
+    FrontendInput in = embed_with_features(ctx, dur.embedding, n_tokens, dim);
+
+    ggml_tensor * x = project(ctx, w.input_proj_w, w.input_proj_b, in.concat);
+    // Unlike the native stages, the nonlinearity is between the projections:
+    // `output(silu(input_proj(x)))`, both of them pointwise.
+    x = ggml_silu(ctx, x);
+    ggml_tensor * out = project(ctx, w.output_w, w.output_b, x);   // [1, n_tokens]
+    // Everything downstream is a step function away from the frame count, so
+    // this branch is pinned to the CPU sub-backend exactly like the neutral
+    // projection it corrects.
+    arch.backend->defer_cpu_assignment(out);
+    arch.backend->defer_cpu_assignment(out->src[0]);
+
+    ggml_set_name(out, "sanotts_duration_style");
+    ggml_set_output(out);
+
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, budget.nodes, false);
+    ggml_build_forward_expand(graph, out);
+
+    if (!alloc_graph(arch, graph, "duration residual", error)) {
+        ggml_free(ctx);
+        return false;
+    }
+
+    std::vector<float> features(static_cast<size_t>(n_tokens * dim));
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        std::copy(style.vector.begin(), style.vector.end(),
+                  features.begin() + static_cast<ptrdiff_t>(t * dim));
+    }
+    std::vector<int32_t> ids_i32(clamped.begin(), clamped.end());
+
+    arch.backend->tensor_set(in.ids, ids_i32.data(), 0, ggml_nbytes(in.ids));
+    arch.backend->tensor_set(in.features, features.data(), 0, ggml_nbytes(in.features));
+
+    if (arch.backend->compute(ctx, graph) != GGML_STATUS_SUCCESS) {
+        ggml_free(ctx);
+        error = "sanoTTS duration residual graph compute failed";
+        return false;
+    }
+
+    residual.resize(static_cast<size_t>(n_tokens));
+    arch.backend->tensor_get(out, residual.data(), 0, residual.size() * sizeof(float));
+    ggml_free(ctx);
+
+    // What closes the branch: the declared bound, so that a style may at most
+    // halve or double a token's duration however far the projection ran.
+    for (float & value : residual) {
+        value = std::tanh(value) * w.max_log_ratio;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // Graph 2 — acoustic, token stage
 // ---------------------------------------------------------------------------
 
 bool sano_run_acoustic_token(SanoArch & arch, const SanoVoice & voice,
                              const std::vector<uint32_t> & ids,
                              const std::vector<int32_t> & durations,
+                             const SanoStyle & style,
                              std::vector<float> & token_ctx, std::string & error) {
     const SanoAcousticWeights & w = voice.ac;
     const int64_t n_tokens = static_cast<int64_t>(ids.size());
     if (durations.size() != ids.size()) {
         error = "sanoTTS acoustic model: duration and id counts disagree";
+        return false;
+    }
+    // The style is one constant vector for the whole utterance, concatenated
+    // to the features of every token. An empty one is a voice without an
+    // emotion pack, whose projection is exactly `hidden + 2` wide.
+    const int64_t style_dim = static_cast<int64_t>(style.vector.size());
+    if (style_dim != static_cast<int64_t>(voice.emo.dim)) {
+        error = "sanoTTS acoustic model: the style vector does not match the voice";
         return false;
     }
 
@@ -239,7 +351,8 @@ bool sano_run_acoustic_token(SanoArch & arch, const SanoVoice & voice,
     arch.backend->set_active_label("sanotts_acoustic_token");
 
     const int64_t hidden = static_cast<int64_t>(w.hidden);
-    FrontendInput in = embed_with_features(ctx, w.embedding, n_tokens, 2);
+    const int64_t n_features = 2 + style_dim;
+    FrontendInput in = embed_with_features(ctx, w.embedding, n_tokens, n_features);
 
     ggml_tensor * x = project(ctx, w.token_proj_w, w.token_proj_b, in.concat);
     x = residual_stack(ctx, x, w.token_blocks, hidden);
@@ -261,11 +374,13 @@ bool sano_run_acoustic_token(SanoArch & arch, const SanoVoice & voice,
     }
     const double log_max = std::log1p(max_duration);
 
-    std::vector<float> features(static_cast<size_t>(n_tokens) * 2);
+    std::vector<float> features(static_cast<size_t>(n_tokens * n_features));
     for (int64_t t = 0; t < n_tokens; ++t) {
-        features[static_cast<size_t>(t) * 2 + 0] = linspace01(t, n_tokens);
-        features[static_cast<size_t>(t) * 2 + 1] = static_cast<float>(
+        float * row = features.data() + static_cast<size_t>(t * n_features);
+        row[0] = linspace01(t, n_tokens);
+        row[1] = static_cast<float>(
             std::log1p(static_cast<double>(durations[static_cast<size_t>(t)])) / log_max);
+        std::copy(style.vector.begin(), style.vector.end(), row + 2);
     }
     std::vector<int32_t> ids_i32(clamped.begin(), clamped.end());
 
@@ -290,8 +405,10 @@ bool sano_run_acoustic_token(SanoArch & arch, const SanoVoice & voice,
 
 void sano_expand_to_frames(const std::vector<float> & token_ctx, int64_t n_tokens,
                            int64_t hidden, const std::vector<int32_t> & durations,
-                           int64_t frames, std::vector<float> & frame_input) {
-    const int64_t rows = hidden + 3;
+                           int64_t frames, const std::vector<float> & style,
+                           std::vector<float> & frame_input) {
+    const int64_t style_dim = static_cast<int64_t>(style.size());
+    const int64_t rows = hidden + 3 + style_dim;
     frame_input.assign(static_cast<size_t>(rows * frames), 0.0f);
 
     const int64_t token_span = n_tokens > 1 ? n_tokens - 1 : 1;
@@ -309,6 +426,7 @@ void sano_expand_to_frames(const std::vector<float> & token_ctx, int64_t n_token
             dest[hidden + 2] = duration > 1
                 ? static_cast<float>(d) / static_cast<float>(duration - 1)
                 : 0.0f;
+            std::copy(style.begin(), style.end(), dest + hidden + 3);
         }
     }
 }
@@ -323,8 +441,11 @@ bool sano_run_acoustic_frame(SanoArch & arch, const SanoVoice & voice,
                              std::string & error) {
     const SanoAcousticWeights & w = voice.ac;
     const int64_t hidden = static_cast<int64_t>(w.hidden);
-    const int64_t rows = hidden + 3;
-    if (frame_input.size() != static_cast<size_t>(rows * frames)) {
+    // Taken from the projection rather than recomputed: it is the one place
+    // the style width is already known to match the weights.
+    const int64_t rows = w.frame_proj_w->ne[0];
+    if (rows != hidden + 3 + static_cast<int64_t>(voice.emo.dim) ||
+        frame_input.size() != static_cast<size_t>(rows * frames)) {
         error = "sanoTTS acoustic model: frame input has the wrong size";
         return false;
     }

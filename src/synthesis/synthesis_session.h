@@ -23,6 +23,10 @@ struct SynthesisSessionOptions {
     /// separate so that 0 stays a usable explicit seed.
     bool     has_noise_seed = false;
     uint64_t noise_seed     = 0;
+
+    /// sanoTTS's emotion style for untagged text; empty is the voice's own
+    /// default. `[style]` tags in the text override it, chunk by chunk.
+    std::string style;
 };
 
 struct SynthesisAudioChunk {

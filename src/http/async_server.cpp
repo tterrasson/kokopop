@@ -618,6 +618,21 @@ void AsyncHttpServer::_dispatch_request(int fd, Connection & conn) {
             noise_seed = yyjson_get_uint(noise_seed_val);
         }
 
+        // Optional sanoTTS emotion style for text that carries no `[style]`
+        // tag of its own. An unknown one fails the request in the scheduler,
+        // where the voice is resolved and can say what it does have.
+        std::string style;
+        yyjson_val * style_val = yyjson_obj_get(root, "style");
+        if (style_val && !yyjson_is_null(style_val)) {
+            if (!yyjson_is_str(style_val)) {
+                yyjson_doc_free(doc);
+                _send_error(fd, conn, 400, "Bad Request",
+                            json_error("'style' must be a string"));
+                return;
+            }
+            style = yyjson_get_str(style_val);
+        }
+
         // Optional diffusion style sampling. Disabled by default; only the
         // "diffusion" boolean turns it on, the rest are optional tuning knobs.
         KokoroDiffusionOptions diffusion;  // defaults: disabled, steps=5, alpha=0.1, beta=0.5
@@ -741,7 +756,7 @@ void AsyncHttpServer::_dispatch_request(int fd, Connection & conn) {
             text_str, current_voice, spd, current_mode, fmt,
             ogg_prebuffer_chunks,
             chunk_cfg_override, has_chunk_cfg_override, diffusion,
-            has_noise_seed, noise_seed);
+            has_noise_seed, noise_seed, style);
 
         _send_streaming_response(fd, conn, ctx);
         return;

@@ -24,11 +24,13 @@ struct Options {
     std::string voice = "zf_xiaoni";
     std::string text;
     std::string phonemes;
+    std::string style;
 };
 
 void print_usage() {
     std::fprintf(stderr,
-        "usage: kokopop_probe --voice VOICE [--model PATH] (--text TEXT | --phonemes PS)\n");
+        "usage: kokopop_probe --voice VOICE [--model PATH] [--style NAME] "
+        "(--text TEXT | --phonemes PS)\n");
 }
 
 bool parse_args(int argc, char ** argv, Options & options) {
@@ -51,6 +53,8 @@ bool parse_args(int argc, char ** argv, Options & options) {
             if (!need_value("--text", options.text)) return false;
         } else if (arg == "--phonemes") {
             if (!need_value("--phonemes", options.phonemes)) return false;
+        } else if (arg == "--style") {
+            if (!need_value("--style", options.style)) return false;
         } else if (arg == "--help" || arg == "-h") {
             print_usage();
             std::exit(0);
@@ -155,6 +159,7 @@ int probe_sanotts(kokopop::Model & model, const Options & options) {
     }
 
     kokopop::SynthesisExtras extras;
+    extras.style = options.style;
     kokopop::SanoProbe probe;
     if (!arch->run(ids, *voice, 1.0f, extras, probe, error)) {
         std::fprintf(stderr, "sanoTTS synthesis failed: %s\n", error.c_str());
@@ -172,6 +177,17 @@ int probe_sanotts(kokopop::Model & model, const Options & options) {
                 voice->decoder == kokopop::DecoderKind::PiperLite ? "piperlite" : "vocos");
     std::printf("sample_rate=%d\n", voice->sample_rate);
     std::printf("length_scale=%.6f\n", static_cast<double>(voice->length_scale));
+    if (!voice->styles.empty()) {
+        std::string styles;
+        for (const auto & name : voice->styles) {
+            styles += (styles.empty() ? "" : ",") + name;
+        }
+        std::printf("styles=%s\n", styles.c_str());
+        std::printf("default_style=%s\n", voice->default_style.c_str());
+        std::printf("style=%s\n",
+                    options.style.empty() ? voice->default_style.c_str()
+                                          : options.style.c_str());
+    }
     std::printf("phonemes=%s\n", phonemes.c_str());
     std::printf("token_count=%zu\n", ids.size());
     std::printf("frames=%lld\n", static_cast<long long>(probe.frames));

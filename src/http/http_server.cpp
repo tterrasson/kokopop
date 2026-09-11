@@ -20,6 +20,7 @@
   #include <errno.h>
   #include <fcntl.h>
   #include <csignal>
+  #include <poll.h>
   #include <signal.h>
 #endif
 
@@ -49,6 +50,11 @@ static constexpr int MAX_CONCURRENT_CONNECTIONS = 64;
 /// Connection idle timeout (seconds).  A connection that sits idle for this
 /// long is closed.
 static constexpr int CONNECTION_TIMEOUT_SECS = 30;
+
+/// How long the accept loop waits for a connection before re-reading the
+/// running flag. It bounds shutdown latency on an idle server and costs one
+/// `poll()` every tick; it is not a connection timeout.
+static constexpr int ACCEPT_POLL_MS = 100;
 
 // ---------------------------------------------------------------------------
 // Platform helpers
@@ -89,6 +95,33 @@ int socket_close(int fd) {
 #else
     return ::close(fd);
 #endif
+}
+
+/// Waits until `fd` has a connection to accept, for at most `timeout_ms`.
+/// Returns 1 when it does, 0 on timeout, -1 on error.
+///
+/// This is what makes the accept loop interruptible. Closing the listening
+/// socket from another thread does *not* wake a thread already blocked in
+/// `accept()` on Linux — the descriptor leaves the table but the syscall stays
+/// parked — so a server shut down that way never joins. Waiting with a timeout
+/// and only then accepting means `stop()` has to flip one flag and nothing
+/// else, which is also the only thing it may safely do from a signal handler.
+int wait_for_connection(int fd, int timeout_ms) {
+#ifdef _WIN32
+    WSAPOLLFD pfd{};
+    pfd.fd = static_cast<SOCKET>(fd);
+    pfd.events = POLLRDNORM;
+    const int rv = WSAPoll(&pfd, 1, timeout_ms);
+#else
+    struct pollfd pfd{};
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    int rv;
+    do {
+        rv = ::poll(&pfd, 1, timeout_ms);
+    } while (rv < 0 && errno == EINTR);
+#endif
+    return rv > 0 ? 1 : rv;
 }
 
 // ---------------------------------------------------------------------------
@@ -316,11 +349,10 @@ bool HttpServer::start(const std::string & addr, int port) {
 }
 
 void HttpServer::stop() {
+    // Only the flag: the accept loop polls it, and closing the listening
+    // socket here would neither wake that loop (see `wait_for_connection`) nor
+    // be safe to do from the signal handler this is called from.
     _running.store(false);
-    if (_server_fd >= 0) {
-        socket_close(_server_fd);
-        _server_fd = -1;
-    }
 }
 
 void HttpServer::set_shutdown_callback(ShutdownCallback cb) {
@@ -330,6 +362,14 @@ void HttpServer::set_shutdown_callback(ShutdownCallback cb) {
 void HttpServer::join() {
     if (_accept_thread.joinable()) {
         _accept_thread.join();
+    }
+    // After the accept thread has exited, nothing reads `_server_fd` any more,
+    // so this is the one point where closing it races with nobody. A connection
+    // thread can still take up to CONNECTION_TIMEOUT_SECS to notice the flag on
+    // an idle keep-alive socket; it holds its own descriptor, not this one.
+    if (_server_fd >= 0) {
+        socket_close(_server_fd);
+        _server_fd = -1;
     }
     {
         std::lock_guard<std::mutex> lock(_threads_mutex);
@@ -350,6 +390,17 @@ void HttpServer::_accept_loop() {
                 std::this_thread::sleep_for(std::chrono::milliseconds(200));
                 continue;
             }
+        }
+
+        // Bounded wait, so `stop()` is noticed within one tick even with no
+        // traffic at all. An error here is the listening socket itself going
+        // bad, which the accept below reports with a message.
+        const int ready = wait_for_connection(_server_fd, ACCEPT_POLL_MS);
+        if (ready == 0) {
+            continue;
+        }
+        if (ready < 0 && !_running.load()) {
+            break;
         }
 
         sockaddr_in client_addr{};

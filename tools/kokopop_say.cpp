@@ -28,7 +28,9 @@ void usage(const char * argv0) {
         "  --play          Play audio directly (mutually exclusive with --out)\n"
         "  --backend       Inference backend (default: auto)\n"
         "  --seed N        sanoTTS noise seed; default: derived from the voice.\n"
-        "                  Ignored with --phonemes and on a Kokoro model.\n",
+        "                  Ignored with --phonemes and on a Kokoro model.\n"
+        "  --style NAME    sanoTTS emotion style for untagged text, e.g. --style sad.\n"
+        "                  The text may also switch style inline: \"[sad] ...\".\n",
         argv0,
         kokopop::backend_name_list());
 }
@@ -42,16 +44,19 @@ const char * arg_value(int & i, int argc, char ** argv) {
 }
 
 /// Long-form synthesis through the session API, concatenated into one buffer.
-/// Only used when the caller pinned a noise seed.
-int synthesize_text_with_seed(kokopop_model * model, const std::string & text,
-                              const std::string & voice, float speed,
-                              uint64_t seed, kokopop_audio & out) {
+/// Only used when the caller pinned a noise seed or a style, neither of which
+/// the one-call text API takes.
+int synthesize_text_with_options(kokopop_model * model, const std::string & text,
+                                 const std::string & voice, float speed,
+                                 bool has_seed, uint64_t seed,
+                                 const std::string & style, kokopop_audio & out) {
     kokopop_synthesis_options options{};
     options.voice = voice.c_str();
     options.speed = speed;
     options.mode = KOKOPOP_SYNTH_LONG_FORM;
-    options.has_sano_noise_seed = 1;
+    options.has_sano_noise_seed = has_seed ? 1 : 0;
     options.sano_noise_seed = seed;
+    options.style = style.empty() ? nullptr : style.c_str();
 
     kokopop_synthesis * synthesis = nullptr;
     int rc = kokopop_synthesis_create(model, &options, &synthesis);
@@ -108,6 +113,7 @@ int main(int argc, char ** argv) {
     int32_t backend = KOKOPOP_BACKEND_AUTO;
     bool has_seed = false;
     uint64_t seed = 0;
+    std::string style;
 
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--model") == 0) {
@@ -122,6 +128,10 @@ int main(int argc, char ** argv) {
             const char * v = arg_value(i, argc, argv);
             if (!v) { usage(argv[0]); return 2; }
             phonemes = v;
+        } else if (std::strcmp(argv[i], "--style") == 0) {
+            const char * v = arg_value(i, argc, argv);
+            if (!v) { usage(argv[0]); return 2; }
+            style = v;
         } else if (std::strcmp(argv[i], "--voice") == 0) {
             const char * v = arg_value(i, argc, argv);
             if (!v) { usage(argv[0]); return 2; }
@@ -193,16 +203,22 @@ int main(int argc, char ** argv) {
     // chunks and different pauses). Taking it for a model that ignores the
     // seed anyway would change the chunking, the pauses and the audio for
     // nothing, so it is reserved for the architecture the seed belongs to.
-    const bool seeded = has_seed && !text.empty() &&
-                        kokopop_model_arch(model) == KOKOPOP_ARCH_SANOTTS;
+    const bool sanotts = kokopop_model_arch(model) == KOKOPOP_ARCH_SANOTTS;
+    const bool seeded = has_seed && !text.empty() && sanotts;
     if (has_seed && !seeded) {
         std::fprintf(stderr,
                      "warning: --seed applies to sanoTTS voices only, ignoring it\n");
     }
+    if (!style.empty() && (text.empty() || !sanotts)) {
+        std::fprintf(stderr,
+                     "warning: --style applies to sanoTTS text synthesis only, ignoring it\n");
+        style.clear();
+    }
 
     kokopop_audio audio{};
-    if (seeded) {
-        rc = synthesize_text_with_seed(model, text, voice, speed, seed, audio);
+    if (seeded || !style.empty()) {
+        rc = synthesize_text_with_options(model, text, voice, speed,
+                                          seeded, seed, style, audio);
     } else if (!text.empty()) {
         rc = kokopop_synthesize_text(model, text.c_str(), voice.c_str(), speed, &audio);
     } else {

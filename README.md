@@ -269,6 +269,36 @@ reconstructed size against the next offset, the blob totals and the declared
 parameter count. A checkpoint whose operators are not covered is refused, not
 guessed at.
 
+A locally trained pack converts the same way, under its own name, with
+`--voice-dir`:
+
+```bash
+uv run python tools/convert_sanotts_to_gguf.py \
+  --output models/sanotts-fr.gguf --voice fr-upmc --voice-dir runs/fr-upmc/voice
+```
+
+### Emotion styles (sanoTTS)
+
+A sanoTTS pack trained with an utterance style space
+(`sanofr.utterance-emotion.v1`, manifest format `roota.raw-fp16.v2`) carries a
+named style per vector: `neutral`, `angry`, `sad`, `joyful`, `laughing` for the
+packs built from the reference recipe. `kokopop_probe` lists what a voice has:
+
+```
+styles=neutral,angry,sad,joyful,laughing
+default_style=neutral
+```
+
+The style is selected two ways, and they compose. **Inline tags** switch style
+in the middle of a text; each tag opens a new chunk, because the style is one
+vector per inference:
+
+```bash
+./build/kokopop_say --model models/sanotts-fr.gguf --voice fr-upmc \
+  --text "Bonjour. [sad] Il est parti hier soir. [chuckles] Enfin, presque." \
+  --out bonjour.wav
+```
+
 > **Note:** `AUTO` backend selection resolves to **CPU** for sanoTTS. The
 > models are two orders of magnitude smaller than Kokoro's, so dispatch
 > overhead dominates and a GPU wins nothing, see [Benchmarks](#benchmarks).

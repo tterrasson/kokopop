@@ -57,6 +57,7 @@ struct RequestContext {
     KokoroDiffusionOptions diffusion{};  // disabled by default
     bool     has_noise_seed = false;     // sanoTTS deterministic noise
     uint64_t noise_seed     = 0;
+    std::string style;                   // sanoTTS emotion style, "" = default
     std::unique_ptr<SynthesisSession> synthesis;
 
     bool is_streaming() const {

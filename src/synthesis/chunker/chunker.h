@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace kokopop {
@@ -72,6 +73,10 @@ ChunkConfig scale_chunk_budgets(ChunkConfig cfg, int ids_per_phoneme, int capaci
 struct Unit {
     std::string text;
     std::string phonemes;
+    /// Emotion style the preceding `[tag]` selected, empty for the request's
+    /// own default. Units of different styles never share a chunk: the style
+    /// is one vector per inference, so a chunk cannot hold two.
+    std::string style;
     /// Token count of `phonemes` tokenized alone, framing included. Used as the
     /// budget estimate when assembling chunks.
     int n_tokens = 0;
@@ -84,6 +89,8 @@ struct Unit {
 struct Chunk {
     std::string text;
     std::string phonemes;
+    /// The style of every unit in it; see `Unit::style`.
+    std::string style;
     /// `phonemes` tokenized once, framing included. This is the exact sequence
     /// passed to inference.
     std::vector<uint32_t> tokens;
@@ -104,9 +111,14 @@ struct Chunk {
 //   5. Rebalance tiny chunks
 //   6. Trim boundary punctuation and tokenize each chunk once
 //
-// Both closures are bound by the caller to the resolved voice: the phonemizer
-// and tokenizer belong to the architecture, so the chunker has no voice
-// parameter. Budgets are counted in final ids, framing included.
+// The closures are bound by the caller to the resolved voice: the phonemizer,
+// the tokenizer and the style vocabulary belong to the architecture, so the
+// chunker has no voice parameter. Budgets are counted in final ids, framing
+// included.
+//
+// Step 1 is preceded by style-tag splitting: `[sad] ...` cuts the text into
+// styled segments, each chunked on its own, so a chunk carries exactly one
+// style and the tags themselves never reach the phonemizer.
 // ---------------------------------------------------------------------------
 using PhonemizeFn = std::function<bool(const std::string & text,
                                        std::string & phonemes,
@@ -114,12 +126,20 @@ using PhonemizeFn = std::function<bool(const std::string & text,
 using TokenizeFn = std::function<bool(const std::string & phonemes,
                                        std::vector<uint32_t> & ids,
                                        std::string & error)>;
+/// Does `[tag]` name an emotion style of the resolved voice? Writes its
+/// canonical name and returns true if so.
+///
+/// Bound by the caller like the two above, and empty for a voice or an
+/// architecture that has no styles — in which case no bracket is ever stripped
+/// and the text reaches the phonemizer exactly as it was written.
+using StyleTagFn = std::function<bool(std::string_view tag, std::string & style)>;
 
 std::vector<Chunk> chunk_text(
     const std::string & text,
     const ChunkConfig & config,
     const PhonemizeFn & phonemize_fn,
     const TokenizeFn & tokenize_fn,
+    const StyleTagFn & style_tag_fn,
     std::string & error);
 
 /// Steps 1 to 3 only: units for adaptative chunking, split on natural pauses.
@@ -128,6 +148,7 @@ std::vector<Unit> prepare_chunk_units(
     const ChunkConfig & config,
     const PhonemizeFn & phonemize_fn,
     const TokenizeFn & tokenize_fn,
+    const StyleTagFn & style_tag_fn,
     std::string & error);
 
 /// Build the next adaptative chunk from prepared units and advance `next_unit`.

@@ -70,8 +70,8 @@ bool SynthesisSession::prepare(std::string & error) {
     _tokenize = frontend.tokenize;
 
     if (_options.mode == StreamMode::LongForm) {
-        _plan.chunks = chunk_text(_text, cfg,
-                                  frontend.phonemize, frontend.tokenize, error);
+        _plan.chunks = chunk_text(_text, cfg, frontend.phonemize,
+                                  frontend.tokenize, frontend.style_tag, error);
         if (_plan.chunks.empty()) return false;
         _plan.voice = _options.voice;
         _plan.speed = _options.speed;
@@ -80,11 +80,13 @@ bool SynthesisSession::prepare(std::string & error) {
         _plan.diffusion = _options.diffusion;
         _plan.has_noise_seed = _options.has_noise_seed;
         _plan.noise_seed = _options.noise_seed;
+        _plan.style = _options.style;
         _chunks_total = static_cast<int>(_plan.chunks.size());
     } else {
         _adaptative_units = prepare_chunk_units(_text, cfg,
                                                 frontend.phonemize,
-                                                frontend.tokenize, error);
+                                                frontend.tokenize,
+                                                frontend.style_tag, error);
         if (_adaptative_units.empty()) return false;
 
         _plan.voice = _options.voice;
@@ -94,6 +96,7 @@ bool SynthesisSession::prepare(std::string & error) {
         _plan.diffusion = _options.diffusion;
         _plan.has_noise_seed = _options.has_noise_seed;
         _plan.noise_seed = _options.noise_seed;
+        _plan.style = _options.style;
         _adaptative_controller.min_tokens = cfg.target_min_tokens;
         _adaptative_controller.max_tokens = cfg.soft_max_tokens;
         _adaptative_controller.growth_max_tokens = cfg.target_max_tokens;
@@ -150,6 +153,7 @@ bool SynthesisSession::next(size_t max_chunks, size_t queued_requests,
             one_chunk_plan.diffusion = _options.diffusion;
             one_chunk_plan.has_noise_seed = _options.has_noise_seed;
             one_chunk_plan.noise_seed = _options.noise_seed;
+            one_chunk_plan.style = _options.style;
 
             const auto start = std::chrono::steady_clock::now();
             audio = infer_chunk(_model, one_chunk_plan, 0, _prev_tail, out_tail, error,

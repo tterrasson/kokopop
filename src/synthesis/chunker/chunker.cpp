@@ -206,7 +206,64 @@ void append_piece(Chunk & chunk, const std::string & phonemes, const std::string
     chunk.boundary_after = boundary_after;
 }
 
+/// One run of text spoken in one style.
+struct StyledSegment {
+    std::string style;  ///< Empty for the request's own default.
+    std::string text;
+};
+
+/// Longest tag this will even consider. A `[` far from its `]` is prose —
+/// a citation, a stage direction, an array index — and scanning to the end of
+/// a paragraph to decide that is both slow and more likely to be wrong.
+constexpr size_t MAX_STYLE_TAG = 32;
+
+/// Splits on `[style]` tags the voice recognises, dropping the tags.
+///
+/// A bracket the voice does not know is left exactly where it was and reaches
+/// the phonemizer as text: this must not quietly eat `[1]` out of a citation,
+/// and a caller who misspells a style would rather hear it than lose it.
+std::vector<StyledSegment> split_style_tags(const std::string & text,
+                                            const StyleTagFn & style_tag_fn) {
+    std::vector<StyledSegment> segments;
+    segments.push_back(StyledSegment{});
+    if (!style_tag_fn) {
+        segments.back().text = text;
+        return segments;
+    }
+
+    size_t pos = 0;
+    while (pos < text.size()) {
+        const size_t open = text.find('[', pos);
+        if (open == std::string::npos) {
+            segments.back().text.append(text, pos, std::string::npos);
+            break;
+        }
+        const size_t limit = std::min(text.size(), open + 1 + MAX_STYLE_TAG + 1);
+        const size_t close = text.find(']', open + 1);
+        std::string style;
+        const bool matched =
+            close != std::string::npos && close < limit &&
+            text.find('[', open + 1) > close &&
+            style_tag_fn(std::string_view(text).substr(open + 1, close - open - 1), style);
+
+        segments.back().text.append(text, pos, open - pos);
+        if (!matched) {
+            segments.back().text.push_back('[');
+            pos = open + 1;
+            continue;
+        }
+        // A tag ends the segment it appears in, even mid-sentence: the style is
+        // one vector per inference, so the change needs a chunk boundary.
+        segments.push_back(StyledSegment{style, std::string()});
+        pos = close + 1;
+    }
+    return segments;
+}
+
 void append_unit(Chunk & chunk, const Unit & unit) {
+    if (chunk.n_tokens == 0) {
+        chunk.style = unit.style;
+    }
     append_piece(chunk, unit.phonemes, unit.text, unit.n_tokens, unit.boundary_after);
 }
 
@@ -304,12 +361,14 @@ std::vector<Chunk> rebalance_tiny_chunks(std::vector<Chunk> chunks, const ChunkC
             result.push_back(std::move(cur));
             continue;
         }
-        if (!result.empty() &&
+        // A merge across a style change would have to drop one of the two
+        // styles, so a short chunk in its own style simply stays short.
+        if (!result.empty() && result.back().style == cur.style &&
             result.back().n_tokens + cur.n_tokens <= config.target_max_tokens) {
             append_chunk(result.back(), cur);
             continue;
         }
-        if (i + 1 < chunks.size() &&
+        if (i + 1 < chunks.size() && chunks[i + 1].style == cur.style &&
             cur.n_tokens + chunks[i + 1].n_tokens <= config.target_max_tokens) {
             append_chunk(cur, chunks[i + 1]);
             ++i;
@@ -319,23 +378,19 @@ std::vector<Chunk> rebalance_tiny_chunks(std::vector<Chunk> chunks, const ChunkC
     return result;
 }
 
-} // namespace
-
-// ---------------------------------------------------------------------------
-// Main pipeline
-// ---------------------------------------------------------------------------
-
-std::vector<Unit> prepare_chunk_units(
-    const std::string & text,
-    const ChunkConfig & config,
-    const PhonemizeFn & phonemize_fn,
-    const TokenizeFn & tokenize_fn,
-    std::string & error) {
-    const Frontend fe{phonemize_fn, tokenize_fn};
-
-    const std::string normalized = ensure_terminal_sentence_boundary(normalize_text(text));
-
-    std::vector<Unit> units;
+/// Steps 1 to 3 for one styled segment, appending to `units`.
+///
+/// `units` is the whole request's list, not the segment's: the first-chunk
+/// budget bounds time to first audio, which is a property of the request.
+void prepare_segment_units(const StyledSegment & segment, const ChunkConfig & config,
+                           const Frontend & fe, std::vector<Unit> & units,
+                           std::string & error) {
+    std::string normalized = normalize_text(segment.text);
+    // Leading, consecutive and trailing tags can leave no text to speak.
+    if (normalized.find_first_not_of(" \t\r\n\f\v") == std::string::npos) {
+        return;
+    }
+    normalized = ensure_terminal_sentence_boundary(std::move(normalized));
     for (const auto & raw : split_into_candidate_units(normalized)) {
         std::vector<Unit> made;
         Unit u;
@@ -373,20 +428,44 @@ std::vector<Unit> prepare_chunk_units(
                 }
                 continue;
             }
+            unit.style = segment.style;
             units.push_back(std::move(unit));
         }
     }
+}
+
+} // namespace
+
+// ---------------------------------------------------------------------------
+// Main pipeline
+// ---------------------------------------------------------------------------
+
+std::vector<Unit> prepare_chunk_units(
+    const std::string & text,
+    const ChunkConfig & config,
+    const PhonemizeFn & phonemize_fn,
+    const TokenizeFn & tokenize_fn,
+    const StyleTagFn & style_tag_fn,
+    std::string & error) {
+    const Frontend fe{phonemize_fn, tokenize_fn};
+
+    std::vector<Unit> units;
+    for (const StyledSegment & segment : split_style_tags(text, style_tag_fn)) {
+        prepare_segment_units(segment, config, fe, units, error);
+    }
     return units;
 }
+
 
 std::vector<Chunk> chunk_text(
     const std::string & text,
     const ChunkConfig & config,
     const PhonemizeFn & phonemize_fn,
     const TokenizeFn & tokenize_fn,
+    const StyleTagFn & style_tag_fn,
     std::string & error) {
     const std::vector<Unit> units =
-        prepare_chunk_units(text, config, phonemize_fn, tokenize_fn, error);
+        prepare_chunk_units(text, config, phonemize_fn, tokenize_fn, style_tag_fn, error);
 
     std::vector<Chunk> chunks;
     Chunk current;
@@ -403,6 +482,10 @@ std::vector<Chunk> chunk_text(
             ? config.first_chunk_target_max_tokens
             : config.target_max_tokens;
         const int trial = current.n_tokens + unit.n_tokens;
+
+        if (current.n_tokens > 0 && current.style != unit.style) {
+            flush();
+        }
 
         if (current.n_tokens > 0) {
             const bool full = current.n_tokens >= config.target_min_tokens;
@@ -516,7 +599,9 @@ Chunk build_adaptative_chunk(
 
     while (next_unit < units.size()) {
         const Unit & unit = units[next_unit];
-        if (chunk.n_tokens > 0 && chunk.n_tokens + unit.n_tokens > config.hard_max_tokens) {
+        if (chunk.n_tokens > 0 &&
+            (chunk.style != unit.style ||
+             chunk.n_tokens + unit.n_tokens > config.hard_max_tokens)) {
             break;
         }
         append_unit(chunk, unit);
@@ -553,10 +638,15 @@ Chunk build_adaptative_chunk(
     // Absorb a tiny tail rather than emit an undersized final chunk.
     if (!is_first && chunk.n_tokens > 0 && next_unit < units.size()) {
         int remaining = 0;
+        bool same_style = true;
         for (size_t i = next_unit; i < units.size(); ++i) {
+            if (units[i].style != chunk.style) {
+                same_style = false;
+                break;
+            }
             remaining += units[i].n_tokens;
         }
-        if (remaining > 0 && remaining < config.target_min_tokens &&
+        if (same_style && remaining > 0 && remaining < config.target_min_tokens &&
             chunk.n_tokens + remaining <= config.hard_max_tokens) {
             for (; next_unit < units.size(); ++next_unit) {
                 append_unit(chunk, units[next_unit]);

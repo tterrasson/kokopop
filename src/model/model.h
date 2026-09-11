@@ -114,7 +114,7 @@ struct Model {
     ggml_tensor * cached_tensor(const std::string & logical_name) const;
 };
 
-/// The two closures the chunker needs, bound to one resolved voice.
+/// The three closures the chunker needs, bound to one resolved voice.
 ///
 /// Both go through `ModelArch`, which is the point: the chunker used to call a
 /// global `phonemize_text()` with a voice *name*, which silently applied
@@ -123,6 +123,7 @@ struct VoiceFrontend {
     VoiceDesc   voice;
     PhonemizeFn phonemize;
     TokenizeFn  tokenize;
+    StyleTagFn  style_tag;
 };
 
 /// Resolve `requested_voice` (empty = default) and bind its frontend.

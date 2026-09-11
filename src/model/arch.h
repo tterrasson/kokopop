@@ -67,6 +67,11 @@ struct VoiceDesc {
 
     FrontendKind frontend = FrontendKind::Misaki;
     DecoderKind  decoder  = DecoderKind::Kokoro;
+
+    /// Emotion styles this voice can be asked for, empty when it carries no
+    /// emotion pack, and the one it uses when a request names none.
+    std::vector<std::string> styles;
+    std::string default_style;
 };
 
 /// Kokoro's style-diffusion sampler options.
@@ -108,6 +113,11 @@ struct SynthesisExtras {
     /// Stable index of this chunk within the utterance. Folded into the
     /// per-chunk seed so that consecutive chunks do not reuse the same noise.
     uint32_t chunk_index = 0;
+
+    /// sanoTTS only — the utterance style, a name from the voice's emotion
+    /// pack or one of its aliases. Empty means the pack's declared default,
+    /// and is the only accepted value for a voice without an emotion pack.
+    std::string style;
 
     /// sanoTTS only — per-token frame counts, replacing the duration model's
     /// prediction. Empty means "predict them".
@@ -160,6 +170,20 @@ struct ModelArch {
     /// Phonemes → token ids, framing included.
     virtual bool tokenize(const std::string & phonemes, const VoiceDesc & voice,
                           std::vector<uint32_t> & ids, std::string & error) const = 0;
+
+    /// Does `tag` (the contents of a `[...]` the text carries) name an
+    /// emotion style of this voice? Writes the canonical style name and
+    /// returns true if so.
+    ///
+    /// This is what the chunker consults before it strips a bracket from the
+    /// text, so an architecture that answers false everywhere (the default,
+    /// and Kokoro) keeps every bracket the caller wrote as literal text to
+    /// phonemize.
+    virtual bool resolve_style_tag(const VoiceDesc & voice, std::string_view tag,
+                                   std::string & style) const {
+        (void)voice; (void)tag; (void)style;
+        return false;
+    }
 
     // ---- chunking ----
 

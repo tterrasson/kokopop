@@ -49,7 +49,8 @@ public:
         bool has_chunk_config_override = false,
         const KokoroDiffusionOptions & diffusion = KokoroDiffusionOptions{},
         bool has_noise_seed = false,
-        uint64_t noise_seed = 0);
+        uint64_t noise_seed = 0,
+        const std::string & style = std::string());
 
     /// Stop the worker thread. Does not wait — call join() for that.
     void stop();

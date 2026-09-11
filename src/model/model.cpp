@@ -273,6 +273,9 @@ bool make_voice_frontend(Model & model, const std::string & requested_voice,
                                  std::string & err) {
         return arch->tokenize(phonemes, voice, ids, err);
     };
+    out.style_tag = [arch, voice](std::string_view tag, std::string & style) {
+        return arch->resolve_style_tag(voice, tag, style);
+    };
     return true;
 }
 

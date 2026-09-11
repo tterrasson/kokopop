@@ -38,9 +38,28 @@ struct SanoVoice {
     SanoDurationWeights dur;
     SanoAcousticWeights ac;
 
+    /// Empty (`dim == 0`) unless the pack declared an emotion capability.
+    SanoEmotionWeights emo;
+
     /// Exactly one of these is populated, per `desc.decoder`.
     SanoPiperliteWeights piperlite;
     SanoVocosWeights vocos;
+};
+
+/// The style of one synthesis, resolved from a name once per chunk.
+struct SanoStyle {
+    /// `[dim]`, or empty for a voice without an emotion pack. Always filled
+    /// when the voice has one: the acoustic model is conditioned everywhere,
+    /// so the neutral style is the zero vector, not the absence of one.
+    std::vector<float> vector;
+
+    /// True when every component is zero — the exact neutral bypass the pack
+    /// declares, which skips the duration residual graph entirely rather than
+    /// computing a term that is provably zero. Also true for a plain voice.
+    bool neutral = true;
+
+    /// The canonical style name this was resolved from, for diagnostics.
+    std::string name;
 };
 
 /// Intermediate results of one synthesis, kept addressable so the tests can
@@ -73,6 +92,9 @@ struct SanoArch final : ModelArch {
     bool tokenize(const std::string & phonemes, const VoiceDesc & voice,
                   std::vector<uint32_t> & ids, std::string & error) const override;
 
+    bool resolve_style_tag(const VoiceDesc & voice, std::string_view tag,
+                           std::string & style) const override;
+
     ChunkConfig adjust_chunk_config(ChunkConfig cfg,
                                     const VoiceDesc & voice) const override;
 
@@ -104,6 +126,13 @@ struct SanoArch final : ModelArch {
     /// Voice for a description resolved through `find_voice()`. Null when the
     /// description did not come from this arch.
     const SanoVoice * voice_for(const VoiceDesc & desc) const;
+
+    /// Resolves a style name — or an alias, or the empty string for the pack's
+    /// own default — into its vectors. Fails on an unknown name, and on any
+    /// name at all for a voice that carries no emotion pack: a style the model
+    /// cannot render is a silently wrong rendering, not a detail to drop.
+    bool resolve_style(const SanoVoice & voice, const std::string & name,
+                       SanoStyle & style, std::string & error) const;
 
     // ---- shared tables ----
 
@@ -165,6 +194,7 @@ struct SanoGraphBudget {
 };
 
 SanoGraphBudget sano_duration_budget(const SanoVoice & voice);
+SanoGraphBudget sano_duration_residual_budget(const SanoVoice & voice);
 SanoGraphBudget sano_acoustic_token_budget(const SanoVoice & voice);
 SanoGraphBudget sano_acoustic_frame_budget(const SanoVoice & voice);
 SanoGraphBudget sano_piperlite_budget(const SanoVoice & voice);
@@ -180,17 +210,31 @@ SanoGraphBudget sano_vocos_budget(const SanoVoice & voice);
 /// a tie produces a different frame count and a different audio length.
 bool sano_run_duration(SanoArch & arch, const SanoVoice & voice,
                        const std::vector<uint32_t> & ids, float length_scale,
+                       const SanoStyle & style,
                        std::vector<int32_t> & durations, std::string & error);
+
+/// Graph 1b: the style's log-duration residual, `[n_tokens]`, added to the
+/// neutral log durations before they are exponentiated and rounded.
+///
+/// Only the two projections run on the backend; the bound that closes the
+/// branch, `tanh(x) * max_log_ratio`, is a per-token scalar and costs less on
+/// the host than the graph nodes it would take.
+bool sano_run_duration_residual(SanoArch & arch, const SanoVoice & voice,
+                                const std::vector<uint32_t> & ids,
+                                const SanoStyle & style,
+                                std::vector<float> & residual, std::string & error);
 
 /// Graph 2: ids + durations -> token context `[n_tokens, hidden]`.
 bool sano_run_acoustic_token(SanoArch & arch, const SanoVoice & voice,
                              const std::vector<uint32_t> & ids,
                              const std::vector<int32_t> & durations,
+                             const SanoStyle & style,
                              std::vector<float> & token_ctx, std::string & error);
 
 /// Graph 3: expanded token context + frame features -> `[frames, out_channels]`.
 ///
-/// `frame_input` is the host-side expansion, already `[frames, hidden + 3]`.
+/// `frame_input` is the host-side expansion, already
+/// `[frames, hidden + 3 + style dim]`.
 bool sano_run_acoustic_frame(SanoArch & arch, const SanoVoice & voice,
                              const std::vector<float> & frame_input,
                              int64_t frames, std::vector<float> & latent,
@@ -200,7 +244,8 @@ bool sano_run_acoustic_frame(SanoArch & arch, const SanoVoice & voice,
 /// as the `[frames, hidden + 3]` graph-3 input.
 void sano_expand_to_frames(const std::vector<float> & token_ctx, int64_t n_tokens,
                            int64_t hidden, const std::vector<int32_t> & durations,
-                           int64_t frames, std::vector<float> & frame_input);
+                           int64_t frames, const std::vector<float> & style,
+                           std::vector<float> & frame_input);
 
 /// Graph 4a: latent `[frames, 192]` -> PCM at the voice's rate.
 bool sano_run_piperlite(SanoArch & arch, const SanoVoice & voice,
