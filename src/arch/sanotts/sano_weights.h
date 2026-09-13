@@ -24,7 +24,8 @@ namespace kokopop {
 ///
 /// `kernel` is read from the weight tensor rather than the metadata, then
 /// cross-checked against it: the tensor is what the graph will actually be
-/// built from.
+/// built from. `dilation` is 1 for the native students and doubles per level
+/// in the emotion conditioner, where reach — not capacity — is the point.
 struct SanoResBlock {
     ggml_tensor * net0_w = nullptr;
     ggml_tensor * net0_b = nullptr;
@@ -36,6 +37,7 @@ struct SanoResBlock {
     float scale = 0.0f;
 
     int32_t kernel = 0;
+    int32_t dilation = 1;
 };
 
 struct SanoDurationWeights {
@@ -54,34 +56,138 @@ struct SanoDurationWeights {
     ggml_tensor * output_b = nullptr;
 };
 
-/// The utterance style space and the duration model's style residual.
+/// The utterance style space, the shared conditioner, and the two FiLM heads.
 ///
-/// One capability, `sanofr.utterance-emotion.v1`, in its `concat` shape: the
-/// style vector is a constant per utterance, concatenated to the acoustic
-/// model's two input projections — which is why nothing here touches the
-/// acoustic weights, they are simply `dim` channels wider — and the duration
-/// model keeps a separate residual branch on top of its frozen neutral self.
+/// One capability, `sanofr.utterance-emotion.v1`, in its FiLM shape: the
+/// emotion never enters either native student. Both stay exactly the neutral
+/// voice; the style is a correction applied *after* them.
+///
+///   * Acoustically, a feature-wise affine transform — a per-channel log gain
+///     and a shift — predicted once per phone but evaluated on each frame's
+///     own content, `phone_mean + frame_gain * (frame - phone_mean)`, with a
+///     short raised-cosine crossfade joining the raw residual across phone
+///     boundaries before it is bounded. Only the residual is ever crossfaded;
+///     the native latent is never smoothed.
+///   * On timing, one global log tempo plus a per-token redistribution that is
+///     centered to zero under the neutral model's own attention, so a style
+///     may move where the time goes without moving how much there is of it
+///     beyond the tempo it asked for.
+///
+/// Both are driven by one shared conditioner (`sanofr.shared-phrase-film.v2`),
+/// a small dilated stack over the phoneme sequence with a phrase summary added
+/// back to every token, and by one style code — the direction of the style
+/// vector through a biasless, 0-preserving encoder — scaled by one scalar
+/// intensity. Splitting direction from intensity is what makes `0.5 * v`
+/// exactly half the displacement of `v`.
 ///
 /// `dim == 0` means the voice carries no emotion pack. A style vector of all
-/// zeros is the neutral one and bypasses the duration residual exactly: the
-/// branch is zero-init in the style vector and every term is multiplied by it.
+/// zeros is the neutral one and bypasses both heads exactly: the intensity is
+/// zero, and every term of both heads is multiplied by it.
+///
+/// Everything below except the conditioner's own stack is kept on the host.
+/// These are hundreds to a few thousand floats and the arithmetic over them is
+/// a handful of matrix-vector products per token; a graph node each would cost
+/// more to dispatch than to compute.
 struct SanoEmotionWeights {
     uint32_t dim = 0;
-    uint32_t hidden = 0;
 
-    /// Bound on the log-duration ratio the residual may apply, in either
-    /// direction: the branch closes on `tanh(...) * max_log_ratio`.
+    // -- the shared conditioner --------------------------------------------
+    uint32_t cond_vocab = 0;
+    uint32_t cond_hidden = 0;
+    uint32_t cond_depth = 0;
+    uint32_t cond_kernel = 0;
+    uint32_t style_code = 0;
+
+    ggml_tensor * cond_embedding = nullptr;
+
+    /// `[cond_hidden + 1, cond_hidden]`: the embedding with the token's
+    /// phrase-relative position appended, pointwise.
+    ggml_tensor * cond_input_proj_w = nullptr;
+    ggml_tensor * cond_input_proj_b = nullptr;
+
+    /// Dilation doubles per level — block `i` runs at `1 << i` — which is an
+    /// architecture constant and not carried in the file.
+    std::vector<SanoResBlock> cond_blocks;
+
+    /// `[3 * cond_hidden, cond_hidden]`: mean, first and last token of the
+    /// phrase, added back to every token before the layer norm.
+    ggml_tensor * cond_phrase_w = nullptr;
+    ggml_tensor * cond_phrase_b = nullptr;
+    ggml_tensor * cond_norm_w = nullptr;
+    ggml_tensor * cond_norm_b = nullptr;
+
+    /// The style encoder, on the host: `[dim, cond_hidden]` then
+    /// `[cond_hidden, style_code]`, no biases, SiLU between them.
+    std::vector<float> style_w0;
+    std::vector<float> style_w2;
+
+    /// `[dim]`. Calibration scales an axis's intensity, never its direction.
+    std::vector<float> axis_gain;
+
+    // -- the acoustic head -------------------------------------------------
+    /// The latent channel count the heads produce a gain and a shift for;
+    /// equal to the acoustic model's `out_channels`.
+    uint32_t channels = 0;
+    uint32_t context_rank = 0;
+
+    /// Ceilings the head closes on, all in the units of the quantity they
+    /// bound: the rendered per-channel displacement, the log gain before it,
+    /// and the contextual departure from the phrase-global pair.
+    float max_delta = 0.0f;
+    float max_log_gain = 0.0f;
+    float context_bound = 0.0f;
+
+    /// How much of a frame's departure from its phone mean the gain sees, in
+    /// `[0, 1]`. Zero is the retired v1 behaviour — one constant residual per
+    /// phone — and is why a v1 pack is refused rather than rendered with a
+    /// default: the same weights mean a different voice under each.
+    float frame_gain = 0.0f;
+
+    /// Half-width, in frames, of the raised-cosine crossfade applied to the
+    /// raw residual at each phone boundary. Further limited per boundary to
+    /// half of the shorter of the two phones it joins, so a short phone is
+    /// never smeared over its neighbours. Zero disables the crossfade.
+    uint32_t transition_frames = 0;
+
+    /// How much of the donor-versus-teacher direction is removed from the
+    /// rendered delta, in `[0, 1]`. Zero for every shipped pack; the axis is
+    /// carried regardless so the two always travel together.
+    float donor_projection = 0.0f;
+
+    /// `[style_code, 2 * channels]` and `[context_rank, 2 * channels]`, both
+    /// producing the log gain and the shift stacked, gain first.
+    std::vector<float> global_film;
+    std::vector<float> context_basis;
+
+    /// `[cond_hidden, context_rank]` + `[context_rank]`, and the style's own
+    /// `[style_code, context_rank]`: the two factors whose product is the
+    /// style x context interaction.
+    std::vector<float> context_coeff_w;
+    std::vector<float> context_coeff_b;
+    std::vector<float> style_rank;
+
+    /// `[channels]`, zero unless the run fitted one.
+    std::vector<float> donor_axis;
+
+    // -- the duration head -------------------------------------------------
+    /// Bound on the log-duration ratio the head may apply, in either
+    /// direction: it closes on `tanh(...) * max_log_ratio`.
     float max_log_ratio = 0.0f;
 
-    /// `[dur.hidden + dim, hidden]`: the frozen model's token embedding, with
-    /// the utterance's style vector concatenated to every token. Both
-    /// projections are pointwise, so a token's residual reads that token only.
-    ggml_tensor * input_proj_w = nullptr;
-    ggml_tensor * input_proj_b = nullptr;
+    /// Bound on the per-token redistribution alone, before it is centered and
+    /// added to the tempo. Halved in use, as the reference does.
+    float local_bound = 0.0f;
 
-    /// `[hidden, 1]`: one log-duration ratio per token.
-    ggml_tensor * output_w = nullptr;
-    ggml_tensor * output_b = nullptr;
+    /// `[style_code]`, `[style_code, cond_hidden]`, `[cond_hidden]`.
+    std::vector<float> tempo_w;
+    std::vector<float> style_local;
+    std::vector<float> dur_output_w;
+
+    /// `[dur.vocab]`, 1 for a phoneme id the emotional corpus supervised.
+    /// An id outside it receives no redistribution and does not take part in
+    /// the centering, so a rare phone is never moved by a term nothing
+    /// measured.
+    std::vector<float> observed_ids;
 
     /// Style names and their vectors, `dim` values each, style-major.
     std::vector<std::string> styles;
@@ -251,6 +357,15 @@ inline constexpr std::array<std::array<int32_t, 3>, 3> SANO_PIPER_STAGES{{
 /// LayerNorm epsilon. Explicit because it is not ggml's default and the
 /// reference uses torch's.
 inline constexpr float SANO_LAYER_NORM_EPS = 1e-6f;
+
+/// The emotion conditioner's own LayerNorm epsilon: PyTorch's `nn.LayerNorm`
+/// default, which is not the vocos trunk's.
+inline constexpr float SANO_EMOTION_NORM_EPS = 1e-5f;
+
+/// The widest crossfade a pack may ask for at a phone boundary, matching the
+/// reference's own ceiling. A bound, not a modelling choice: the window is
+/// still limited to half of each of the two phones it joins.
+inline constexpr uint32_t SANO_MAX_TRANSITION_FRAMES = 8;
 
 /// Upper bound on the log-magnitude before `exp`, an overflow guard rather
 /// than a modelling choice.

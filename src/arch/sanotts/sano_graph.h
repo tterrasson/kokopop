@@ -68,7 +68,8 @@ ggml_tensor * sano_leaky_relu(ggml_context * ctx, const Backend * backend,
 ggml_tensor * sano_layer_norm(ggml_context * ctx, ggml_tensor * x,
                               ggml_tensor * weight, ggml_tensor * bias);
 
-/// `x + scale * conv2(silu(conv1(x)))` on a `[T, C]` activation.
+/// `x + scale * conv2(silu(conv1(x)))` on a `[T, C]` activation, at the
+/// block's own dilation.
 struct SanoResBlock;
 ggml_tensor * sano_res_block(ggml_context * ctx, ggml_tensor * x,
                              const SanoResBlock & block, int64_t channels);

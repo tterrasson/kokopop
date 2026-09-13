@@ -454,9 +454,11 @@ bool load_duration(const VoiceMeta & meta, TensorLoader & loader, Backend & back
     return error.empty();
 }
 
-/// `emotion.dim`, or 0 for a voice that declares no emotion capability. Read
-/// before the acoustic weights because it is what widens their two input
-/// projections; validated in `load_emotion`.
+/// `emotion.dim`, or 0 for a voice that declares no emotion capability.
+///
+/// Nothing about the native students depends on it: the FiLM heads correct
+/// what they produce rather than conditioning what they read. It decides only
+/// whether the emotion block is loaded at all.
 uint32_t declared_style_dim(const VoiceMeta & meta) {
     uint32_t dim = 0;
     if (!gguf_get_u32(meta.ctx, (meta.prefix + "emotion.dim").c_str(), dim)) {
@@ -466,7 +468,7 @@ uint32_t declared_style_dim(const VoiceMeta & meta) {
 }
 
 bool load_acoustic(const VoiceMeta & meta, TensorLoader & loader, Backend & backend,
-                   uint32_t style_dim, SanoAcousticWeights & w, std::string & error) {
+                   SanoAcousticWeights & w, std::string & error) {
     if (!meta.u32("ac.vocab", w.vocab, error) ||
         !meta.u32("ac.hidden", w.hidden, error) ||
         !meta.u32("ac.token_depth", w.token_depth, error) ||
@@ -485,13 +487,10 @@ bool load_acoustic(const VoiceMeta & meta, TensorLoader & loader, Backend & back
     }
 
     const int64_t hidden = static_cast<int64_t>(w.hidden);
-    // The style vector, when there is one, is concatenated to both stages'
-    // features: that is the whole of the acoustic conditioning.
-    const int64_t style = static_cast<int64_t>(style_dim);
     w.embedding     = loader.get("ac.embedding.weight", hidden, w.vocab);
-    w.token_proj_w  = loader.get("ac.token_input_proj.weight", hidden + 2 + style, hidden);
+    w.token_proj_w  = loader.get("ac.token_input_proj.weight", hidden + 2, hidden);
     w.token_proj_b  = loader.get_f32("ac.token_input_proj.bias", hidden);
-    w.frame_proj_w  = loader.get("ac.frame_input_proj.weight", hidden + 3 + style, hidden);
+    w.frame_proj_w  = loader.get("ac.frame_input_proj.weight", hidden + 3, hidden);
     w.frame_proj_b  = loader.get_f32("ac.frame_input_proj.bias", hidden);
     if (!error.empty()) {
         return false;
@@ -507,14 +506,40 @@ bool load_acoustic(const VoiceMeta & meta, TensorLoader & loader, Backend & back
     return error.empty();
 }
 
+/// Reads a tensor to host as F32. The FiLM heads are hundreds to a few
+/// thousand floats each and the arithmetic over them is a matrix-vector
+/// product per token; on the host they cost less than their dispatch would.
+bool read_host(Backend & backend, ggml_tensor * tensor, std::vector<float> & out,
+               const std::string & name, std::string & error) {
+    if (tensor == nullptr) {
+        return false;
+    }
+    if (!tensor_to_f32(backend, tensor, out)) {
+        error = "failed to read the tensor " + name;
+        return false;
+    }
+    for (const float value : out) {
+        if (!std::isfinite(value)) {
+            error = "the tensor " + name + " is not finite";
+            return false;
+        }
+    }
+    return true;
+}
+
 /// The emotion capability, or nothing at all.
 ///
 /// Presence is decided by `emotion.dim`: a voice without that key is a plain
 /// neutral voice and must carry none of the tensors below, which is what keeps
 /// a half-written pack from loading as a voice that silently ignores styles.
-bool load_emotion(const VoiceMeta & meta, TensorLoader & loader,
-                  const SanoDurationWeights & dur, uint32_t dim,
-                  SanoEmotionWeights & w, std::string & error) {
+///
+/// One conditioner drives both heads, so it is loaded once. The acoustic head
+/// reads the latent's channel count, the duration head the frozen duration
+/// model's vocabulary; both are cross-checked against the models themselves
+/// rather than trusted from the metadata alone.
+bool load_emotion(const VoiceMeta & meta, TensorLoader & loader, Backend & backend,
+                  const SanoDurationWeights & dur, const SanoAcousticWeights & ac,
+                  uint32_t dim, SanoEmotionWeights & w, std::string & error) {
     if (dim == 0) {
         if (loader.has_prefix("emo.")) {
             error = meta.where("emotion.dim")
@@ -523,33 +548,165 @@ bool load_emotion(const VoiceMeta & meta, TensorLoader & loader,
         }
         return true;
     }
-    if (!meta.u32("emotion.dur.hidden", w.hidden, error) ||
-        !meta.f32("emotion.dur.max_log_ratio", w.max_log_ratio, error)) {
+    if (!meta.u32("emotion.cond.vocab", w.cond_vocab, error) ||
+        !meta.u32("emotion.cond.hidden", w.cond_hidden, error) ||
+        !meta.u32("emotion.cond.depth", w.cond_depth, error) ||
+        !meta.u32("emotion.cond.kernel", w.cond_kernel, error) ||
+        !meta.u32("emotion.cond.style_code", w.style_code, error) ||
+        !meta.u32("emotion.ac.channels", w.channels, error) ||
+        !meta.u32("emotion.ac.context_rank", w.context_rank, error) ||
+        !meta.u32("emotion.ac.transition_frames", w.transition_frames, error) ||
+        !meta.f32("emotion.ac.frame_gain", w.frame_gain, error) ||
+        !meta.f32("emotion.ac.max_delta", w.max_delta, error) ||
+        !meta.f32("emotion.ac.max_log_gain", w.max_log_gain, error) ||
+        !meta.f32("emotion.ac.context_bound", w.context_bound, error) ||
+        !meta.f32("emotion.ac.donor_projection", w.donor_projection, error) ||
+        !meta.f32("emotion.dur.max_log_ratio", w.max_log_ratio, error) ||
+        !meta.f32("emotion.dur.local_bound", w.local_bound, error)) {
         return false;
     }
     if (!in_range(dim, SANO_MAX_DIM, "emotion.dim", meta, error) ||
-        !in_range(w.hidden, SANO_MAX_DIM, "emotion.dur.hidden", meta, error)) {
+        !in_range(w.cond_vocab, SANO_MAX_DIM, "emotion.cond.vocab", meta, error) ||
+        !in_range(w.cond_hidden, SANO_MAX_DIM, "emotion.cond.hidden", meta, error) ||
+        !in_range(w.cond_depth, SANO_MAX_DEPTH, "emotion.cond.depth", meta, error) ||
+        !odd_kernel(w.cond_kernel, "emotion.cond.kernel", meta, error) ||
+        !in_range(w.style_code, SANO_MAX_DIM, "emotion.cond.style_code", meta, error) ||
+        !in_range(w.channels, SANO_MAX_DIM, "emotion.ac.channels", meta, error) ||
+        !in_range(w.context_rank, SANO_MAX_DIM, "emotion.ac.context_rank", meta, error)) {
         return false;
     }
     w.dim = dim;
+
+    // The heads produce a gain and a shift per latent channel, and the
+    // conditioner has to be able to embed every id either native model can
+    // produce. Neither is stated twice in the file by accident.
+    if (w.channels != ac.out_channels) {
+        error = meta.where("emotion.ac.channels") + " = " + std::to_string(w.channels)
+              + " does not match the acoustic model's "
+              + std::to_string(ac.out_channels) + " output channels";
+        return false;
+    }
+    if (w.cond_vocab < dur.vocab || w.cond_vocab < ac.vocab) {
+        error = meta.where("emotion.cond.vocab") + " = " + std::to_string(w.cond_vocab)
+              + " is narrower than the vocabulary of a model it conditions";
+        return false;
+    }
+    // Every bound below changes what renders without changing a single tensor
+    // shape, so each one is checked against the range its own definition
+    // allows rather than merely for being a number.
+    if (!std::isfinite(w.max_delta) || w.max_delta <= 0.0f) {
+        error = meta.where("emotion.ac.max_delta") + " must be a positive finite bound";
+        return false;
+    }
+    if (!std::isfinite(w.max_log_gain) || w.max_log_gain < 0.0f) {
+        error = meta.where("emotion.ac.max_log_gain") + " must be a nonnegative finite bound";
+        return false;
+    }
+    if (!std::isfinite(w.context_bound) || w.context_bound < 0.0f ||
+        w.context_bound > w.max_delta) {
+        error = meta.where("emotion.ac.context_bound") + " must lie in [0, max_delta]";
+        return false;
+    }
+    if (!std::isfinite(w.donor_projection) || w.donor_projection < 0.0f ||
+        w.donor_projection > 1.0f) {
+        error = meta.where("emotion.ac.donor_projection") + " must lie in [0, 1]";
+        return false;
+    }
+    // The two shape parameters of the frame-adaptive residual. Both are read
+    // rather than defaulted: a pack exported before they existed rendered one
+    // constant residual per phone, and picking a default here would render it
+    // as a voice it was never trained to be.
+    if (!std::isfinite(w.frame_gain) || w.frame_gain < 0.0f || w.frame_gain > 1.0f) {
+        error = meta.where("emotion.ac.frame_gain") + " must lie in [0, 1]";
+        return false;
+    }
+    if (w.transition_frames > SANO_MAX_TRANSITION_FRAMES) {
+        error = meta.where("emotion.ac.transition_frames") + " = "
+              + std::to_string(w.transition_frames) + " exceeds the "
+              + std::to_string(SANO_MAX_TRANSITION_FRAMES) + " frames a crossfade may span";
+        return false;
+    }
     if (!std::isfinite(w.max_log_ratio) || w.max_log_ratio <= 0.0f) {
         error = meta.where("emotion.dur.max_log_ratio")
               + " must be a positive finite bound";
         return false;
     }
+    if (!std::isfinite(w.local_bound) || w.local_bound <= 0.0f ||
+        w.local_bound > w.max_log_ratio) {
+        error = meta.where("emotion.dur.local_bound") + " must lie in (0, max_log_ratio]";
+        return false;
+    }
 
-    const int64_t e_hidden = static_cast<int64_t>(w.hidden);
-    const int64_t dur_hidden = static_cast<int64_t>(dur.hidden);
-    // Every tensor of this branch stays F32: it ends in the same exp/round
-    // step function the neutral duration model does, where an F16 difference
-    // of 1e-3 near a tie changes the frame count.
-    w.input_proj_w = loader.get_f32("emo.dur.input_proj.weight",
-                                    dur_hidden + static_cast<int64_t>(dim), e_hidden);
-    w.input_proj_b = loader.get_f32("emo.dur.input_proj.bias", e_hidden);
-    w.output_w = loader.get_f32("emo.dur.output.weight", e_hidden, 1);
-    w.output_b = loader.get_f32("emo.dur.output.bias", 1);
+    // -- the shared conditioner --------------------------------------------
+    const int64_t hidden = static_cast<int64_t>(w.cond_hidden);
+    const int64_t code = static_cast<int64_t>(w.style_code);
+    const int64_t rank = static_cast<int64_t>(w.context_rank);
+    const int64_t channels = static_cast<int64_t>(w.channels);
+    const int64_t width = static_cast<int64_t>(dim);
+
+    // F32 throughout. The duration half ends in the same `round(exp(x))` step
+    // function the neutral model does, where an F16 difference of 1e-3 near a
+    // tie changes the frame count and the audio length.
+    w.cond_embedding    = loader.get_f32("emo.cond.embedding.weight", hidden, w.cond_vocab);
+    w.cond_input_proj_w = loader.get_f32("emo.cond.input_proj.weight", hidden + 1, hidden);
+    w.cond_input_proj_b = loader.get_f32("emo.cond.input_proj.bias", hidden);
+    w.cond_phrase_w     = loader.get_f32("emo.cond.phrase.weight", 3 * hidden, hidden);
+    w.cond_phrase_b     = loader.get_f32("emo.cond.phrase.bias", hidden);
+    w.cond_norm_w       = loader.get_f32("emo.cond.norm.weight", hidden);
+    w.cond_norm_b       = loader.get_f32("emo.cond.norm.bias", hidden);
     if (!error.empty()) {
         return false;
+    }
+    if (!load_res_blocks(loader, backend, meta.prefix, "emo.cond.blocks", w.cond_depth,
+                         w.cond_hidden, w.cond_kernel, w.cond_blocks, error)) {
+        return false;
+    }
+    // Dilation doubles per level: with two size-3 convolutions a block, depth
+    // 2 reaches thirteen phones. It is an architecture constant, not a field.
+    for (size_t i = 0; i < w.cond_blocks.size(); ++i) {
+        if (i >= 31) {
+            error = meta.where("emotion.cond.depth") + " is too deep to dilate";
+            return false;
+        }
+        w.cond_blocks[i].dilation = static_cast<int32_t>(1u << i);
+    }
+
+    // -- everything the host evaluates -------------------------------------
+    struct HostTensor {
+        const char * suffix;
+        int64_t ne0;
+        int64_t ne1;
+        std::vector<float> * out;
+    };
+    const HostTensor host[] = {
+        {"emo.cond.style.0.weight", width, hidden, &w.style_w0},
+        {"emo.cond.style.2.weight", hidden, code, &w.style_w2},
+        {"emo.cond.axis_gain", width, 1, &w.axis_gain},
+        {"emo.ac.global_film.weight", code, 2 * channels, &w.global_film},
+        {"emo.ac.context_coeff.weight", hidden, rank, &w.context_coeff_w},
+        {"emo.ac.context_coeff.bias", rank, 1, &w.context_coeff_b},
+        {"emo.ac.style_rank.weight", code, rank, &w.style_rank},
+        {"emo.ac.context_basis.weight", rank, 2 * channels, &w.context_basis},
+        {"emo.ac.donor_axis", channels, 1, &w.donor_axis},
+        {"emo.dur.tempo.weight", code, 1, &w.tempo_w},
+        {"emo.dur.style_local.weight", code, hidden, &w.style_local},
+        {"emo.dur.output.weight", hidden, 1, &w.dur_output_w},
+        {"emo.dur.observed_ids", static_cast<int64_t>(dur.vocab), 1, &w.observed_ids},
+    };
+    for (const HostTensor & entry : host) {
+        ggml_tensor * tensor = loader.get_f32(entry.suffix, entry.ne0, entry.ne1);
+        if (!error.empty() ||
+            !read_host(backend, tensor, *entry.out, meta.prefix + entry.suffix, error)) {
+            return false;
+        }
+    }
+    // A mask, not a weight: anything else would silently scale a term the
+    // centering below assumes is either present or absent.
+    for (const float value : w.observed_ids) {
+        if (value != 0.0f && value != 1.0f) {
+            error = meta.where("emotion.dur.observed_ids") + " is not a 0/1 mask";
+            return false;
+        }
     }
 
     // -- the style space ---------------------------------------------------
@@ -987,10 +1144,10 @@ bool SanoArch::load(Model & base_model, std::string & error) {
         }
 
         TensorLoader loader(base_model, info.prefix, declared, error);
-        const uint32_t style_dim = declared_style_dim(info);
         if (!load_duration(info, loader, *backend, voice.dur, error) ||
-            !load_acoustic(info, loader, *backend, style_dim, voice.ac, error) ||
-            !load_emotion(info, loader, voice.dur, style_dim, voice.emo, error)) {
+            !load_acoustic(info, loader, *backend, voice.ac, error) ||
+            !load_emotion(info, loader, *backend, voice.dur, voice.ac,
+                          declared_style_dim(info), voice.emo, error)) {
             return false;
         }
         voice.desc.styles = voice.emo.styles;
@@ -1096,10 +1253,12 @@ SanoGraphBudget sano_duration_budget(const SanoVoice & voice) {
                   SANO_NODES_PER_RES_BLOCK * voice.dur.depth);
 }
 
-SanoGraphBudget sano_duration_residual_budget(const SanoVoice &) {
-    // Two pointwise projections and a SiLU between them: no convolutions at
-    // all, so the frontend's own nodes are the whole graph.
-    return budget(SANO_FRONTEND_BASE_NODES);
+SanoGraphBudget sano_emotion_conditioner_budget(const SanoVoice & voice) {
+    // The frontend's own nodes, the dilated stack, and the phrase summary:
+    // a mean, two views and their transposes, two concatenations, a
+    // projection, a SiLU, the broadcast add and the layer norm.
+    return budget(SANO_FRONTEND_BASE_NODES + 32 +
+                  SANO_NODES_PER_RES_BLOCK * voice.emo.cond_depth);
 }
 
 SanoGraphBudget sano_acoustic_token_budget(const SanoVoice & voice) {
@@ -1188,17 +1347,81 @@ bool SanoArch::resolve_style(const SanoVoice & voice, const std::string & name,
         return false;
     }
 
-    const size_t dim = voice.emo.dim;
-    const float * vector = voice.emo.vectors.data() + static_cast<size_t>(index) * dim;
-    style.name = voice.emo.styles[static_cast<size_t>(index)];
+    const SanoEmotionWeights & emo = voice.emo;
+    const size_t dim = emo.dim;
+    const float * vector = emo.vectors.data() + static_cast<size_t>(index) * dim;
+    style.name = emo.styles[static_cast<size_t>(index)];
     style.vector.assign(vector, vector + dim);
 
-    // The duration residual is zero-initialised in the style vector and every
-    // term is multiplied by it, so a zero vector produces an exactly zero
-    // residual: the declared neutral bypass, taken here by never building the
-    // graph. The acoustic model is conditioned on the vector either way.
+    // Every term of both heads is multiplied by the intensity below, and the
+    // style encoder is biasless and 0-preserving, so a zero vector renders the
+    // base voice bit for bit. That is the declared neutral bypass, taken here
+    // by never building either head rather than by computing zeros.
     style.neutral = std::none_of(style.vector.begin(), style.vector.end(),
                                  [](float value) { return value != 0.0f; });
+    if (style.neutral) {
+        return true;
+    }
+
+    // The loader fills all of these together or rejects the voice; restating
+    // it here is what keeps a hand-built `SanoEmotionWeights` — the tests
+    // build several — a failed request rather than a read past an array.
+    if (emo.axis_gain.size() != dim ||
+        emo.style_w0.size() != dim * emo.cond_hidden ||
+        emo.style_w2.size() != static_cast<size_t>(emo.cond_hidden) * emo.style_code) {
+        error = "voice " + voice.desc.name + " has an incomplete style encoder";
+        return false;
+    }
+
+    // The radial split. Scaling by the largest component first keeps the L1
+    // norm from overflowing on the way, which is the only step here that can:
+    // the direction that comes out is bounded by construction.
+    float peak = 0.0f;
+    for (const float value : style.vector) {
+        peak = std::fmax(peak, std::fabs(value));
+    }
+    std::vector<float> direction(dim);
+    float norm = 0.0f;
+    for (size_t i = 0; i < dim; ++i) {
+        direction[i] = style.vector[i] / (peak > 0.0f ? peak : 1.0f);
+        norm += std::fabs(direction[i]);
+    }
+    const float divisor = std::fmax(norm, 1.0f);
+    float gain = 0.0f;
+    for (size_t i = 0; i < dim; ++i) {
+        direction[i] /= divisor;
+        gain += std::fabs(direction[i]) * emo.axis_gain[i];
+    }
+
+    // Only the direction enters the nonlinear encoder; the amount multiplies
+    // what comes out of it. So half a vector is exactly half the displacement,
+    // and calibrating an axis's gain cannot rotate it into another style.
+    style.amount = peak * norm * gain;
+    if (!std::isfinite(style.amount) || style.amount < 0.0f) {
+        error = "voice " + voice.desc.name + ": style \"" + style.name
+              + "\" has no representable intensity";
+        return false;
+    }
+
+    std::vector<float> inner(emo.cond_hidden, 0.0f);
+    for (size_t h = 0; h < emo.cond_hidden; ++h) {
+        const float * row = emo.style_w0.data() + h * dim;
+        float acc = 0.0f;
+        for (size_t i = 0; i < dim; ++i) {
+            acc += row[i] * direction[i];
+        }
+        acc = acc / (1.0f + std::exp(-acc));  // SiLU
+        inner[h] = acc;
+    }
+    style.code.assign(emo.style_code, 0.0f);
+    for (size_t c = 0; c < emo.style_code; ++c) {
+        const float * row = emo.style_w2.data() + c * emo.cond_hidden;
+        float acc = 0.0f;
+        for (size_t h = 0; h < emo.cond_hidden; ++h) {
+            acc += row[h] * inner[h];
+        }
+        style.code[c] = acc;
+    }
     return true;
 }
 
@@ -1290,20 +1513,34 @@ bool SanoArch::run(const std::vector<uint32_t> & ids, const VoiceDesc & desc,
     probe.n_tokens = static_cast<int64_t>(ids.size());
     probe.frames = frames;
 
-    if (!sano_run_acoustic_token(*this, *voice, ids, probe.durations, style,
+    if (!sano_run_acoustic_token(*this, *voice, ids, probe.durations,
                                  probe.token_ctx, error)) {
         return false;
     }
 
     std::vector<float> frame_input;
     sano_expand_to_frames(probe.token_ctx, probe.n_tokens, voice->ac.hidden,
-                          probe.durations, frames, style.vector, frame_input);
+                          probe.durations, frames, frame_input);
 
     if (!sano_run_acoustic_frame(*this, *voice, frame_input, frames, probe.latent, error)) {
         return false;
     }
     frame_input.clear();
     frame_input.shrink_to_fit();
+
+    // The style reaches the acoustics here and nowhere earlier: the native
+    // model above is the neutral voice unchanged, and the head below is a
+    // bounded correction on the latent it produced. A neutral style skips it
+    // entirely, which is what makes that bypass exact rather than approximate.
+    if (!style.neutral) {
+        std::vector<float> conditioned;
+        if (!sano_run_emotion_conditioner(*this, *voice, ids, voice->ac.vocab,
+                                          "acoustic", conditioned, error) ||
+            !sano_apply_emotion_latent(*voice, probe.durations, style, conditioned,
+                                       frames, probe.latent, error)) {
+            return false;
+        }
+    }
 
     if (desc.decoder == DecoderKind::PiperLite) {
         return sano_run_piperlite(*this, *voice, probe.latent, frames, probe.audio, error);

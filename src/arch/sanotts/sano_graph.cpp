@@ -109,13 +109,18 @@ ggml_tensor * sano_layer_norm(ggml_context * ctx, ggml_tensor * x,
 
 ggml_tensor * sano_res_block(ggml_context * ctx, ggml_tensor * x,
                              const SanoResBlock & block, int64_t channels) {
-    const int padding = block.kernel / 2;
+    const int dilation = block.dilation > 0 ? block.dilation : 1;
+    // "same" padding for a dilated kernel: the reference pads by
+    // `dilation * (kernel // 2)` on both sides.
+    const int padding = dilation * (block.kernel / 2);
 
-    ggml_tensor * t = sano_conv1d(ctx, block.net0_w, x, channels, block.kernel, padding, 1);
+    ggml_tensor * t = sano_conv1d(ctx, block.net0_w, x, channels, block.kernel,
+                                  padding, dilation);
     t = sano_add_channel_bias(ctx, t, block.net0_b);
     t = ggml_silu(ctx, t);
 
-    ggml_tensor * u = sano_conv1d(ctx, block.net2_w, t, channels, block.kernel, padding, 1);
+    ggml_tensor * u = sano_conv1d(ctx, block.net2_w, t, channels, block.kernel,
+                                  padding, dilation);
     u = sano_add_channel_bias(ctx, u, block.net2_b);
 
     return ggml_add(ctx, x, ggml_scale(ctx, u, block.scale));

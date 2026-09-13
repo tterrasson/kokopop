@@ -516,16 +516,56 @@ CONV1D_3D_SUFFIXES = (
 )
 
 
-# `v2` is `v1` plus `inference.emotion`: the same three components, with the
-# style vector concatenated to the acoustic model's two input projections and a
-# residual branch on the duration model. Everything else about the layout —
-# one flat blob, one manifest naming every tensor — is unchanged, so a v2 pack
-# without the emotion block would convert as a v1 pack.
+# `v2` is `v1` plus `inference.emotion`: the same three components, both the
+# acoustic and the duration one wrapping the frozen native student they were
+# trained around, under a `base.` prefix, plus one shared conditioner and two
+# small heads. Everything else about the layout — one flat blob, one manifest
+# naming every tensor — is unchanged, so a v2 pack without the emotion block
+# would convert as a v1 pack.
 PACK_FORMATS = ("roota.raw-fp16.v1", "roota.raw-fp16.v2")
 
 EMOTION_CAPABILITY = "sanofr.utterance-emotion.v1"
-EMOTION_ACOUSTIC_ARCH = "emotion_token_context_v1"
-EMOTION_DURATION_ARCH = "emotion_duration_residual_v1"
+EMOTION_ACOUSTIC_ARCH = "emotion_film_v1"
+EMOTION_DURATION_ARCH = "emotion_duration_context_v1"
+EMOTION_CONDITIONING_CAPABILITY = "sanofr.shared-phrase-film.v2"
+
+# The conditioner's dilated residual blocks: an architecture constant, not a
+# checkpoint field. Dilation doubles per level, so block `i` runs at `2 ** i`.
+CONDITIONER_KERNEL = 3
+
+# Every bound the FiLM heads close on. None of them changes a tensor shape, so
+# a pack that omits one would load and render differently from the model that
+# was trained — which is exactly why the checkpoint is required to spell them
+# out and this converter refuses to guess.
+FILM_BOUNDS = (
+    "context_rank",
+    "max_delta",
+    "max_log_gain",
+    "context_bound",
+    "donor_projection",
+    "frame_gain",
+    "transition_frames",
+)
+
+# What `sanofr.shared-phrase-film.v2` added over `v1`: the residual is no
+# longer one constant per phone. It is evaluated on each frame's own content,
+# `phone_mean + frame_gain * (frame - phone_mean)`, and its endpoints are
+# crossfaded across phone boundaries over at most `transition_frames` frames.
+# A v1 pack carries neither and is refused by capability rather than rendered
+# with a guessed `frame_gain = 0`, which would be a different voice.
+MAX_TRANSITION_FRAMES = 8
+
+# In the pack but never rendered: the per-donor factorizations are a training
+# nuisance term the consensus is centered against, and `domain_scale` is a
+# channel matching used by the loss. `trained_donors` in the manifest is what
+# tells a reader they existed at all.
+TRAINING_ONLY_ACOUSTIC = (
+    "domain_scale",
+    "donor_code.weight",
+    "donor_style.weight",
+    "donor_basis.weight",
+)
+TRAINING_ONLY_DURATION = ("donor_tempo",)
 
 # Tags a writer is likely to reach for, mapped onto the style names the pack
 # actually carries. They are ElevenLabs audio tags because that is what
@@ -604,9 +644,10 @@ def emotion_contract(voice: str, manifest: dict[str, Any]) -> dict[str, Any] | N
             f"{voice}: emotion capability {emotion.get('capability')!r} is not supported "
             f"(only {EMOTION_CAPABILITY!r})"
         )
-    # `paired_residual` carries a different pair of students — a bounded latent
-    # residual with a channel gain and a donor-axis projection — and none of it
-    # is implemented here. Refusing it by name beats reconstructing a graph out
+    # The retired `concat` and `paired_residual` routes carry different pairs of
+    # students — a style vector concatenated to the acoustic projections, or a
+    # bounded latent residual with a donor-axis projection — and neither is
+    # implemented here. Refusing them by name beats reconstructing a graph out
     # of whichever tensors happen to be in the blob.
     if emotion.get("acoustic_architecture") != EMOTION_ACOUSTIC_ARCH:
         raise ConversionError(
@@ -614,15 +655,62 @@ def emotion_contract(voice: str, manifest: dict[str, Any]) -> dict[str, Any] | N
             f"{emotion.get('acoustic_architecture')!r} is not supported "
             f"(only {EMOTION_ACOUSTIC_ARCH!r})"
         )
-    # Same for the duration side: `emotion_duration_context_v1` is a different
-    # student — a global tempo, dilated blocks over the neutral prediction, a
-    # calibrated per-axis gain and a duration-weighted centering — and its
-    # tensors would load into this graph without meaning the same thing.
+    # Same for the duration side: the two heads are trained by one optimizer
+    # around one conditioner, and a duration student from any other route would
+    # load into this graph without meaning the same thing.
     if emotion.get("duration_architecture") != EMOTION_DURATION_ARCH:
         raise ConversionError(
             f"{voice}: emotion duration architecture "
             f"{emotion.get('duration_architecture')!r} is not supported "
             f"(only {EMOTION_DURATION_ARCH!r})"
+        )
+    # The FiLM acoustic head is a correction *on top of* the frozen native
+    # latent, so a zero style vector must be the base voice bit for bit. The
+    # runtime renders neutral by skipping the head entirely; a pack that does
+    # not promise this would render its own neutral differently.
+    if emotion.get("neutral_acoustic_bypass") is not True:
+        raise ConversionError(
+            f"{voice}: the pack does not declare an exact neutral acoustic bypass"
+        )
+    conditioning = emotion.get("conditioning")
+    if (
+        not isinstance(conditioning, dict)
+        or conditioning.get("capability") != EMOTION_CONDITIONING_CAPABILITY
+    ):
+        raise ConversionError(
+            f"{voice}: emotion conditioning "
+            f"{conditioning.get('capability')!r} is not supported "
+            f"(only {EMOTION_CONDITIONING_CAPABILITY!r})"
+            if isinstance(conditioning, dict)
+            else f"{voice}: the emotion block declares no shared conditioner"
+        )
+    context_rank = conditioning.get("context_rank")
+    if not isinstance(context_rank, int) or isinstance(context_rank, bool) or context_rank < 1:
+        raise ConversionError(
+            f"{voice}: conditioning context_rank {context_rank!r} is not a positive integer"
+        )
+    # The two v2 shape parameters. Declared in the manifest *and* in the
+    # acoustic checkpoint below, and required to agree: the manifest is what a
+    # reader negotiates on, the checkpoint is what was trained.
+    frame_gain = conditioning.get("frame_gain")
+    if (
+        isinstance(frame_gain, bool)
+        or not isinstance(frame_gain, (int, float))
+        or not math.isfinite(float(frame_gain))
+        or not 0.0 <= float(frame_gain) <= 1.0
+    ):
+        raise ConversionError(
+            f"{voice}: conditioning frame_gain {frame_gain!r} must lie in [0, 1]"
+        )
+    transition_frames = conditioning.get("transition_frames")
+    if (
+        not isinstance(transition_frames, int)
+        or isinstance(transition_frames, bool)
+        or not 0 <= transition_frames <= MAX_TRANSITION_FRAMES
+    ):
+        raise ConversionError(
+            f"{voice}: conditioning transition_frames {transition_frames!r} must be an "
+            f"integer in [0, {MAX_TRANSITION_FRAMES}]"
         )
     if emotion.get("rounding") != "nearest-even-clamp-1-max_duration":
         raise ConversionError(
@@ -632,20 +720,6 @@ def emotion_contract(voice: str, manifest: dict[str, Any]) -> dict[str, Any] | N
     if emotion.get("neutral_duration_bypass") is not True:
         raise ConversionError(
             f"{voice}: the pack does not declare an exact neutral duration bypass"
-        )
-    prosody = emotion.get("prosody")
-    if isinstance(prosody, dict):
-        # A declared post-decoder pitch/level shift. kokopop does not apply it,
-        # so a pack that *requires* it would render a voice missing an axis.
-        if prosody.get("required"):
-            raise ConversionError(
-                f"{voice}: the pack requires the post-decoder prosody effect "
-                f"({prosody.get('capability')!r}), which kokopop does not apply"
-            )
-        logger.warning(
-            "%s: ignoring the optional post-decoder prosody effect (%s); the styles "
-            "will render without their declared pitch and level shift",
-            voice, prosody.get("capability"),
         )
     max_log_ratio = float(emotion.get("max_log_ratio") or 0.0)
     if not math.isfinite(max_log_ratio) or max_log_ratio <= 0.0:
@@ -660,6 +734,9 @@ def emotion_contract(voice: str, manifest: dict[str, Any]) -> dict[str, Any] | N
         "vectors": vectors,
         "default": default,
         "max_log_ratio": max_log_ratio,
+        "context_rank": int(context_rank),
+        "frame_gain": float(frame_gain),
+        "transition_frames": int(transition_frames),
     }
 
 
@@ -873,6 +950,10 @@ class VoiceBuild:
 
     # Parameter count the source declares, or 0 when it declares none.
     declared_parameters: int = 0
+    # Elements the source carries that this file deliberately does not emit:
+    # the duration component's copy of the shared conditioner, and the emotion
+    # terms that only exist while the pack is being trained.
+    skipped_parameters: int = 0
 
     def element_count(self) -> int:
         return int(sum(t.data.size for t in self.tensors))
@@ -902,12 +983,15 @@ def build_piperlite_voice(
     dec_cfg = pack.component("decoder")["config"]
     emotion = emotion_contract(name, manifest)
 
-    # An emotion pack wraps the neutral duration model it was trained around:
-    # the shapes come from its `base_config` and its tensors are under `base.`,
-    # while the acoustic model is the same module widened by the style vector.
+    # An emotion pack wraps *both* native students it was trained around: each
+    # component's shapes come from its own `base_config` and its frozen tensors
+    # live under `base.`, with the shared conditioner and the two style heads
+    # beside them. The native models themselves are untouched — the emotion
+    # reaches the latent as a correction on the finished output, not as extra
+    # input channels — so the neutral graphs below are the same either way.
     dur_base_cfg = dur_cfg["base_config"] if emotion else dur_cfg
-    dur_prefix = "base." if emotion else ""
-    style_dim = emotion["dim"] if emotion else 0
+    ac_base_cfg = ac_cfg["base_config"] if emotion else ac_cfg
+    base_prefix = "base." if emotion else ""
 
     # -- refuse what the runtime does not implement -------------------------
     if emotion and str(dur_cfg.get("architecture")) != EMOTION_DURATION_ARCH:
@@ -915,15 +999,20 @@ def build_piperlite_voice(
             f"{name}: duration checkpoint declares {dur_cfg.get('architecture')!r} while "
             f"the manifest declares {EMOTION_DURATION_ARCH!r}"
         )
+    if emotion and str(ac_cfg.get("architecture")) != EMOTION_ACOUSTIC_ARCH:
+        raise ConversionError(
+            f"{name}: acoustic checkpoint declares {ac_cfg.get('architecture')!r} while "
+            f"the manifest declares {EMOTION_ACOUSTIC_ARCH!r}"
+        )
     if str(dur_base_cfg.get("architecture")) != "duration_conv":
         raise ConversionError(
             f"{name}: duration architecture {dur_base_cfg.get('architecture')!r} is not "
             "supported (only 'duration_conv')"
         )
-    if str(ac_cfg.get("architecture")) != (EMOTION_ACOUSTIC_ARCH if emotion else "token_context"):
+    if str(ac_base_cfg.get("architecture")) != "token_context":
         raise ConversionError(
-            f"{name}: acoustic architecture {ac_cfg.get('architecture')!r} is not supported "
-            f"(only {EMOTION_ACOUSTIC_ARCH if emotion else 'token_context'!r})"
+            f"{name}: acoustic architecture {ac_base_cfg.get('architecture')!r} is not "
+            "supported (only 'token_context')"
         )
     if str(dec_cfg.get("variant")) != "piperlite":
         raise ConversionError(
@@ -968,12 +1057,12 @@ def build_piperlite_voice(
     dur_hidden = int(dur_base_cfg["hidden"])
     dur_depth = int(dur_base_cfg["depth"])
     dur_kernel = int(dur_base_cfg.get("kernel_size") or 5)
-    ac_vocab = int(ac_cfg["vocab_size"])
-    ac_hidden = int(ac_cfg["hidden"])
-    ac_depth = int(ac_cfg["depth"])
-    ac_token_depth = int(ac_cfg["token_depth"])
-    ac_kernel = int(ac_cfg.get("kernel_size") or 5)
-    ac_out = int(ac_cfg["out_channels"])
+    ac_vocab = int(ac_base_cfg["vocab_size"])
+    ac_hidden = int(ac_base_cfg["hidden"])
+    ac_depth = int(ac_base_cfg["depth"])
+    ac_token_depth = int(ac_base_cfg["token_depth"])
+    ac_kernel = int(ac_base_cfg.get("kernel_size") or 5)
+    ac_out = int(ac_base_cfg["out_channels"])
     channels = [int(c) for c in dec_cfg["channels"][:4]]
 
     build = VoiceBuild(
@@ -1046,7 +1135,7 @@ def build_piperlite_voice(
         VoiceTensor(
             "dur.embedding.weight",
             expect(
-                take(dur_tensors, dur_prefix + "embedding.weight", "duration"),
+                take(dur_tensors, base_prefix + "embedding.weight", "duration"),
                 (dur_vocab, dur_hidden),
                 "dur.embedding.weight",
             ),
@@ -1059,7 +1148,7 @@ def build_piperlite_voice(
             flatten_conv1d(
                 "dur.input_proj.weight",
                 expect(
-                    take(dur_tensors, dur_prefix + "input_proj.weight", "duration"),
+                    take(dur_tensors, base_prefix + "input_proj.weight", "duration"),
                     (dur_hidden, dur_hidden + 3, 1),
                     "dur.input_proj.weight",
                 ),
@@ -1070,7 +1159,7 @@ def build_piperlite_voice(
         VoiceTensor(
             "dur.input_proj.bias",
             expect(
-                take(dur_tensors, dur_prefix + "input_proj.bias", "duration"),
+                take(dur_tensors, base_prefix + "input_proj.bias", "duration"),
                 (dur_hidden,),
                 "dur.input_proj.bias",
             ),
@@ -1078,7 +1167,7 @@ def build_piperlite_voice(
         )
     )
     _add_residual_blocks(
-        build, name, dur_tensors, dur_prefix + "blocks", "dur.blocks",
+        build, name, dur_tensors, base_prefix + "blocks", "dur.blocks",
         dur_depth, dur_hidden, dur_kernel,
     )
     # dur.output stays F32 and its matmul runs on CPU: round(exp(x)) is a step
@@ -1090,7 +1179,7 @@ def build_piperlite_voice(
             flatten_conv1d(
                 "dur.output.weight",
                 expect(
-                    take(dur_tensors, dur_prefix + "output.weight", "duration"),
+                    take(dur_tensors, base_prefix + "output.weight", "duration"),
                     (1, dur_hidden, 1),
                     "dur.output.weight",
                 ),
@@ -1102,7 +1191,7 @@ def build_piperlite_voice(
         VoiceTensor(
             "dur.output.bias",
             expect(
-                take(dur_tensors, dur_prefix + "output.bias", "duration"),
+                take(dur_tensors, base_prefix + "output.bias", "duration"),
                 (1,),
                 "dur.output.bias",
             ),
@@ -1115,7 +1204,7 @@ def build_piperlite_voice(
         VoiceTensor(
             "ac.embedding.weight",
             expect(
-                take(ac_tensors, "embedding.weight", "acoustic"),
+                take(ac_tensors, base_prefix + "embedding.weight", "acoustic"),
                 (ac_vocab, ac_hidden),
                 "ac.embedding.weight",
             ),
@@ -1132,8 +1221,8 @@ def build_piperlite_voice(
                 flatten_conv1d(
                     f"{dst}.weight",
                     expect(
-                        take(ac_tensors, f"{src}.weight", "acoustic"),
-                        (ac_hidden, ac_hidden + extra + style_dim, 1),
+                        take(ac_tensors, base_prefix + f"{src}.weight", "acoustic"),
+                        (ac_hidden, ac_hidden + extra, 1),
                         f"{dst}.weight",
                     ),
                 ),
@@ -1143,7 +1232,7 @@ def build_piperlite_voice(
             VoiceTensor(
                 f"{dst}.bias",
                 expect(
-                    take(ac_tensors, f"{src}.bias", "acoustic"),
+                    take(ac_tensors, base_prefix + f"{src}.bias", "acoustic"),
                     (ac_hidden,),
                     f"{dst}.bias",
                 ),
@@ -1151,11 +1240,11 @@ def build_piperlite_voice(
             )
         )
     _add_residual_blocks(
-        build, name, ac_tensors, "token_blocks", "ac.token_blocks",
+        build, name, ac_tensors, base_prefix + "token_blocks", "ac.token_blocks",
         ac_token_depth, ac_hidden, ac_kernel,
     )
     _add_residual_blocks(
-        build, name, ac_tensors, "frame_blocks", "ac.frame_blocks",
+        build, name, ac_tensors, base_prefix + "frame_blocks", "ac.frame_blocks",
         ac_depth, ac_hidden, ac_kernel,
     )
     add(
@@ -1164,7 +1253,7 @@ def build_piperlite_voice(
             flatten_conv1d(
                 "ac.output.weight",
                 expect(
-                    take(ac_tensors, "output.weight", "acoustic"),
+                    take(ac_tensors, base_prefix + "output.weight", "acoustic"),
                     (ac_out, ac_hidden, 1),
                     "ac.output.weight",
                 ),
@@ -1174,7 +1263,7 @@ def build_piperlite_voice(
     add(
         VoiceTensor(
             "ac.output.bias",
-            expect(take(ac_tensors, "output.bias", "acoustic"), (ac_out,), "ac.output.bias"),
+            expect(take(ac_tensors, base_prefix + "output.bias", "acoustic"), (ac_out,), "ac.output.bias"),
             f32=True,
         )
     )
@@ -1272,7 +1361,8 @@ def build_piperlite_voice(
 
     if emotion:
         _add_emotion(
-            build, name, emotion, dur_cfg, dur_tensors, dur_hidden, style_aliases,
+            build, name, emotion, ac_cfg, ac_tensors, dur_cfg, dur_tensors,
+            dur_vocab, ac_out, style_aliases,
         )
 
     build.sources = {
@@ -1291,56 +1381,232 @@ def _add_emotion(
     build: VoiceBuild,
     voice: str,
     emotion: dict[str, Any],
+    ac_cfg: dict[str, Any],
+    ac_tensors: dict[str, np.ndarray],
     dur_cfg: dict[str, Any],
     dur_tensors: dict[str, np.ndarray],
-    dur_hidden: int,
+    dur_vocab: int,
+    channels: int,
     style_aliases: dict[str, str] | None,
 ) -> None:
-    """The style space, and the duration model's style residual.
+    """The style space, the shared conditioner, and the two FiLM heads.
 
-    The acoustic side needs nothing here: its two input projections are already
-    `style_dim` channels wider, and the runtime fills those rows with the style
-    vector. The duration side is a separate branch on top of the frozen neutral
-    model — `tanh(output(silu(input_proj([embedding; style])))) * max_log_ratio`,
-    both projections pointwise — so all of its tensors are new.
+    Neither native student is touched: the emotion is a feature-wise affine
+    transform, predicted per phone and evaluated on each frame of the latent
+    the frozen acoustic model already produced, plus a
+    tempo-and-redistribution term on the frozen duration model's own log
+    predictions. One conditioner drives both, so it is
+    emitted once and cross-checked against the copy the duration component
+    carries — which is the contract `sanofr`'s `validate_pair` enforces on the
+    checkpoints, restated on the tensors that actually ship.
+
+    Everything here is F32. The duration half ends in the same `round(exp(x))`
+    step function the neutral model does, where an F16 difference of 1e-3 near
+    a tie changes the frame count; the acoustic half is small enough that the
+    bandwidth is invisible.
     """
     dim = int(emotion["dim"])
     styles = list(emotion["styles"])
-    hidden = int(dur_cfg["hidden"])
+
+    # -- the shared conditioner's dimensions -------------------------------
+    cond_cfg = ac_cfg.get("conditioner")
+    if not isinstance(cond_cfg, dict) or cond_cfg != dur_cfg.get("conditioner"):
+        raise ConversionError(
+            f"{voice}: the acoustic and duration checkpoints do not declare the "
+            "same shared conditioner"
+        )
+    cond_vocab = int(cond_cfg["vocab_size"])
+    cond_hidden = int(cond_cfg["hidden"])
+    cond_depth = int(cond_cfg["depth"])
+    style_code = int(cond_cfg["style_code"])
+    if int(cond_cfg["dim"]) != dim:
+        raise ConversionError(
+            f"{voice}: the conditioner is {cond_cfg['dim']}-dimensional and the style "
+            f"space is {dim}-dimensional"
+        )
+    if min(cond_vocab, cond_hidden, cond_depth, style_code) < 1:
+        raise ConversionError(f"{voice}: the shared conditioner has a nonpositive dimension")
+
+    # -- the bounds both heads close on ------------------------------------
+    film = ac_cfg.get("film")
+    if not isinstance(film, dict):
+        raise ConversionError(f"{voice}: the acoustic checkpoint declares no FiLM bounds")
+    missing = [key for key in FILM_BOUNDS if key not in film]
+    if missing:
+        raise ConversionError(
+            f"{voice}: the acoustic checkpoint does not declare its FiLM bounds "
+            f"({', '.join(missing)}); the pack was exported from a checkpoint this "
+            "runtime cannot render faithfully"
+        )
+    context_rank = int(film["context_rank"])
+    max_delta = float(film["max_delta"])
+    max_log_gain = float(film["max_log_gain"])
+    context_bound = float(film["context_bound"])
+    donor_projection = float(film["donor_projection"])
+    frame_gain = float(film["frame_gain"])
+    transition_frames = film["transition_frames"]
+    if context_rank != emotion["context_rank"]:
+        raise ConversionError(
+            f"{voice}: the acoustic checkpoint factorizes the context at rank "
+            f"{context_rank} and the manifest declares {emotion['context_rank']}"
+        )
+    if not (math.isfinite(max_delta) and max_delta > 0):
+        raise ConversionError(f"{voice}: emotion max_delta {max_delta!r} must be positive")
+    if not (math.isfinite(max_log_gain) and max_log_gain >= 0):
+        raise ConversionError(
+            f"{voice}: emotion max_log_gain {max_log_gain!r} must be nonnegative"
+        )
+    if not (math.isfinite(context_bound) and 0 <= context_bound <= max_delta):
+        raise ConversionError(
+            f"{voice}: emotion context_bound {context_bound!r} must lie in [0, max_delta]"
+        )
+    if not (math.isfinite(donor_projection) and 0 <= donor_projection <= 1):
+        raise ConversionError(
+            f"{voice}: emotion donor_projection {donor_projection!r} must lie in [0, 1]"
+        )
+    # Neither of these changes a tensor shape, and both change every frame of
+    # the rendered residual, so a disagreement between what was trained and
+    # what the manifest advertises is a silently different voice.
+    if not (math.isfinite(frame_gain) and 0 <= frame_gain <= 1):
+        raise ConversionError(
+            f"{voice}: emotion frame_gain {frame_gain!r} must lie in [0, 1]"
+        )
+    if (
+        not isinstance(transition_frames, int)
+        or isinstance(transition_frames, bool)
+        or not 0 <= transition_frames <= MAX_TRANSITION_FRAMES
+    ):
+        raise ConversionError(
+            f"{voice}: emotion transition_frames {transition_frames!r} must be an "
+            f"integer in [0, {MAX_TRANSITION_FRAMES}]"
+        )
+    transition_frames = int(transition_frames)
+    if frame_gain != emotion["frame_gain"] or transition_frames != emotion["transition_frames"]:
+        raise ConversionError(
+            f"{voice}: the acoustic checkpoint renders its residual with "
+            f"frame_gain={frame_gain:g}/transition_frames={transition_frames} and the "
+            f"manifest declares frame_gain={emotion['frame_gain']:g}/"
+            f"transition_frames={emotion['transition_frames']}"
+        )
+
     max_log_ratio = float(dur_cfg["max_log_ratio"])
+    local_bound = float(dur_cfg["local_bound"])
     if max_log_ratio != emotion["max_log_ratio"]:
         raise ConversionError(
             f"{voice}: the duration checkpoint bounds the residual at {max_log_ratio:g} "
             f"and the manifest at {emotion['max_log_ratio']:g}"
         )
-    if hidden < 1:
-        raise ConversionError(f"{voice}: emotion duration hidden must be positive")
-
-    def take(key: str, shape: tuple[int, ...]) -> None:
-        if key not in dur_tensors:
-            raise ConversionError(f"{voice}: duration is missing emotion tensor {key!r}")
-        array = dur_tensors[key]
-        if tuple(array.shape) != shape:
-            raise ConversionError(
-                f"{voice}: emo.dur.{key} has shape {tuple(array.shape)}, expected {shape}"
-            )
-        build.tensors.append(
-            VoiceTensor(
-                f"emo.dur.{key}",
-                flatten_conv1d(key, array) if array.ndim == 3 else array,
-                # F32 like the neutral duration model: this branch ends in the
-                # same exp/round step function, where an F16 difference of 1e-3
-                # near a tie changes the frame count and the audio length.
-                f32=True,
-            )
+    if not (math.isfinite(local_bound) and 0 < local_bound <= max_log_ratio):
+        raise ConversionError(
+            f"{voice}: emotion local_bound {local_bound!r} must lie in (0, max_log_ratio]"
         )
 
-    # The style vector is concatenated to the frozen model's token embedding,
-    # so the branch reads `dur_hidden + dim` channels and writes one log ratio.
-    take("input_proj.weight", (hidden, dur_hidden + dim, 1))
-    take("input_proj.bias", (hidden,))
-    take("output.weight", (1, hidden, 1))
-    take("output.bias", (1,))
+    # -- tensors -----------------------------------------------------------
+    def emit(
+        tensors: dict[str, np.ndarray],
+        where: str,
+        key: str,
+        suffix: str,
+        shape: tuple[int, ...],
+    ) -> np.ndarray:
+        if key not in tensors:
+            raise ConversionError(f"{voice}: {where} is missing emotion tensor {key!r}")
+        array = tensors[key]
+        if tuple(array.shape) != shape:
+            raise ConversionError(
+                f"{voice}: {suffix} has shape {tuple(array.shape)}, expected {shape}"
+            )
+        build.tensors.append(
+            VoiceTensor(suffix, flatten_conv1d(key, array) if array.ndim == 3 else array,
+                        f32=True)
+        )
+        return array
+
+    cond = "conditioner."
+    emit(ac_tensors, "acoustic", cond + "embedding.weight",
+         "emo.cond.embedding.weight", (cond_vocab, cond_hidden))
+    # `[embedding; position]`, pointwise: the phrase-relative position of a
+    # token is the one feature the conditioner reads besides its identity.
+    emit(ac_tensors, "acoustic", cond + "input_proj.weight",
+         "emo.cond.input_proj.weight", (cond_hidden, cond_hidden + 1, 1))
+    emit(ac_tensors, "acoustic", cond + "input_proj.bias",
+         "emo.cond.input_proj.bias", (cond_hidden,))
+    # `first`/`second` rather than the native students' `net.0`/`net.2`: the
+    # same block, built directly instead of through a Sequential. Dilation is
+    # not carried — it doubles per level and the runtime derives it.
+    _add_residual_blocks(
+        build, voice, ac_tensors, cond + "blocks", "emo.cond.blocks",
+        cond_depth, cond_hidden, CONDITIONER_KERNEL,
+        names=(("first", "net0"), ("second", "net2")), f32=True,
+    )
+    emit(ac_tensors, "acoustic", cond + "phrase.weight",
+         "emo.cond.phrase.weight", (cond_hidden, 3 * cond_hidden))
+    emit(ac_tensors, "acoustic", cond + "phrase.bias",
+         "emo.cond.phrase.bias", (cond_hidden,))
+    emit(ac_tensors, "acoustic", cond + "norm.weight",
+         "emo.cond.norm.weight", (cond_hidden,))
+    emit(ac_tensors, "acoustic", cond + "norm.bias",
+         "emo.cond.norm.bias", (cond_hidden,))
+    # The style encoder: biasless and 0-preserving at every layer, which is
+    # half of why a zero vector renders the base voice bit for bit.
+    emit(ac_tensors, "acoustic", cond + "style.0.weight",
+         "emo.cond.style.0.weight", (cond_hidden, dim))
+    emit(ac_tensors, "acoustic", cond + "style.2.weight",
+         "emo.cond.style.2.weight", (style_code, cond_hidden))
+    # Calibration: it scales the intensity of an axis, never its direction.
+    emit(ac_tensors, "acoustic", cond + "axis_gain", "emo.cond.axis_gain", (dim,))
+
+    # The acoustic head. `global_film` and `context_basis` both produce the
+    # log-gain and the shift stacked, gain first.
+    emit(ac_tensors, "acoustic", "global_film.weight",
+         "emo.ac.global_film.weight", (2 * channels, style_code))
+    emit(ac_tensors, "acoustic", "context_coeff.weight",
+         "emo.ac.context_coeff.weight", (context_rank, cond_hidden))
+    emit(ac_tensors, "acoustic", "context_coeff.bias",
+         "emo.ac.context_coeff.bias", (context_rank,))
+    emit(ac_tensors, "acoustic", "style_rank.weight",
+         "emo.ac.style_rank.weight", (context_rank, style_code))
+    emit(ac_tensors, "acoustic", "context_basis.weight",
+         "emo.ac.context_basis.weight", (2 * channels, context_rank))
+    # The donor-versus-teacher direction the delta may be projected off, and
+    # zero when this run did not fit one. Only read when `donor_projection` is
+    # nonzero, but always shipped so the two always travel together.
+    emit(ac_tensors, "acoustic", "donor_axis", "emo.ac.donor_axis", (channels,))
+
+    # The duration head: one global log tempo, and a per-token redistribution
+    # that is centered to zero under the neutral model's own attention.
+    emit(dur_tensors, "duration", "tempo.weight", "emo.dur.tempo.weight", (1, style_code))
+    emit(dur_tensors, "duration", "style_local.weight",
+         "emo.dur.style_local.weight", (cond_hidden, style_code))
+    emit(dur_tensors, "duration", "output.weight", "emo.dur.output.weight", (1, cond_hidden))
+    # Which phoneme ids the emotional corpus ever supervised. An id outside it
+    # gets no redistribution at all and is excluded from the centering, so a
+    # rare phone is not moved by a term nothing measured.
+    observed = emit(dur_tensors, "duration", "observed_ids",
+                    "emo.dur.observed_ids", (dur_vocab,))
+    if not np.isin(observed, (0.0, 1.0)).all():
+        raise ConversionError(f"{voice}: emo.dur.observed_ids is not a 0/1 mask")
+
+    # One conditioner, two checkpoints: the duration component carries its own
+    # copy and the runtime loads neither twice, so they have to agree here.
+    for key, array in ac_tensors.items():
+        if not key.startswith(cond):
+            continue
+        other = dur_tensors.get(key)
+        if other is None or not np.array_equal(array, other):
+            raise ConversionError(
+                f"{voice}: {key!r} differs between the acoustic and duration "
+                "components; the pack was not exported from a jointly trained pair"
+            )
+        build.skipped_parameters += int(other.size)
+
+    # Trained, never rendered. Counted so the parameter cross-check below still
+    # matches the source's own total to the element.
+    for names, tensors in ((TRAINING_ONLY_ACOUSTIC, ac_tensors),
+                           (TRAINING_ONLY_DURATION, dur_tensors)):
+        for key in names:
+            if key in tensors:
+                build.skipped_parameters += int(tensors[key].size)
 
     resolved: dict[str, str] = {}
     for alias, style in DEFAULT_STYLE_ALIASES.items():
@@ -1356,8 +1622,30 @@ def _add_emotion(
             raise ConversionError(f"{voice}: --style-alias {alias} is already a style name")
         resolved[alias] = style
 
-    build.scalar_meta.update({"emotion.dim": dim, "emotion.dur.hidden": hidden})
-    build.float_meta["emotion.dur.max_log_ratio"] = max_log_ratio
+    build.scalar_meta.update(
+        {
+            "emotion.dim": dim,
+            "emotion.cond.vocab": cond_vocab,
+            "emotion.cond.hidden": cond_hidden,
+            "emotion.cond.depth": cond_depth,
+            "emotion.cond.kernel": CONDITIONER_KERNEL,
+            "emotion.cond.style_code": style_code,
+            "emotion.ac.channels": channels,
+            "emotion.ac.context_rank": context_rank,
+            "emotion.ac.transition_frames": transition_frames,
+        }
+    )
+    build.float_meta.update(
+        {
+            "emotion.ac.max_delta": max_delta,
+            "emotion.ac.max_log_gain": max_log_gain,
+            "emotion.ac.context_bound": context_bound,
+            "emotion.ac.donor_projection": donor_projection,
+            "emotion.ac.frame_gain": frame_gain,
+            "emotion.dur.max_log_ratio": max_log_ratio,
+            "emotion.dur.local_bound": local_bound,
+        }
+    )
     build.string_meta["emotion.default_style"] = str(emotion["default"])
     build.string_array_meta["emotion.styles"] = styles
     build.string_array_meta["emotion.alias_names"] = sorted(resolved)
@@ -1389,6 +1677,8 @@ def _add_residual_blocks(
     depth: int,
     channels: int,
     kernel: int,
+    names: Sequence[tuple[str, str]] = (("net.0", "net0"), ("net.2", "net2")),
+    f32: bool = False,
 ) -> None:
     for i in range(depth):
         scale_key = f"{src_prefix}.{i}.scale"
@@ -1402,7 +1692,7 @@ def _add_residual_blocks(
         build.tensors.append(
             VoiceTensor(f"{dst_prefix}.{i}.scale", scale.reshape(1), f32=True)
         )
-        for src, dst in (("net.0", "net0"), ("net.2", "net2")):
+        for src, dst in names:
             w_key = f"{src_prefix}.{i}.{src}.weight"
             b_key = f"{src_prefix}.{i}.{src}.bias"
             if w_key not in tensors or b_key not in tensors:
@@ -1414,7 +1704,8 @@ def _add_residual_blocks(
                     f"({channels}, {channels}, {kernel})"
                 )
             build.tensors.append(
-                VoiceTensor(f"{dst_prefix}.{i}.{dst}.weight", flatten_conv1d(w_key, w))
+                VoiceTensor(f"{dst_prefix}.{i}.{dst}.weight", flatten_conv1d(w_key, w),
+                            f32=f32)
             )
             b = tensors[b_key]
             if tuple(b.shape) != (channels,):
@@ -2220,13 +2511,16 @@ def check_parameter_count(build: VoiceBuild) -> None:
         )
         return
     actual = build.element_count()
-    if actual != build.declared_parameters:
+    total = actual + build.skipped_parameters
+    if total != build.declared_parameters:
         raise ConversionError(
-            f"{build.name}: reconstructed {actual} parameters, the source declares "
-            f"{build.declared_parameters} (difference {actual - build.declared_parameters:+d}); "
-            "a tensor is missing, mis-shaped, or still carries export padding"
+            f"{build.name}: reconstructed {total} parameters ({actual} emitted, "
+            f"{build.skipped_parameters} deliberately dropped), the source declares "
+            f"{build.declared_parameters} (difference {total - build.declared_parameters:+d}); "
+            "a tensor is missing, mis-shaped, still carries export padding, or is a "
+            "training-only term this converter does not know to drop"
         )
-    logger.info("%s: %d parameters, matching the source", build.name, actual)
+    logger.info("%s: %d parameters, matching the source", build.name, total)
 
 
 def check_unique(builds: Sequence[VoiceBuild]) -> None:

@@ -701,16 +701,31 @@ def emotion_manifest(**overrides) -> dict:
     emotion = {
         "capability": "sanofr.utterance-emotion.v1",
         "style_space": style_space(),
-        "acoustic_architecture": "emotion_token_context_v1",
-        "duration_architecture": "emotion_duration_residual_v1",
+        "acoustic_architecture": "emotion_film_v1",
+        "duration_architecture": "emotion_duration_context_v1",
         "max_log_ratio": 0.6931471805599453,
         "neutral_duration_bypass": True,
-        "neutral_acoustic_bypass": False,
+        "neutral_acoustic_bypass": True,
         "rounding": "nearest-even-clamp-1-max_duration",
         "max_duration": 80,
+        "shared_conditioner_id": "0" * 64,
+        "conditioning": {
+            "capability": "sanofr.shared-phrase-film.v2",
+            "required": True,
+            "context_rank": 3,
+            "frame_gain": 0.25,
+            "transition_frames": 2,
+        },
+        "trained_donors": ["jessica"],
     }
     emotion.update(overrides)
     return {"inference": {"emotion": emotion}}
+
+
+def conditioning(**overrides) -> dict:
+    block = dict(emotion_manifest()["inference"]["emotion"]["conditioning"])
+    block.update(overrides)
+    return {k: v for k, v in block.items() if v is not None}
 
 
 def test_emotion_contract_reads_the_style_space() -> None:
@@ -719,6 +734,9 @@ def test_emotion_contract_reads_the_style_space() -> None:
     assert contract["styles"] == ["neutral", "sad", "laughing"]
     assert contract["vectors"] == [0.0, 0.0, 0.0, 1.0, 1.0, 0.0]
     assert contract["default"] == "neutral"
+    assert contract["context_rank"] == 3
+    assert contract["frame_gain"] == 0.25
+    assert contract["transition_frames"] == 2
 
 
 def test_a_pack_without_an_emotion_block_is_a_neutral_pack() -> None:
@@ -729,19 +747,47 @@ def test_a_pack_without_an_emotion_block_is_a_neutral_pack() -> None:
     "overrides, message",
     [
         ({"capability": "sanofr.utterance-emotion.v2"}, "capability"),
-        # The paired route is a different pair of students; reconstructing it
-        # from whichever tensors are in the blob is exactly what must not happen.
-        ({"acoustic_architecture": "emotion_paired_residual_v1"}, "acoustic architecture"),
-        ({"duration_architecture": "emotion_duration_context_v1"}, "duration architecture"),
+        # The retired routes are different pairs of students; reconstructing
+        # one from whichever tensors are in the blob is exactly what must not
+        # happen.
+        ({"acoustic_architecture": "emotion_token_context_v1"}, "acoustic architecture"),
+        ({"duration_architecture": "emotion_duration_residual_v1"}, "duration architecture"),
         ({"rounding": "floor"}, "rounding"),
         ({"neutral_duration_bypass": False}, "neutral duration bypass"),
+        ({"neutral_acoustic_bypass": False}, "neutral acoustic bypass"),
         ({"max_log_ratio": 0.0}, "max_log_ratio"),
-        # A declared post-decoder effect this runtime cannot apply. Optional is
-        # a warning; required is a voice missing an axis, so it is refused.
+        # The conditioner is the whole of what drives both heads. A pack that
+        # does not name it has not said what the tensors in the blob mean.
+        ({"conditioning": None}, "no shared conditioner"),
         (
-            {"prosody": {"capability": "sanofr.post-decoder-prosody.v1", "required": True}},
-            "post-decoder prosody",
+            {"conditioning": {"capability": "sanofr.phrase-film.v2", "context_rank": 3}},
+            "conditioning",
         ),
+        # `v1` predicted one constant residual per phone. Its weights load into
+        # the v2 graph and render a different voice, so the pack is refused by
+        # capability rather than read with a guessed frame_gain.
+        (
+            {
+                "conditioning": {
+                    "capability": "sanofr.shared-phrase-film.v1",
+                    "context_rank": 3,
+                    "frame_gain": 0.25,
+                    "transition_frames": 2,
+                }
+            },
+            "conditioning",
+        ),
+        (
+            {"conditioning": conditioning(context_rank=0)},
+            "context_rank",
+        ),
+        # Both v2 parameters change every frame of the residual without
+        # changing a tensor shape, so neither may be absent or out of range.
+        ({"conditioning": conditioning(frame_gain=None)}, "frame_gain"),
+        ({"conditioning": conditioning(frame_gain=1.5)}, "frame_gain"),
+        ({"conditioning": conditioning(transition_frames=None)}, "transition_frames"),
+        ({"conditioning": conditioning(transition_frames=9)}, "transition_frames"),
+        ({"conditioning": conditioning(transition_frames=1.0)}, "transition_frames"),
     ],
 )
 def test_emotion_contract_refuses_what_the_runtime_does_not_implement(
@@ -749,16 +795,6 @@ def test_emotion_contract_refuses_what_the_runtime_does_not_implement(
 ) -> None:
     with pytest.raises(conv.ConversionError, match=message):
         conv.emotion_contract("v", emotion_manifest(**overrides))
-
-
-def test_an_optional_prosody_effect_is_ignored_rather_than_refused() -> None:
-    contract = conv.emotion_contract(
-        "v",
-        emotion_manifest(
-            prosody={"capability": "sanofr.post-decoder-prosody.v1", "required": False}
-        ),
-    )
-    assert contract["dim"] == 2
 
 
 @pytest.mark.parametrize(
@@ -769,8 +805,8 @@ def test_an_optional_prosody_effect_is_ignored_rather_than_refused() -> None:
         ({"vectors": {"sad": [0.0, 1.0]}}, "no 'neutral' vector"),
         ({"vectors": {"neutral": [0.0, 0.0], "sad": [1.0]}}, "width 2"),
         ({"vectors": {"neutral": [0.0, 0.0], "sad": [0.0, float("nan")]}}, "nonfinite"),
-        # The runtime bypasses the duration branch on the neutral vector, and
-        # every caller reads "neutral" as "the voice the baseline trained".
+        # The runtime bypasses both heads on the neutral vector, and every
+        # caller reads "neutral" as "the voice the baseline trained".
         ({"vectors": {"neutral": [0.1, 0.0]}}, "not exactly zero"),
         ({"default": "wistful"}, "default style"),
     ],
@@ -780,58 +816,216 @@ def test_style_space_validation(overrides, message) -> None:
         conv.validate_style_space("v", style_space(**overrides))
 
 
-def emotion_tensors(dim: int = 2, hidden: int = 4,
-                    dur_hidden: int = 8) -> dict[str, np.ndarray]:
+# The dimensions of the hand-built pack below. Every one is distinct, so a
+# transposed or mis-sized tensor cannot pass by coincidence.
+EMO_DIM = 2
+EMO_COND_VOCAB = 12
+EMO_COND_HIDDEN = 4
+EMO_COND_DEPTH = 2
+EMO_STYLE_CODE = 5
+EMO_RANK = 3
+EMO_CHANNELS = 7
+EMO_DUR_VOCAB = 10
+
+
+def emotion_conditioner() -> dict[str, np.ndarray]:
+    def full(*shape):
+        return np.full(shape, 0.25, dtype=np.float32)
+
+    tensors = {
+        "conditioner.embedding.weight": full(EMO_COND_VOCAB, EMO_COND_HIDDEN),
+        "conditioner.input_proj.weight": full(EMO_COND_HIDDEN, EMO_COND_HIDDEN + 1, 1),
+        "conditioner.input_proj.bias": full(EMO_COND_HIDDEN),
+        "conditioner.phrase.weight": full(EMO_COND_HIDDEN, 3 * EMO_COND_HIDDEN),
+        "conditioner.phrase.bias": full(EMO_COND_HIDDEN),
+        "conditioner.norm.weight": full(EMO_COND_HIDDEN),
+        "conditioner.norm.bias": full(EMO_COND_HIDDEN),
+        "conditioner.style.0.weight": full(EMO_COND_HIDDEN, EMO_DIM),
+        "conditioner.style.2.weight": full(EMO_STYLE_CODE, EMO_COND_HIDDEN),
+        "conditioner.axis_gain": full(EMO_DIM),
+    }
+    for i in range(EMO_COND_DEPTH):
+        for part in ("first", "second"):
+            tensors[f"conditioner.blocks.{i}.{part}.weight"] = full(
+                EMO_COND_HIDDEN, EMO_COND_HIDDEN, conv.CONDITIONER_KERNEL
+            )
+            tensors[f"conditioner.blocks.{i}.{part}.bias"] = full(EMO_COND_HIDDEN)
+        tensors[f"conditioner.blocks.{i}.scale"] = np.float32(0.1).reshape(())
+    return tensors
+
+
+def emotion_acoustic_tensors() -> dict[str, np.ndarray]:
     def full(*shape):
         return np.full(shape, 0.25, dtype=np.float32)
 
     return {
-        "input_proj.weight": full(hidden, dur_hidden + dim, 1),
-        "input_proj.bias": full(hidden),
-        "output.weight": full(1, hidden, 1),
-        "output.bias": full(1),
+        **emotion_conditioner(),
+        "global_film.weight": full(2 * EMO_CHANNELS, EMO_STYLE_CODE),
+        "context_coeff.weight": full(EMO_RANK, EMO_COND_HIDDEN),
+        "context_coeff.bias": full(EMO_RANK),
+        "style_rank.weight": full(EMO_RANK, EMO_STYLE_CODE),
+        "context_basis.weight": full(2 * EMO_CHANNELS, EMO_RANK),
+        "donor_axis": np.zeros(EMO_CHANNELS, dtype=np.float32),
+        # Trained, never rendered.
+        "domain_scale": np.ones(EMO_CHANNELS, dtype=np.float32),
     }
 
 
-def emotion_build(style_aliases=None, dur_cfg_overrides=None, tensors=None):
+def emotion_duration_tensors() -> dict[str, np.ndarray]:
+    def full(*shape):
+        return np.full(shape, 0.25, dtype=np.float32)
+
+    return {
+        **emotion_conditioner(),
+        "tempo.weight": full(1, EMO_STYLE_CODE),
+        "donor_tempo": np.zeros((1, EMO_STYLE_CODE), dtype=np.float32),
+        "style_local.weight": full(EMO_COND_HIDDEN, EMO_STYLE_CODE),
+        "output.weight": full(1, EMO_COND_HIDDEN),
+        "observed_ids": np.ones(EMO_DUR_VOCAB, dtype=np.float32),
+    }
+
+
+def emotion_build(
+    style_aliases=None,
+    ac_cfg_overrides=None,
+    dur_cfg_overrides=None,
+    ac_tensors=None,
+    dur_tensors=None,
+):
     build = conv.VoiceBuild(
         name="fr", aliases=[], sample_rate=22050, length_scale=1.0,
         espeak_voice="roa/fr", normalization_lang="a", frontend="piper",
         decoder="piperlite", max_tokens=510, token_symbols=[], token_ids=[],
         bos_id=0, eos_id=1, pad_id=2, fallback_id=3,
     )
-    dur_cfg = {"hidden": 4, "max_log_ratio": 0.6931471805599453}
+    conditioner = {
+        "vocab_size": EMO_COND_VOCAB,
+        "dim": EMO_DIM,
+        "hidden": EMO_COND_HIDDEN,
+        "depth": EMO_COND_DEPTH,
+        "style_code": EMO_STYLE_CODE,
+    }
+    ac_cfg = {
+        "conditioner": dict(conditioner),
+        "film": {
+            "context_rank": EMO_RANK,
+            "max_delta": 1.0,
+            "max_log_gain": 0.3,
+            "context_bound": 0.25,
+            "donor_projection": 0.0,
+            "frame_gain": 0.25,
+            "transition_frames": 2,
+            "donors": ["jessica"],
+            "donor_rank": 4,
+            "donor_bound": 0.15,
+        },
+    }
+    ac_cfg.update(ac_cfg_overrides or {})
+    dur_cfg = {
+        "conditioner": dict(conditioner),
+        "max_log_ratio": 0.6931471805599453,
+        "local_bound": 0.2,
+    }
     dur_cfg.update(dur_cfg_overrides or {})
     conv._add_emotion(
-        build, "fr", conv.emotion_contract("fr", emotion_manifest()), dur_cfg,
-        emotion_tensors() if tensors is None else tensors, 8, style_aliases,
+        build, "fr", conv.emotion_contract("fr", emotion_manifest()),
+        ac_cfg,
+        emotion_acoustic_tensors() if ac_tensors is None else ac_tensors,
+        dur_cfg,
+        emotion_duration_tensors() if dur_tensors is None else dur_tensors,
+        EMO_DUR_VOCAB, EMO_CHANNELS, style_aliases,
     )
     return build
 
 
-def test_emotion_emits_the_residual_branch_and_the_style_space() -> None:
+def test_emotion_emits_one_conditioner_two_heads_and_the_style_space() -> None:
     build = emotion_build()
     names = {t.suffix for t in build.tensors}
-    assert names == {
-        "emo.dur.input_proj.weight", "emo.dur.input_proj.bias",
-        "emo.dur.output.weight", "emo.dur.output.bias",
+    expected = {
+        "emo.cond.embedding.weight",
+        "emo.cond.input_proj.weight", "emo.cond.input_proj.bias",
+        "emo.cond.phrase.weight", "emo.cond.phrase.bias",
+        "emo.cond.norm.weight", "emo.cond.norm.bias",
+        "emo.cond.style.0.weight", "emo.cond.style.2.weight",
+        "emo.cond.axis_gain",
+        "emo.ac.global_film.weight",
+        "emo.ac.context_coeff.weight", "emo.ac.context_coeff.bias",
+        "emo.ac.style_rank.weight", "emo.ac.context_basis.weight",
+        "emo.ac.donor_axis",
+        "emo.dur.tempo.weight", "emo.dur.style_local.weight",
+        "emo.dur.output.weight", "emo.dur.observed_ids",
     }
-    # Every tensor of the branch is F32: it ends in the same exp/round step
-    # function the neutral duration model does.
+    for i in range(EMO_COND_DEPTH):
+        expected |= {
+            f"emo.cond.blocks.{i}.scale",
+            f"emo.cond.blocks.{i}.net0.weight", f"emo.cond.blocks.{i}.net0.bias",
+            f"emo.cond.blocks.{i}.net2.weight", f"emo.cond.blocks.{i}.net2.bias",
+        }
+    assert names == expected
+    # Every tensor is F32: the duration half ends in the same exp/round step
+    # function the neutral model does.
     assert all(t.f32 for t in build.tensors)
 
     by_name = {t.suffix: t for t in build.tensors}
-    # [OC, IC, K] flattened to [OC, IC*K], kokopop's kernel layout. The input
-    # is the frozen embedding widened by the style vector.
-    assert by_name["emo.dur.input_proj.weight"].data.shape == (4, 10)
-    assert by_name["emo.dur.output.weight"].data.shape == (1, 4)
+    # [OC, IC, K] flattened to [OC, IC*K], kokopop's kernel layout.
+    assert by_name["emo.cond.input_proj.weight"].data.shape == (EMO_COND_HIDDEN,
+                                                               EMO_COND_HIDDEN + 1)
+    assert by_name["emo.cond.blocks.0.net0.weight"].data.shape == (
+        EMO_COND_HIDDEN, EMO_COND_HIDDEN * conv.CONDITIONER_KERNEL
+    )
+    # Both FiLM producers emit the log gain and the shift stacked.
+    assert by_name["emo.ac.global_film.weight"].data.shape == (2 * EMO_CHANNELS,
+                                                               EMO_STYLE_CODE)
 
-    assert build.scalar_meta["emotion.dim"] == 2
-    assert build.scalar_meta["emotion.dur.hidden"] == 4
+    assert build.scalar_meta["emotion.dim"] == EMO_DIM
+    assert build.scalar_meta["emotion.cond.vocab"] == EMO_COND_VOCAB
+    assert build.scalar_meta["emotion.cond.hidden"] == EMO_COND_HIDDEN
+    assert build.scalar_meta["emotion.cond.depth"] == EMO_COND_DEPTH
+    assert build.scalar_meta["emotion.cond.kernel"] == conv.CONDITIONER_KERNEL
+    assert build.scalar_meta["emotion.cond.style_code"] == EMO_STYLE_CODE
+    assert build.scalar_meta["emotion.ac.channels"] == EMO_CHANNELS
+    assert build.scalar_meta["emotion.ac.context_rank"] == EMO_RANK
+    assert build.scalar_meta["emotion.ac.transition_frames"] == 2
+    assert build.float_meta["emotion.ac.frame_gain"] == 0.25
+    assert build.float_meta["emotion.ac.max_delta"] == 1.0
+    assert build.float_meta["emotion.ac.max_log_gain"] == 0.3
+    assert build.float_meta["emotion.ac.context_bound"] == 0.25
+    assert build.float_meta["emotion.ac.donor_projection"] == 0.0
     assert build.float_meta["emotion.dur.max_log_ratio"] == 0.6931471805599453
+    assert build.float_meta["emotion.dur.local_bound"] == 0.2
     assert build.string_array_meta["emotion.styles"] == ["neutral", "sad", "laughing"]
     assert build.float_array_meta["emotion.style_vectors"] == [0.0, 0.0, 0.0, 1.0, 1.0, 0.0]
     assert build.string_meta["emotion.default_style"] == "neutral"
+
+
+def test_emotion_counts_what_it_drops_so_the_total_still_matches() -> None:
+    """The duration copy of the conditioner, and the training-only terms.
+
+    The parameter cross-check is the strongest validation the converter has;
+    it only stays that way if everything deliberately left out is counted
+    rather than waved through.
+    """
+    build = emotion_build()
+    dropped = sum(
+        v.size for k, v in emotion_duration_tensors().items()
+        if k.startswith("conditioner.") or k == "donor_tempo"
+    )
+    dropped += emotion_acoustic_tensors()["domain_scale"].size
+    assert build.skipped_parameters == dropped
+
+
+def test_emotion_refuses_a_conditioner_the_two_heads_do_not_share() -> None:
+    # Declared differently...
+    with pytest.raises(conv.ConversionError, match="same shared conditioner"):
+        emotion_build(dur_cfg_overrides={"conditioner": {"vocab_size": 1, "dim": 2,
+                                                         "hidden": 4, "depth": 2,
+                                                         "style_code": 5}})
+    # ...or declared alike and trained apart. One optimizer produced both
+    # branches; a pack whose copies differ was not exported from that run.
+    tensors = emotion_duration_tensors()
+    tensors["conditioner.axis_gain"] = np.zeros(EMO_DIM, dtype=np.float32)
+    with pytest.raises(conv.ConversionError, match="differs between"):
+        emotion_build(dur_tensors=tensors)
 
 
 def test_emotion_emits_only_the_aliases_this_pack_can_honour() -> None:
@@ -854,22 +1048,65 @@ def test_emotion_style_aliases_must_name_a_style_of_the_pack() -> None:
         emotion_build(style_aliases={"sad": "laughing"})
 
 
-def test_emotion_refuses_a_branch_that_does_not_fit_its_declared_shape() -> None:
-    tensors = emotion_tensors()
-    # A branch trained against a wider style space than the pack declares.
-    tensors["input_proj.weight"] = np.zeros((4, 11, 1), dtype=np.float32)
+def test_emotion_refuses_a_head_that_does_not_fit_its_declared_shape() -> None:
+    tensors = emotion_acoustic_tensors()
+    # A head trained against a wider style space than the pack declares.
+    tensors["global_film.weight"] = np.zeros((2 * EMO_CHANNELS, EMO_STYLE_CODE + 1),
+                                             dtype=np.float32)
     with pytest.raises(conv.ConversionError, match="expected"):
-        emotion_build(tensors=tensors)
+        emotion_build(ac_tensors=tensors)
 
-    missing = emotion_tensors()
-    del missing["output.bias"]
+    missing = emotion_duration_tensors()
+    del missing["observed_ids"]
     with pytest.raises(conv.ConversionError, match="missing emotion tensor"):
-        emotion_build(tensors=missing)
+        emotion_build(dur_tensors=missing)
+
+    mask = emotion_duration_tensors()
+    mask["observed_ids"] = np.full(EMO_DUR_VOCAB, 0.5, dtype=np.float32)
+    with pytest.raises(conv.ConversionError, match="0/1 mask"):
+        emotion_build(dur_tensors=mask)
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        ({"max_delta": 0.0}, "max_delta"),
+        ({"max_log_gain": -0.1}, "max_log_gain"),
+        # A context bound above the ceiling the rendered delta closes on would
+        # describe a term that cannot reach its own limit.
+        ({"context_bound": 2.0}, "context_bound"),
+        ({"donor_projection": 1.5}, "donor_projection"),
+        ({"context_rank": 4}, "factorizes the context"),
+        ({"frame_gain": 1.5}, "frame_gain"),
+        ({"transition_frames": 9}, "transition_frames"),
+        ({"transition_frames": 2.0}, "transition_frames"),
+        # Either one disagreeing with the manifest is a voice that renders
+        # differently from the checkpoint the manifest describes.
+        ({"frame_gain": 0.5}, "renders its residual"),
+        ({"transition_frames": 1}, "renders its residual"),
+    ],
+)
+def test_emotion_refuses_bounds_outside_their_own_definition(overrides, message) -> None:
+    film = {
+        "context_rank": EMO_RANK, "max_delta": 1.0, "max_log_gain": 0.3,
+        "context_bound": 0.25, "donor_projection": 0.0,
+        "frame_gain": 0.25, "transition_frames": 2,
+    }
+    film.update(overrides)
+    with pytest.raises(conv.ConversionError, match=message):
+        emotion_build(ac_cfg_overrides={"film": film})
+
+
+def test_emotion_refuses_a_checkpoint_that_does_not_declare_its_bounds() -> None:
+    with pytest.raises(conv.ConversionError, match="does not declare its FiLM bounds"):
+        emotion_build(ac_cfg_overrides={"film": {"context_rank": EMO_RANK}})
 
 
 def test_emotion_refuses_a_bound_the_checkpoint_and_the_manifest_disagree_on() -> None:
     with pytest.raises(conv.ConversionError, match="bounds the residual"):
         emotion_build(dur_cfg_overrides={"max_log_ratio": 1.0})
+    with pytest.raises(conv.ConversionError, match="local_bound"):
+        emotion_build(dur_cfg_overrides={"local_bound": 0.0})
 
 
 def test_style_alias_parsing() -> None:

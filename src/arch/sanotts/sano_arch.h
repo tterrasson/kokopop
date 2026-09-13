@@ -11,7 +11,10 @@
 // Inference is four sequential ggml graphs (duration, acoustic/token,
 // acoustic/frame, decoder) with host work between them. The split is forced:
 // the frame count depends on the *values* the duration model produces, and the
-// token-to-frame expansion is a gather ggml has no operator for.
+// token-to-frame expansion is a gather ggml has no operator for. A styled
+// request runs one more — the emotion conditioner — before the duration model
+// and again before the decoder, each time feeding a head that stays on the
+// host.
 
 #include "arch/sanotts/sano_tokenizer.h"
 #include "arch/sanotts/sano_weights.h"
@@ -47,15 +50,30 @@ struct SanoVoice {
 };
 
 /// The style of one synthesis, resolved from a name once per chunk.
+///
+/// Resolution is where the style vector is split into the two things the heads
+/// actually consume: a *direction*, which is all the nonlinear style encoder
+/// ever sees, and a scalar *intensity*, which multiplies everything the encoder
+/// produces. That separation is what makes the displacement radial — half a
+/// vector is exactly half the effect — and it is why calibration can scale an
+/// axis without rotating it into another style.
 struct SanoStyle {
     /// `[dim]`, or empty for a voice without an emotion pack. Always filled
-    /// when the voice has one: the acoustic model is conditioned everywhere,
-    /// so the neutral style is the zero vector, not the absence of one.
+    /// when the voice has one, so the neutral style is the zero vector rather
+    /// than the absence of one.
     std::vector<float> vector;
 
+    /// `[style_code]`: the style encoder run on the L1-normalized direction.
+    /// Empty for a neutral style, which needs neither head.
+    std::vector<float> code;
+
+    /// The effective intensity every term of both heads is multiplied by:
+    /// the vector's own L1 norm, weighted by the pack's calibrated axis gains.
+    float amount = 0.0f;
+
     /// True when every component is zero — the exact neutral bypass the pack
-    /// declares, which skips the duration residual graph entirely rather than
-    /// computing a term that is provably zero. Also true for a plain voice.
+    /// declares, which skips both heads entirely rather than computing terms
+    /// that are provably zero. Also true for a plain voice.
     bool neutral = true;
 
     /// The canonical style name this was resolved from, for diagnostics.
@@ -154,7 +172,7 @@ struct SanoArch final : ModelArch {
 
     // ---- execution state ----
     //
-    // The four graphs are strictly sequential — each is computed and read back
+    // The graphs are strictly sequential — each is computed and read back
     // before the next is built — so one arena serves them all, sized to the
     // largest. Two concurrent synthesis sessions on one model would share it,
     // which is why nothing here is touched outside `run()`.
@@ -194,7 +212,7 @@ struct SanoGraphBudget {
 };
 
 SanoGraphBudget sano_duration_budget(const SanoVoice & voice);
-SanoGraphBudget sano_duration_residual_budget(const SanoVoice & voice);
+SanoGraphBudget sano_emotion_conditioner_budget(const SanoVoice & voice);
 SanoGraphBudget sano_acoustic_token_budget(const SanoVoice & voice);
 SanoGraphBudget sano_acoustic_frame_budget(const SanoVoice & voice);
 SanoGraphBudget sano_piperlite_budget(const SanoVoice & voice);
@@ -213,28 +231,46 @@ bool sano_run_duration(SanoArch & arch, const SanoVoice & voice,
                        const SanoStyle & style,
                        std::vector<int32_t> & durations, std::string & error);
 
-/// Graph 1b: the style's log-duration residual, `[n_tokens]`, added to the
-/// neutral log durations before they are exponentiated and rounded.
+/// Graph 1b: the shared conditioner, `[cond_hidden, n_tokens]`.
 ///
-/// Only the two projections run on the backend; the bound that closes the
-/// branch, `tanh(x) * max_log_ratio`, is a per-token scalar and costs less on
-/// the host than the graph nodes it would take.
-bool sano_run_duration_residual(SanoArch & arch, const SanoVoice & voice,
-                                const std::vector<uint32_t> & ids,
-                                const SanoStyle & style,
-                                std::vector<float> & residual, std::string & error);
+/// The one graph the emotion path runs, and both heads read it: a dilated
+/// stack over the phoneme sequence with the phrase's mean, first and last
+/// token added back to every position. `ids` are the *branch's* ids, clamped
+/// to the vocabulary of whichever native model this conditioning accompanies.
+///
+/// Everything downstream of it — the style code, the FiLM pair, the bounds,
+/// the phone means and the boundary crossfade — stays on the host: a handful
+/// of matrix-vector products per token and one pass over the frames, which
+/// costs less than the dispatches would.
+bool sano_run_emotion_conditioner(SanoArch & arch, const SanoVoice & voice,
+                                  const std::vector<uint32_t> & ids,
+                                  uint32_t vocab, const char * label,
+                                  std::vector<float> & tokens, std::string & error);
+
+/// The style's log-duration residual, `[n_tokens]`, added to the neutral log
+/// durations before they are exponentiated and rounded.
+///
+/// `neutral` is the frozen model's own log predictions: they are not only what
+/// the residual corrects, they are the attention the per-token redistribution
+/// is centered under, so that a style moves where the time goes without also
+/// moving how much of it there is.
+bool sano_emotion_duration_residual(const SanoVoice & voice,
+                                    const std::vector<uint32_t> & ids,
+                                    const SanoStyle & style,
+                                    const std::vector<float> & conditioned,
+                                    const std::vector<float> & neutral,
+                                    std::vector<float> & residual,
+                                    std::string & error);
 
 /// Graph 2: ids + durations -> token context `[n_tokens, hidden]`.
 bool sano_run_acoustic_token(SanoArch & arch, const SanoVoice & voice,
                              const std::vector<uint32_t> & ids,
                              const std::vector<int32_t> & durations,
-                             const SanoStyle & style,
                              std::vector<float> & token_ctx, std::string & error);
 
 /// Graph 3: expanded token context + frame features -> `[frames, out_channels]`.
 ///
-/// `frame_input` is the host-side expansion, already
-/// `[frames, hidden + 3 + style dim]`.
+/// `frame_input` is the host-side expansion, already `[frames, hidden + 3]`.
 bool sano_run_acoustic_frame(SanoArch & arch, const SanoVoice & voice,
                              const std::vector<float> & frame_input,
                              int64_t frames, std::vector<float> & latent,
@@ -244,8 +280,26 @@ bool sano_run_acoustic_frame(SanoArch & arch, const SanoVoice & voice,
 /// as the `[frames, hidden + 3]` graph-3 input.
 void sano_expand_to_frames(const std::vector<float> & token_ctx, int64_t n_tokens,
                            int64_t hidden, const std::vector<int32_t> & durations,
-                           int64_t frames, const std::vector<float> & style,
-                           std::vector<float> & frame_input);
+                           int64_t frames, std::vector<float> & frame_input);
+
+/// The style's bounded per-channel correction, applied to `latent` in place.
+///
+/// `latent` is graph 3's output, `[frames, channels]` with frames fastest.
+///
+/// The affine pair is predicted once per phone — two takes of one sentence
+/// share no frame grid, so the phone is the finest timeline the paired
+/// supervision could ever have used — but it is *evaluated* on each frame's
+/// own content, `phone_mean + frame_gain * (frame - phone_mean)`, so the gain
+/// reaches the variation inside a phone instead of a single number standing
+/// for all of it. The raw residual is then crossfaded across phone boundaries
+/// with a raised cosine, bounded, and added. The native latent itself is never
+/// smoothed, and a neutral style leaves it untouched.
+bool sano_apply_emotion_latent(const SanoVoice & voice,
+                               const std::vector<int32_t> & durations,
+                               const SanoStyle & style,
+                               const std::vector<float> & conditioned,
+                               int64_t frames, std::vector<float> & latent,
+                               std::string & error);
 
 /// Graph 4a: latent `[frames, 192]` -> PCM at the voice's rate.
 bool sano_run_piperlite(SanoArch & arch, const SanoVoice & voice,
