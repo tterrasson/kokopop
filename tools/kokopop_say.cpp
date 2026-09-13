@@ -12,6 +12,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <thread>
 #include <vector>
@@ -20,9 +22,12 @@ namespace {
 
 void usage(const char * argv0) {
     std::fprintf(stderr,
-        "usage: %s --model kokoro.gguf --voice ff_siwis (--text TEXT | --phonemes PHONEMES) "
+        "usage: %s --model kokoro.gguf --voice ff_siwis (--text TEXT | --file PATH | --phonemes PHONEMES) "
         "[--out out.wav | --play] [--speed 1.0] [--threads N] [--backend %s] [--seed N]\n"
         "\n"
+        "  --text TEXT      Text to synthesize (mutually exclusive with --file and --phonemes)\n"
+        "  --file PATH      Read text to synthesize from a file (mutually exclusive with --text and --phonemes)\n"
+        "  --phonemes TEXT  Pre-phonemized input (mutually exclusive with --text and --file)\n"
         "  --out out.wav   Write audio to a WAV file\n"
         "  --play          Play audio directly (mutually exclusive with --out)\n"
         "  --backend       Inference backend (default: auto)\n"
@@ -103,6 +108,7 @@ int synthesize_text_with_options(kokopop_model * model, const std::string & text
 int main(int argc, char ** argv) {
     std::string model_path;
     std::string text;
+    std::string file_path;
     std::string phonemes;
     std::string voice;
     std::string out_path;
@@ -123,6 +129,10 @@ int main(int argc, char ** argv) {
             const char * v = arg_value(i, argc, argv);
             if (!v) { usage(argv[0]); return 2; }
             text = v;
+        } else if (std::strcmp(argv[i], "--file") == 0) {
+            const char * v = arg_value(i, argc, argv);
+            if (!v) { usage(argv[0]); return 2; }
+            file_path = v;
         } else if (std::strcmp(argv[i], "--phonemes") == 0) {
             const char * v = arg_value(i, argc, argv);
             if (!v) { usage(argv[0]); return 2; }
@@ -182,9 +192,24 @@ int main(int argc, char ** argv) {
         }
     }
 
-    if (model_path.empty() || (out_path.empty() && !play) || (text.empty() == phonemes.empty())) {
+    const int input_count = (!text.empty() ? 1 : 0) + (!file_path.empty() ? 1 : 0) +
+                            (!phonemes.empty() ? 1 : 0);
+    if (model_path.empty() || (out_path.empty() && !play) || input_count != 1) {
         usage(argv[0]);
         return 2;
+    }
+
+    if (!file_path.empty()) {
+        std::ifstream file(file_path, std::ios::binary);
+        if (!file) {
+            std::fprintf(stderr, "error: cannot open file '%s'\n", file_path.c_str());
+            return 2;
+        }
+        text.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+        if (text.empty()) {
+            std::fprintf(stderr, "error: file '%s' is empty\n", file_path.c_str());
+            return 2;
+        }
     }
 
     kokopop_model_options options{};
