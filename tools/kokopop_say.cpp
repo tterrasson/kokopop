@@ -3,7 +3,6 @@
 #include "core/backend_names.h"
 #include "core/parse_integer.h"
 #include "playback/playback.h"
-#include "playback/playback_dummy.h"
 
 #if defined(__APPLE__)
 #include "playback/playback_coreaudio.h"
