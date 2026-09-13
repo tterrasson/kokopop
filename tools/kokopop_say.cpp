@@ -4,10 +4,6 @@
 #include "core/parse_integer.h"
 #include "playback/playback.h"
 
-#if defined(__APPLE__)
-#include "playback/playback_coreaudio.h"
-#endif
-
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -259,9 +255,9 @@ int main(int argc, char ** argv) {
         kokopop::AudioPlayback * playback = nullptr;
 
 #if defined(__APPLE__)
-        playback = new kokopop::CoreAudioPlayback();
+        playback = kokopop::create_coreaudio_playback();
 #else
-        playback = new kokopop::DummyPlayback();
+        playback = kokopop::create_dummy_playback();
 #endif
 
         if (playback->start(audio.sample_rate)) {
