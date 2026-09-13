@@ -710,11 +710,13 @@ def emotion_manifest(**overrides) -> dict:
         "max_duration": 80,
         "shared_conditioner_id": "0" * 64,
         "conditioning": {
-            "capability": "sanofr.shared-phrase-film.v2",
+            "capability": "sanofr.shared-phrase-film.v3",
             "required": True,
             "context_rank": 3,
             "frame_gain": 0.25,
             "transition_frames": 2,
+            "mix_rank": 2,
+            "mix_bound": 0.2,
         },
         "trained_donors": ["jessica"],
     }
@@ -737,6 +739,8 @@ def test_emotion_contract_reads_the_style_space() -> None:
     assert contract["context_rank"] == 3
     assert contract["frame_gain"] == 0.25
     assert contract["transition_frames"] == 2
+    assert contract["mix_rank"] == 2
+    assert contract["mix_bound"] == 0.2
 
 
 def test_a_pack_without_an_emotion_block_is_a_neutral_pack() -> None:
@@ -824,6 +828,7 @@ EMO_COND_HIDDEN = 4
 EMO_COND_DEPTH = 2
 EMO_STYLE_CODE = 5
 EMO_RANK = 3
+EMO_MIX_RANK = 2
 EMO_CHANNELS = 7
 EMO_DUR_VOCAB = 10
 
@@ -866,6 +871,10 @@ def emotion_acoustic_tensors() -> dict[str, np.ndarray]:
         "style_rank.weight": full(EMO_RANK, EMO_STYLE_CODE),
         "context_basis.weight": full(2 * EMO_CHANNELS, EMO_RANK),
         "donor_axis": np.zeros(EMO_CHANNELS, dtype=np.float32),
+        # The off-diagonal term. Present exactly when `mix_bound` is nonzero.
+        "mix_proj.weight": full(EMO_MIX_RANK, EMO_CHANNELS),
+        "style_mix.weight": full(EMO_MIX_RANK, EMO_STYLE_CODE),
+        "mix_basis.weight": full(EMO_CHANNELS, EMO_MIX_RANK),
         # Trained, never rendered.
         "domain_scale": np.ones(EMO_CHANNELS, dtype=np.float32),
     }
@@ -891,6 +900,7 @@ def emotion_build(
     dur_cfg_overrides=None,
     ac_tensors=None,
     dur_tensors=None,
+    manifest=None,
 ):
     build = conv.VoiceBuild(
         name="fr", aliases=[], sample_rate=22050, length_scale=1.0,
@@ -915,6 +925,8 @@ def emotion_build(
             "donor_projection": 0.0,
             "frame_gain": 0.25,
             "transition_frames": 2,
+            "mix_rank": EMO_MIX_RANK,
+            "mix_bound": 0.2,
             "donors": ["jessica"],
             "donor_rank": 4,
             "donor_bound": 0.15,
@@ -928,7 +940,7 @@ def emotion_build(
     }
     dur_cfg.update(dur_cfg_overrides or {})
     conv._add_emotion(
-        build, "fr", conv.emotion_contract("fr", emotion_manifest()),
+        build, "fr", conv.emotion_contract("fr", manifest or emotion_manifest()),
         ac_cfg,
         emotion_acoustic_tensors() if ac_tensors is None else ac_tensors,
         dur_cfg,
@@ -952,6 +964,8 @@ def test_emotion_emits_one_conditioner_two_heads_and_the_style_space() -> None:
         "emo.ac.context_coeff.weight", "emo.ac.context_coeff.bias",
         "emo.ac.style_rank.weight", "emo.ac.context_basis.weight",
         "emo.ac.donor_axis",
+        "emo.ac.mix_proj.weight", "emo.ac.style_mix.weight",
+        "emo.ac.mix_basis.weight",
         "emo.dur.tempo.weight", "emo.dur.style_local.weight",
         "emo.dur.output.weight", "emo.dur.observed_ids",
     }
@@ -976,6 +990,11 @@ def test_emotion_emits_one_conditioner_two_heads_and_the_style_space() -> None:
     # Both FiLM producers emit the log gain and the shift stacked.
     assert by_name["emo.ac.global_film.weight"].data.shape == (2 * EMO_CHANNELS,
                                                                EMO_STYLE_CODE)
+    # The off-diagonal term: channels in, rank out, then rank back to channels.
+    # A transposed factor would still multiply, so the shapes are pinned.
+    assert by_name["emo.ac.mix_proj.weight"].data.shape == (EMO_MIX_RANK, EMO_CHANNELS)
+    assert by_name["emo.ac.style_mix.weight"].data.shape == (EMO_MIX_RANK, EMO_STYLE_CODE)
+    assert by_name["emo.ac.mix_basis.weight"].data.shape == (EMO_CHANNELS, EMO_MIX_RANK)
 
     assert build.scalar_meta["emotion.dim"] == EMO_DIM
     assert build.scalar_meta["emotion.cond.vocab"] == EMO_COND_VOCAB
@@ -986,6 +1005,8 @@ def test_emotion_emits_one_conditioner_two_heads_and_the_style_space() -> None:
     assert build.scalar_meta["emotion.ac.channels"] == EMO_CHANNELS
     assert build.scalar_meta["emotion.ac.context_rank"] == EMO_RANK
     assert build.scalar_meta["emotion.ac.transition_frames"] == 2
+    assert build.scalar_meta["emotion.ac.mix_rank"] == EMO_MIX_RANK
+    assert build.float_meta["emotion.ac.mix_bound"] == 0.2
     assert build.float_meta["emotion.ac.frame_gain"] == 0.25
     assert build.float_meta["emotion.ac.max_delta"] == 1.0
     assert build.float_meta["emotion.ac.max_log_gain"] == 0.3
@@ -1084,6 +1105,15 @@ def test_emotion_refuses_a_head_that_does_not_fit_its_declared_shape() -> None:
         # differently from the checkpoint the manifest describes.
         ({"frame_gain": 0.5}, "renders its residual"),
         ({"transition_frames": 1}, "renders its residual"),
+        # The off-diagonal term. A bound above the ceiling the rendered delta
+        # closes on describes a term that cannot reach its own limit, and a
+        # rank or bound the manifest does not share decides whether a whole
+        # term of the residual renders at all.
+        ({"mix_bound": 2.0}, "mix_bound"),
+        ({"mix_bound": -0.1}, "mix_bound"),
+        ({"mix_rank": 0}, "mix_rank"),
+        ({"mix_bound": 0.5}, "mixes channels"),
+        ({"mix_rank": 3}, "mixes channels"),
     ],
 )
 def test_emotion_refuses_bounds_outside_their_own_definition(overrides, message) -> None:
@@ -1091,6 +1121,7 @@ def test_emotion_refuses_bounds_outside_their_own_definition(overrides, message)
         "context_rank": EMO_RANK, "max_delta": 1.0, "max_log_gain": 0.3,
         "context_bound": 0.25, "donor_projection": 0.0,
         "frame_gain": 0.25, "transition_frames": 2,
+        "mix_rank": EMO_MIX_RANK, "mix_bound": 0.2,
     }
     film.update(overrides)
     with pytest.raises(conv.ConversionError, match=message):
@@ -1161,3 +1192,42 @@ def test_vocos_vocabulary_decodes_the_golden_ids_to_plausible_ipa() -> None:
     # Every decoded symbol is a phoneme, punctuation or a stress mark — never a
     # framing token.
     assert not any(symbol in decoded for symbol in ("<pad>", "<bos>", "<eos>"))
+
+
+def test_emotion_mix_bound_zero_ships_no_mixing_tensors_at_all() -> None:
+    """The ablation has to be an absence, not three tensors multiplied by zero.
+
+    `mix_bound = 0` is how the 2x2 that separates the off-diagonal term from
+    `frame_gain` is run, so it is a shipping configuration and not a legacy
+    one. The reference builds no mixing modules at that bound, so the pack
+    carries none either, and a pack that disagrees with its own bound in
+    either direction is refused rather than rendered on a guess.
+    """
+    film = {
+        "context_rank": EMO_RANK, "max_delta": 1.0, "max_log_gain": 0.3,
+        "context_bound": 0.25, "donor_projection": 0.0,
+        "frame_gain": 0.25, "transition_frames": 2,
+        "mix_rank": EMO_MIX_RANK, "mix_bound": 0.0,
+    }
+    manifest = emotion_manifest(conditioning=conditioning(mix_bound=0.0))
+    without = {k: v for k, v in emotion_acoustic_tensors().items()
+               if k not in conv.MIXING_TENSORS}
+
+    build = emotion_build(
+        ac_cfg_overrides={"film": film}, ac_tensors=without, manifest=manifest
+    )
+    names = {t.suffix for t in build.tensors}
+    assert not any(n.startswith("emo.ac.mix_") or n == "emo.ac.style_mix.weight"
+                   for n in names)
+    assert build.float_meta["emotion.ac.mix_bound"] == 0.0
+    # The rank is still stated: it is a shape, and a reader that later sees
+    # tensors has to be able to check them against something.
+    assert build.scalar_meta["emotion.ac.mix_rank"] == EMO_MIX_RANK
+
+    # Dead weights under a zero bound would be a term the training never used.
+    with pytest.raises(conv.ConversionError, match="not dead weight"):
+        emotion_build(ac_cfg_overrides={"film": film}, manifest=manifest)
+
+    # And a nonzero bound with no tensors is the same disagreement, mirrored.
+    with pytest.raises(conv.ConversionError, match="mixing tensors"):
+        emotion_build(ac_tensors=without)

@@ -556,6 +556,8 @@ bool load_emotion(const VoiceMeta & meta, TensorLoader & loader, Backend & backe
         !meta.u32("emotion.ac.channels", w.channels, error) ||
         !meta.u32("emotion.ac.context_rank", w.context_rank, error) ||
         !meta.u32("emotion.ac.transition_frames", w.transition_frames, error) ||
+        !meta.u32("emotion.ac.mix_rank", w.mix_rank, error) ||
+        !meta.f32("emotion.ac.mix_bound", w.mix_bound, error) ||
         !meta.f32("emotion.ac.frame_gain", w.frame_gain, error) ||
         !meta.f32("emotion.ac.max_delta", w.max_delta, error) ||
         !meta.f32("emotion.ac.max_log_gain", w.max_log_gain, error) ||
@@ -572,7 +574,8 @@ bool load_emotion(const VoiceMeta & meta, TensorLoader & loader, Backend & backe
         !odd_kernel(w.cond_kernel, "emotion.cond.kernel", meta, error) ||
         !in_range(w.style_code, SANO_MAX_DIM, "emotion.cond.style_code", meta, error) ||
         !in_range(w.channels, SANO_MAX_DIM, "emotion.ac.channels", meta, error) ||
-        !in_range(w.context_rank, SANO_MAX_DIM, "emotion.ac.context_rank", meta, error)) {
+        !in_range(w.context_rank, SANO_MAX_DIM, "emotion.ac.context_rank", meta, error) ||
+        !in_range(w.mix_rank, SANO_MAX_DIM, "emotion.ac.mix_rank", meta, error)) {
         return false;
     }
     w.dim = dim;
@@ -618,6 +621,13 @@ bool load_emotion(const VoiceMeta & meta, TensorLoader & loader, Backend & backe
     // as a voice it was never trained to be.
     if (!std::isfinite(w.frame_gain) || w.frame_gain < 0.0f || w.frame_gain > 1.0f) {
         error = meta.where("emotion.ac.frame_gain") + " must lie in [0, 1]";
+        return false;
+    }
+    // The off-diagonal term's ceiling. Zero switches the term off entirely —
+    // the pack then carries none of its three factors — so this is also what
+    // decides whether the tensors below are expected at all.
+    if (!std::isfinite(w.mix_bound) || w.mix_bound < 0.0f || w.mix_bound > w.max_delta) {
+        error = meta.where("emotion.ac.mix_bound") + " must lie in [0, max_delta]";
         return false;
     }
     if (w.transition_frames > SANO_MAX_TRANSITION_FRAMES) {
@@ -700,6 +710,39 @@ bool load_emotion(const VoiceMeta & meta, TensorLoader & loader, Backend & backe
             return false;
         }
     }
+    // The off-diagonal term, present exactly when its bound is nonzero. Loaded
+    // apart from the table above because its absence is a valid pack and not a
+    // missing tensor: `mix_bound = 0` is how the term is ablated, and a pack
+    // that carries the factors anyway would be rendering weights the training
+    // bounded to nothing.
+    const int64_t mix = static_cast<int64_t>(w.mix_rank);
+    // `style_mix` is named after the factor it scales, not after the term, so
+    // it does not share the `mix_` prefix and is asked for by name.
+    const bool carries_mix =
+        loader.has_prefix("emo.ac.mix_") || loader.has_prefix("emo.ac.style_mix.");
+    if ((w.mix_bound > 0.0f) != carries_mix) {
+        error = meta.where("emotion.ac.mix_bound") + " is "
+              + (w.mix_bound > 0.0f ? "nonzero but the voice carries no channel "
+                                      "mixing tensors"
+                                    : "zero but the voice carries channel mixing "
+                                      "tensors");
+        return false;
+    }
+    if (carries_mix) {
+        const HostTensor mixing[] = {
+            {"emo.ac.mix_proj.weight", channels, mix, &w.mix_proj},
+            {"emo.ac.style_mix.weight", code, mix, &w.style_mix},
+            {"emo.ac.mix_basis.weight", mix, channels, &w.mix_basis},
+        };
+        for (const HostTensor & entry : mixing) {
+            ggml_tensor * tensor = loader.get_f32(entry.suffix, entry.ne0, entry.ne1);
+            if (!error.empty() ||
+                !read_host(backend, tensor, *entry.out, meta.prefix + entry.suffix, error)) {
+                return false;
+            }
+        }
+    }
+
     // A mask, not a weight: anything else would silently scale a term the
     // centering below assumes is either present or absent.
     for (const float value : w.observed_ids) {

@@ -515,6 +515,15 @@ bool sano_apply_emotion_latent(const SanoVoice & voice,
         matvec(w.style_rank, style.code.data(), w.style_code, w.context_rank, rank);
     }
 
+    // The off-diagonal term. Its style coordinates are phrase-global, like the
+    // context basis's, so they are resolved once. A zero bound is the term
+    // switched off entirely, and the pack then carries none of its factors.
+    const bool mixing = w.mix_bound > 0.0f && !w.mix_basis.empty();
+    std::vector<float> mix_style;
+    if (mixing) {
+        matvec(w.style_mix, style.code.data(), w.style_code, w.mix_rank, mix_style);
+    }
+
     const bool project = w.donor_projection > 0.0f &&
         std::any_of(w.donor_axis.begin(), w.donor_axis.end(),
                     [](float v) { return v != 0.0f; });
@@ -558,10 +567,19 @@ bool sano_apply_emotion_latent(const SanoVoice & voice,
     // saturated neighbour drag a boundary somewhere neither phone asked for.
     std::vector<float> raw(latent.size());
     std::vector<float> coefficients, local;
+    // `[duration, mix_rank]` for the phone in hand. The channel loop below is
+    // channel-major and the mixing map reads every channel of one frame, so
+    // the rank coordinates are accumulated across channels as that loop goes
+    // and resolved once it has finished.
+    std::vector<float> mix_acc, mixed;
     for (size_t i = 0; i < voiced.size(); ++i) {
         const size_t  t        = voiced[i];
         const int64_t duration = lengths[i];
         const int64_t first    = starts[i];
+
+        if (mixing) {
+            mix_acc.assign(static_cast<size_t>(duration) * w.mix_rank, 0.0f);
+        }
 
         if (contextual) {
             matvec(w.context_coeff_w, conditioned.data() + t * hidden, hidden,
@@ -602,6 +620,31 @@ bool sano_apply_emotion_latent(const SanoVoice & voice,
                 // term: energy and timbre are scalings, and a purely additive
                 // style would be blind to the base's own magnitude.
                 out[first + d] = style.amount * (gain * content + shift);
+                if (mixing) {
+                    // This channel's contribution to each rank coordinate of
+                    // the same frame. Summed over channels, which is what
+                    // makes the term off-diagonal.
+                    for (uint32_t r = 0; r < w.mix_rank; ++r) {
+                        mix_acc[static_cast<size_t>(d) * w.mix_rank + r] +=
+                            w.mix_proj[r * channels + c] * content;
+                    }
+                }
+            }
+        }
+
+        if (mixing) {
+            // Back onto the channels, bounded on its own, and inside the
+            // intensity like every other term of the pair.
+            for (int64_t d = 0; d < duration; ++d) {
+                float * coords = mix_acc.data() + static_cast<size_t>(d) * w.mix_rank;
+                for (uint32_t r = 0; r < w.mix_rank; ++r) {
+                    coords[r] *= mix_style[r];
+                }
+                matvec(w.mix_basis, coords, w.mix_rank, channels, mixed);
+                for (size_t c = 0; c < channels; ++c) {
+                    raw[c * static_cast<size_t>(frames) + first + d] +=
+                        style.amount * bounded(mixed[c], w.mix_bound);
+                }
             }
         }
     }

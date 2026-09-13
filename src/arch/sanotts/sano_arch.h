@@ -291,7 +291,10 @@ void sano_expand_to_frames(const std::vector<float> & token_ctx, int64_t n_token
 /// supervision could ever have used — but it is *evaluated* on each frame's
 /// own content, `phone_mean + frame_gain * (frame - phone_mean)`, so the gain
 /// reaches the variation inside a phone instead of a single number standing
-/// for all of it. The raw residual is then crossfaded across phone boundaries
+/// for all of it. A bounded low-rank map of that same content is added to the
+/// pair's output: it is the only part of the residual that is not diagonal,
+/// and so the only one that can move what is encoded *across* channels rather
+/// than how loud each one is. The raw residual is then crossfaded across phone boundaries
 /// with a raised cosine, bounded, and added. The native latent itself is never
 /// smoothed, and a neutral style leaves it untouched.
 bool sano_apply_emotion_latent(const SanoVoice & voice,

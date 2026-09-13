@@ -527,7 +527,7 @@ PACK_FORMATS = ("roota.raw-fp16.v1", "roota.raw-fp16.v2")
 EMOTION_CAPABILITY = "sanofr.utterance-emotion.v1"
 EMOTION_ACOUSTIC_ARCH = "emotion_film_v1"
 EMOTION_DURATION_ARCH = "emotion_duration_context_v1"
-EMOTION_CONDITIONING_CAPABILITY = "sanofr.shared-phrase-film.v2"
+EMOTION_CONDITIONING_CAPABILITY = "sanofr.shared-phrase-film.v3"
 
 # The conditioner's dilated residual blocks: an architecture constant, not a
 # checkpoint field. Dilation doubles per level, so block `i` runs at `2 ** i`.
@@ -545,6 +545,8 @@ FILM_BOUNDS = (
     "donor_projection",
     "frame_gain",
     "transition_frames",
+    "mix_rank",
+    "mix_bound",
 )
 
 # What `sanofr.shared-phrase-film.v2` added over `v1`: the residual is no
@@ -554,6 +556,19 @@ FILM_BOUNDS = (
 # A v1 pack carries neither and is refused by capability rather than rendered
 # with a guessed `frame_gain = 0`, which would be a different voice.
 MAX_TRANSITION_FRAMES = 8
+
+# What `v3` adds over `v2`: a term that is *not* diagonal. Every other part of
+# the residual gives each latent channel its own gain and shift, which reaches
+# energy -- a gain is an energy change -- and leaves tempo to the duration
+# head, but cannot rotate the pattern across channels that carries F0. The new
+# term applies a style-conditioned rank-`mix_rank` map to the same content the
+# gain multiplies, under its own bound. A v2 reader would render the gain and
+# the shift and silently drop it, which is a different voice, so the pack is
+# refused by capability instead.
+#
+# `mix_bound = 0` is the ablation, and it ships *no* mixing tensors at all --
+# the term is absent, not switched off with dead weights in the file.
+MIXING_TENSORS = ("mix_proj.weight", "style_mix.weight", "mix_basis.weight")
 
 # In the pack but never rendered: the per-donor factorizations are a training
 # nuisance term the consensus is centered against, and `domain_scale` is a
@@ -712,6 +727,23 @@ def emotion_contract(voice: str, manifest: dict[str, Any]) -> dict[str, Any] | N
             f"{voice}: conditioning transition_frames {transition_frames!r} must be an "
             f"integer in [0, {MAX_TRANSITION_FRAMES}]"
         )
+    # The v3 pair. `mix_rank` is a shape and is always stated; `mix_bound` is
+    # what decides whether the term exists at all.
+    mix_rank = conditioning.get("mix_rank")
+    if not isinstance(mix_rank, int) or isinstance(mix_rank, bool) or mix_rank < 1:
+        raise ConversionError(
+            f"{voice}: conditioning mix_rank {mix_rank!r} is not a positive integer"
+        )
+    mix_bound = conditioning.get("mix_bound")
+    if (
+        isinstance(mix_bound, bool)
+        or not isinstance(mix_bound, (int, float))
+        or not math.isfinite(float(mix_bound))
+        or float(mix_bound) < 0.0
+    ):
+        raise ConversionError(
+            f"{voice}: conditioning mix_bound {mix_bound!r} must be finite and nonnegative"
+        )
     if emotion.get("rounding") != "nearest-even-clamp-1-max_duration":
         raise ConversionError(
             f"{voice}: emotion duration rounding {emotion.get('rounding')!r} is not the "
@@ -737,6 +769,8 @@ def emotion_contract(voice: str, manifest: dict[str, Any]) -> dict[str, Any] | N
         "context_rank": int(context_rank),
         "frame_gain": float(frame_gain),
         "transition_frames": int(transition_frames),
+        "mix_rank": int(mix_rank),
+        "mix_bound": float(mix_bound),
     }
 
 
@@ -1445,6 +1479,8 @@ def _add_emotion(
     donor_projection = float(film["donor_projection"])
     frame_gain = float(film["frame_gain"])
     transition_frames = film["transition_frames"]
+    mix_rank = int(film["mix_rank"])
+    mix_bound = float(film["mix_bound"])
     if context_rank != emotion["context_rank"]:
         raise ConversionError(
             f"{voice}: the acoustic checkpoint factorizes the context at rank "
@@ -1487,6 +1523,35 @@ def _add_emotion(
             f"frame_gain={frame_gain:g}/transition_frames={transition_frames} and the "
             f"manifest declares frame_gain={emotion['frame_gain']:g}/"
             f"transition_frames={emotion['transition_frames']}"
+        )
+    # The off-diagonal term. Its bound decides whether the tensors exist, so a
+    # disagreement between checkpoint and manifest is not a cosmetic one: it
+    # decides whether a whole term of the residual is rendered.
+    if mix_rank < 1:
+        raise ConversionError(f"{voice}: emotion mix_rank {mix_rank!r} must be positive")
+    if not (math.isfinite(mix_bound) and 0 <= mix_bound <= max_delta):
+        raise ConversionError(
+            f"{voice}: emotion mix_bound {mix_bound!r} must lie in [0, max_delta]"
+        )
+    if mix_rank != emotion["mix_rank"] or mix_bound != emotion["mix_bound"]:
+        raise ConversionError(
+            f"{voice}: the acoustic checkpoint mixes channels at rank {mix_rank} under "
+            f"bound {mix_bound:g} and the manifest declares rank {emotion['mix_rank']} "
+            f"under bound {emotion['mix_bound']:g}"
+        )
+    # A checkpoint that bounds the term at zero never built it, and one that
+    # built it must ship all three factors: a partial set would render a term
+    # the training never used.
+    present = [k for k in MIXING_TENSORS if k in ac_tensors]
+    if mix_bound > 0.0 and len(present) != len(MIXING_TENSORS):
+        raise ConversionError(
+            f"{voice}: mix_bound={mix_bound:g} but the acoustic component carries "
+            f"{len(present)} of {len(MIXING_TENSORS)} mixing tensors"
+        )
+    if mix_bound == 0.0 and present:
+        raise ConversionError(
+            f"{voice}: mix_bound is zero but the acoustic component still carries "
+            f"{', '.join(present)}; the term is meant to be absent, not dead weight"
         )
 
     max_log_ratio = float(dur_cfg["max_log_ratio"])
@@ -1572,6 +1637,16 @@ def _add_emotion(
     # zero when this run did not fit one. Only read when `donor_projection` is
     # nonzero, but always shipped so the two always travel together.
     emit(ac_tensors, "acoustic", "donor_axis", "emo.ac.donor_axis", (channels,))
+    # The off-diagonal term, only when the pack carries one. `mix_proj` reads
+    # the same `content` the gain multiplies, `style_mix` scales the rank
+    # coordinates per style, and `mix_basis` puts them back on the channels.
+    if mix_bound > 0.0:
+        emit(ac_tensors, "acoustic", "mix_proj.weight",
+             "emo.ac.mix_proj.weight", (mix_rank, channels))
+        emit(ac_tensors, "acoustic", "style_mix.weight",
+             "emo.ac.style_mix.weight", (mix_rank, style_code))
+        emit(ac_tensors, "acoustic", "mix_basis.weight",
+             "emo.ac.mix_basis.weight", (channels, mix_rank))
 
     # The duration head: one global log tempo, and a per-token redistribution
     # that is centered to zero under the neutral model's own attention.
@@ -1633,6 +1708,7 @@ def _add_emotion(
             "emotion.ac.channels": channels,
             "emotion.ac.context_rank": context_rank,
             "emotion.ac.transition_frames": transition_frames,
+            "emotion.ac.mix_rank": mix_rank,
         }
     )
     build.float_meta.update(
@@ -1642,6 +1718,7 @@ def _add_emotion(
             "emotion.ac.context_bound": context_bound,
             "emotion.ac.donor_projection": donor_projection,
             "emotion.ac.frame_gain": frame_gain,
+            "emotion.ac.mix_bound": mix_bound,
             "emotion.dur.max_log_ratio": max_log_ratio,
             "emotion.dur.local_bound": local_bound,
         }

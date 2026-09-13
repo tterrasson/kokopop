@@ -64,7 +64,8 @@ struct SanoDurationWeights {
 ///
 ///   * Acoustically, a feature-wise affine transform — a per-channel log gain
 ///     and a shift — predicted once per phone but evaluated on each frame's
-///     own content, `phone_mean + frame_gain * (frame - phone_mean)`, with a
+///     own content, `phone_mean + frame_gain * (frame - phone_mean)`, plus a
+///     bounded low-rank channel mixing of that same content, with a
 ///     short raised-cosine crossfade joining the raw residual across phone
 ///     boundaries before it is bounded. Only the residual is ever crossfaded;
 ///     the native latent is never smoothed.
@@ -73,7 +74,7 @@ struct SanoDurationWeights {
 ///     may move where the time goes without moving how much there is of it
 ///     beyond the tempo it asked for.
 ///
-/// Both are driven by one shared conditioner (`sanofr.shared-phrase-film.v2`),
+/// Both are driven by one shared conditioner (`sanofr.shared-phrase-film.v3`),
 /// a small dilated stack over the phoneme sequence with a phrase summary added
 /// back to every token, and by one style code — the direction of the style
 /// vector through a biasless, 0-preserving encoder — scaled by one scalar
@@ -168,6 +169,25 @@ struct SanoEmotionWeights {
 
     /// `[channels]`, zero unless the run fitted one.
     std::vector<float> donor_axis;
+
+    /// Rank of the style x channel x channel mixing map, and the ceiling that
+    /// map closes on. `mix_bound == 0` means the pack carries no mixing term
+    /// at all — the three buffers below are empty — rather than an unbounded
+    /// one, which is what makes it a real ablation on both sides of the pack.
+    uint32_t mix_rank = 0;
+    float mix_bound = 0.0f;
+
+    /// `[mix_rank, channels]`, `[mix_rank, style_code]`, `[channels, mix_rank]`.
+    ///
+    /// The only part of the residual that is not diagonal. Every other term
+    /// gives each latent channel its own gain and shift, which reaches energy
+    /// — a gain is an energy change — and leaves tempo to the duration head,
+    /// but cannot rotate the pattern *across* channels that carries F0. These
+    /// three factor a style-conditioned map applied to the same content the
+    /// gain multiplies: channels in, rank out, rank back to channels.
+    std::vector<float> mix_proj;
+    std::vector<float> style_mix;
+    std::vector<float> mix_basis;
 
     // -- the duration head -------------------------------------------------
     /// Bound on the log-duration ratio the head may apply, in either

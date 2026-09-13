@@ -686,3 +686,85 @@ TEST_CASE("sanotts_the_heads_refuse_a_conditioning_that_does_not_fit") {
                                                    latent, error));
     CHECK(error.find("do not fill") != std::string::npos);
 }
+
+TEST_CASE("sanotts_channel_mixing_moves_a_channel_from_the_ones_it_is_not") {
+    // The point of the term, in the smallest shape that shows it: the map
+    // reads channel 0 and writes channel 1. No per-channel gain or shift can
+    // do that, which is why pitch -- encoded across channels rather than in
+    // any one of them -- was unreachable before it existed.
+    kokopop::SanoVoice voice = make_film_voice();
+    voice.emo.frame_gain = 0.0f;  // isolate the term: content is the phone mean
+    voice.emo.mix_rank = 1;
+    voice.emo.mix_bound = 0.5f;
+    voice.emo.mix_proj = {1.0f, 0.0f};   // [rank, channels]
+    voice.emo.style_mix = {1.0f};        // [rank, style_code]
+    voice.emo.mix_basis = {0.0f, 1.0f};  // [channels, rank]
+    const kokopop::SanoStyle style = unit_style();
+
+    std::vector<float> latent = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+    const std::vector<int32_t> durations = {2, 1};
+    const std::vector<float> conditioned = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    std::string error;
+    REQUIRE_MESSAGE(kokopop::sano_apply_emotion_latent(voice, durations, style,
+                                                       conditioned, 3, latent, error),
+                    error);
+
+    // `mix_bound * tanh(mix_basis * (mix_proj . content) * style_mix / bound)`,
+    // added inside the intensity and before the residual's own bound.
+    auto mixed = [](float mean0) { return 0.5f * std::tanh(mean0 / 0.5f); };
+    auto delta = [](float log_gain, float shift, float mean, float extra) {
+        const float bounded = 0.3f * std::tanh(log_gain / 0.3f);
+        return std::tanh(std::expm1(bounded) * mean + shift + extra);
+    };
+
+    // Channel 0 writes nothing into itself: `mix_basis` is zero on that row.
+    const float first0 = delta(0.2f, 0.5f, 1.5f, 0.0f);
+    const float second0 = delta(0.2f, 0.5f, 3.0f, 0.0f);
+    // Channel 1 is moved by channel 0's mean, phone by phone.
+    const float first1 = delta(-0.2f, -0.5f, 4.5f, mixed(1.5f));
+    const float second1 = delta(-0.2f, -0.5f, 6.0f, mixed(3.0f));
+
+    CHECK(latent[0] == doctest::Approx(1.0f + first0));
+    CHECK(latent[1] == doctest::Approx(2.0f + first0));
+    CHECK(latent[2] == doctest::Approx(3.0f + second0));
+    CHECK(latent[3] == doctest::Approx(4.0f + first1));
+    CHECK(latent[4] == doctest::Approx(5.0f + first1));
+    CHECK(latent[5] == doctest::Approx(6.0f + second1));
+}
+
+TEST_CASE("sanotts_a_zero_mix_bound_is_the_term_removed_not_a_small_one") {
+    // The ablation that separates this term from `frame_gain` has to be an
+    // absence. A zero bound is not `bounded(x, 0)`, which is the identity: it
+    // is the term not evaluated at all, exactly as the reference builds no
+    // mixing modules at that bound.
+    const std::vector<int32_t> durations = {2, 1};
+    const std::vector<float> conditioned = {0.0f, 0.0f, 0.0f, 0.0f};
+    const kokopop::SanoStyle style = unit_style();
+
+    auto render = [&](float bound, bool carry) {
+        kokopop::SanoVoice voice = make_film_voice();
+        voice.emo.frame_gain = 0.5f;
+        voice.emo.mix_rank = 1;
+        voice.emo.mix_bound = bound;
+        if (carry) {
+            voice.emo.mix_proj = {1.0f, 0.0f};
+            voice.emo.style_mix = {1.0f};
+            voice.emo.mix_basis = {0.0f, 1.0f};
+        }
+        std::vector<float> latent = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+        std::string error;
+        REQUIRE_MESSAGE(kokopop::sano_apply_emotion_latent(voice, durations, style,
+                                                           conditioned, 3, latent, error),
+                        error);
+        return latent;
+    };
+
+    const std::vector<float> without = render(0.0f, false);
+    // Weights present but bounded to nothing render the same voice: the loader
+    // refuses that pack, and the renderer does not quietly use them either.
+    CHECK(render(0.0f, true) == without);
+    // And the term does something when it is switched on, so the equality
+    // above is a real ablation and not a dead code path.
+    CHECK(render(0.5f, true) != without);
+}
