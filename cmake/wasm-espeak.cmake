@@ -1,10 +1,6 @@
 # Build the library for wasm and its language data with a host executable.
 # Both builds deliberately use exactly the same pinned eSpeak version.
-FetchContent_Declare(espeak
-  GIT_REPOSITORY https://github.com/espeak-ng/espeak-ng.git
-  GIT_TAG 4870adfa25b1a32b4361592f1be8a40337c58d6c
-  SOURCE_SUBDIR kokopop-populate-only)
-FetchContent_MakeAvailable(espeak)
+include(${CMAKE_CURRENT_LIST_DIR}/espeak-source.cmake)
 foreach(option COMPILE_INTONATIONS ENABLE_TESTS USE_ASYNC USE_MBROLA
     USE_LIBSONIC USE_LIBPCAUDIO USE_SPEECHPLAYER)
   set(${option} OFF CACHE BOOL "" FORCE)

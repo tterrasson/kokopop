@@ -1,0 +1,40 @@
+# The pinned eSpeak already has TranslateClauseWithTerminator internally.
+# Expose it through the same public ABI used by Piper, without changing the
+# old TextToPhonemes entry point or the language data. Idempotent on reconfigure.
+function(kokopop_patch_espeak_terminator source_dir)
+  set(header "${source_dir}/src/include/espeak-ng/speak_lib.h")
+  set(source "${source_dir}/src/libespeak-ng/speech.c")
+  file(READ "${header}" header_text)
+  file(READ "${source}" source_text)
+  if(NOT header_text MATCHES "espeak_TextToPhonemesWithTerminator")
+    set(anchor "ESPEAK_API const char *espeak_TextToPhonemes(const void **textptr, int textmode, int phonememode);")
+    string(FIND "${header_text}" "${anchor}" position)
+    if(position EQUAL -1)
+      message(FATAL_ERROR "Unexpected eSpeak header for terminator backport")
+    endif()
+    string(REPLACE "${anchor}" "${anchor}\n\n#ifdef __cplusplus\nextern \"C\"\n#endif\nESPEAK_API const char *espeak_TextToPhonemesWithTerminator(const void **textptr, int textmode, int phonememode, int *terminator);"
+      header_text "${header_text}")
+    file(WRITE "${header}" "${header_text}")
+  endif()
+  if(NOT source_text MATCHES "ESPEAK_API const char \\*espeak_TextToPhonemesWithTerminator")
+    set(signature "ESPEAK_API const char *espeak_TextToPhonemes(const void **textptr, int textmode, int phonememode)")
+    string(FIND "${source_text}" "${signature}" begin)
+    string(FIND "${source_text}" "ESPEAK_NG_API espeak_ng_STATUS espeak_ng_Cancel(void)" end)
+    if(begin EQUAL -1 OR end LESS begin)
+      message(FATAL_ERROR "Unexpected eSpeak source for terminator backport")
+    endif()
+    math(EXPR length "${end} - ${begin}")
+    string(SUBSTRING "${source_text}" ${begin} ${length} original)
+    string(FIND "${original}" "TranslateClause(translator, NULL, NULL);" call_position)
+    if(call_position EQUAL -1)
+      message(FATAL_ERROR "Unexpected eSpeak clause call for terminator backport")
+    endif()
+    string(REPLACE "${signature}"
+      "ESPEAK_API const char *espeak_TextToPhonemesWithTerminator(const void **textptr, int textmode, int phonememode, int *terminator)"
+      extended "${original}")
+    string(REPLACE "TranslateClause(translator, NULL, NULL);"
+      "TranslateClauseWithTerminator(translator, NULL, NULL, terminator);" extended "${extended}")
+    string(REPLACE "${original}" "${original}${extended}" source_text "${source_text}")
+    file(WRITE "${source}" "${source_text}")
+  endif()
+endfunction()

@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <string_view>
 #include <unordered_map>
@@ -9,6 +11,7 @@
 #include <espeak-ng/speak_lib.h>
 
 #include "synthesis/g2p/zh_g2p.h"
+#include "core/utf8.h"
 
 namespace kokopop {
 namespace {
@@ -251,7 +254,23 @@ EspeakSession & espeak_session() {
     static EspeakSession session;
     static std::once_flag once;
     std::call_once(once, [] {
-        session.init_result = espeak_Initialize(AUDIO_OUTPUT_SYNCHRONOUS, 0, nullptr, 0);
+        const char * data_path = nullptr;
+#ifdef KOKOPOP_ESPEAK_BUILD_DATA_DIR
+        // Respect explicit deployment paths, then prefer installed data over
+        // the build tree. Both belong to the bundled library's pinned version.
+        data_path = std::getenv("ESPEAK_DATA_PATH");
+        if (data_path == nullptr || *data_path == '\0') {
+            FILE * installed = std::fopen(KOKOPOP_ESPEAK_INSTALL_DATA_DIR "/phondata", "rb");
+            if (installed != nullptr) {
+                std::fclose(installed);
+                data_path = KOKOPOP_ESPEAK_INSTALL_DATA_DIR;
+            } else {
+                data_path = KOKOPOP_ESPEAK_BUILD_DATA_DIR;
+            }
+        }
+#endif
+        session.init_result = espeak_Initialize(AUDIO_OUTPUT_SYNCHRONOUS, 0, data_path,
+                                                espeakINITIALIZE_DONT_EXIT);
     });
     return session;
 }
@@ -294,6 +313,71 @@ bool espeak_phonemize_raw(const std::string & text,
         if (input_ptr == nullptr || static_cast<const char *>(input_ptr)[0] == '\0') {
             break;
         }
+    }
+    return true;
+}
+
+bool espeak_phonemize_piper(const std::string & text,
+                            const std::string & espeak_voice,
+                            std::string & phonemes,
+                            std::string & error) {
+    phonemes.clear();
+    size_t offset = 0;
+    std::string_view ch;
+    while (utf8_next(text, offset, ch)) {}
+    if (offset != text.size() || text.find('\0') != std::string::npos) {
+        error = "text is not valid UTF-8 or contains a NUL byte";
+        return false;
+    }
+    EspeakSession & session = espeak_session();
+    if (session.init_result < 0) {
+        error = "failed to initialize eSpeak-ng";
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(session.mutex);
+    if (espeak_SetVoiceByName(espeak_voice.c_str()) != EE_OK) {
+        error = "failed to select eSpeak-ng voice: " + espeak_voice;
+        return false;
+    }
+
+    const void * input = text.c_str();
+    while (input != nullptr) {
+        int terminator = 0;
+        const char * raw = espeak_TextToPhonemesWithTerminator(
+            &input, espeakCHARS_UTF8, espeakPHONEMES_IPA, &terminator);
+        if (raw == nullptr) {
+            break;
+        }
+        // Piper removes nonempty parenthesized language flags from the IPA,
+        // not from the source text. Do not discard an unmatched parenthesis.
+        const std::string_view part(raw);
+        for (size_t i = 0; i < part.size();) {
+            if (part[i] == '(') {
+                const size_t end = part.find(')', i + 1);
+                if (end != std::string_view::npos && end > i + 1) {
+                    i = end + 1;
+                    continue;
+                }
+            }
+            phonemes.push_back(part[i++]);
+        }
+
+        // eSpeak's clause ABI (translate.h): low 12 bits encode pause,
+        // bits 12..14 intonation, bits 16..19 clause type. These constants
+        // are not exposed by speak_lib.h. Match the six Piper terminators;
+        // internal pauses and EOF must not invent punctuation.
+        switch (terminator & 0x000fffff) {
+        case 0x80028: phonemes += '.'; break;
+        case 0x82028: phonemes += '?'; break;
+        case 0x8302d: phonemes += '!'; break;
+        case 0x41014: phonemes += ", "; break;
+        case 0x4001e: phonemes += ": "; break;
+        case 0x4101e: phonemes += "; "; break;
+        }
+    }
+    if (phonemes.empty()) {
+        error = "phonemization produced nothing for: " + text;
+        return false;
     }
     return true;
 }

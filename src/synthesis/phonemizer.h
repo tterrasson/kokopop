@@ -43,4 +43,11 @@ bool espeak_phonemize_raw(const std::string & text,
                           std::string & phonemes,
                           std::string & error);
 
+/// Piper IPA: pass the complete text to eSpeak, retain its clause terminators
+/// and remove language-switch flags. NFD decomposition is left to the tokenizer.
+bool espeak_phonemize_piper(const std::string & text,
+                            const std::string & espeak_voice,
+                            std::string & phonemes,
+                            std::string & error);
+
 } // namespace kokopop

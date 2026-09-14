@@ -22,6 +22,17 @@ if(NOT TARGET kokopop::kokopop)
   if("@KOKOPOP_LIBRARY_TYPE@" STREQUAL "STATIC")
     find_dependency(ggml)
     find_dependency(yyjson)
+    if("@KOKOPOP_BUNDLED_ESPEAK@" AND NOT TARGET kokopop::espeak)
+      add_library(kokopop::espeak STATIC IMPORTED)
+      set_and_check(_kokopop_espeak "@PACKAGE_CMAKE_INSTALL_LIBDIR@/@CMAKE_STATIC_LIBRARY_PREFIX@kokopop-espeak@CMAKE_STATIC_LIBRARY_SUFFIX@")
+      set_and_check(_kokopop_espeak_ucd "@PACKAGE_CMAKE_INSTALL_LIBDIR@/@CMAKE_STATIC_LIBRARY_PREFIX@kokopop-espeak-ucd@CMAKE_STATIC_LIBRARY_SUFFIX@")
+      set_target_properties(kokopop::espeak PROPERTIES
+        IMPORTED_LOCATION "${_kokopop_espeak}"
+        INTERFACE_LINK_LIBRARIES "${_kokopop_espeak_ucd}")
+      if(NOT MSVC)
+        set_property(TARGET kokopop::espeak APPEND PROPERTY INTERFACE_LINK_LIBRARIES m)
+      endif()
+    endif()
     set_property(TARGET kokopop::kokopop APPEND PROPERTY
       INTERFACE_LINK_LIBRARIES "@KOKOPOP_STATIC_LINK_LIBRARIES@")
   endif()

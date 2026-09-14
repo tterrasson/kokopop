@@ -57,6 +57,13 @@ MCU variants, Piperlite decoders with `res_layers != 1`, an output adapter or
 - C++17 / C11 compiler (GCC 11+, Clang 14+, MSVC 2019+)
 - [libespeak-ng](https://github.com/espeak-ng/espeak-ng) (phonemization)
 
+For `piper_espeak` voices (including sanofr exports), CMake uses a compatible
+system eSpeak-ng or automatically downloads and builds a pinned copy with the
+clause API backported. WebAssembly uses the same backport. The bundled native
+library and its language data are installed privately with kokopop; the system
+package is not replaced. For a relocated installation, set `ESPEAK_DATA_PATH`
+to its `share/kokopop/espeak-ng-data` directory.
+
 ### Build
 
 Install `espeak-ng` (required for phonemization):

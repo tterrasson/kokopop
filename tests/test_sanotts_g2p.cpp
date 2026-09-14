@@ -1,6 +1,7 @@
 #include "arch/sanotts/sano_frontend_text.h"
 #include "arch/sanotts/sano_tokenizer.h"
 #include "sanotts_corpus.h"
+#include "synthesis/phonemizer.h"
 
 #include <map>
 #include <string>
@@ -282,18 +283,25 @@ TEST_CASE("sanotts_the_two_contracts_use_different_punctuation_sets") {
 TEST_CASE("sanotts_the_piper_espeak_contract_keeps_words_whole") {
     std::string phonemes;
     std::string error;
-    const std::string_view marks = sano::PIPER_ESPEAK_PUNCTUATION_MARKS;
-    CHECK(marks.find('\'') == std::string_view::npos);
-    CHECK(marks.find('-') == std::string_view::npos);
-    CHECK(marks.find('"') == std::string_view::npos);
-
-    REQUIRE(sano::phonemize_piper_sanotts("L'acier est froid.", "fr", marks,
+    REQUIRE(kokopop::espeak_phonemize_piper("L'acier est froid.", "fr",
                                           phonemes, error));
     CHECK_EQ(phonemes, "lasjˈe ɛ fʁwˈa.");
-    REQUIRE(sano::phonemize_piper_sanotts("peut-être", "fr", marks, phonemes, error));
+    REQUIRE(kokopop::espeak_phonemize_piper("peut-être", "fr", phonemes, error));
     CHECK_EQ(phonemes, "pˈøtˈɛtʁ");
-    REQUIRE(sano::phonemize_piper_sanotts("Un (deux) trois.", "fr", marks, phonemes, error));
-    CHECK_EQ(phonemes, "œ̃ dˈø tʁwˈa.");
+    REQUIRE(kokopop::espeak_phonemize_piper("Un (deux) trois.", "fr", phonemes, error));
+    CHECK(phonemes.find('(') == std::string::npos);
+    CHECK(phonemes.find(')') == std::string::npos);
+
+    // The comma belongs to the number, not to a clause boundary. Stripping
+    // punctuation before calling eSpeak incorrectly inserts a comma token.
+    REQUIRE(kokopop::espeak_phonemize_piper("Il vaut 3,14 euros.", "fr", phonemes, error));
+    CHECK(phonemes.find(',') == std::string::npos);
+
+    // Foreign words may make eSpeak emit language-switch flags. Their letters
+    // must not enter the Piper phoneme table as additional spoken symbols.
+    REQUIRE(kokopop::espeak_phonemize_piper("Le software est cool.", "fr", phonemes, error));
+    CHECK(phonemes.find('(') == std::string::npos);
+    CHECK(phonemes.find(')') == std::string::npos);
 
     // The same text under sanoTTS's set, which is what those voices trained on.
     REQUIRE(sano::phonemize_piper_sanotts("L'acier est froid.", "fr",
@@ -309,6 +317,9 @@ TEST_CASE("sanotts_phonemization_rejects_invalid_utf8_input") {
     std::string error;
     const std::string truncated = "hello \xc3";  // a lone UTF-8 lead byte
     CHECK_FALSE(sano::phonemize_misaki_sanotts(truncated, "gmw/en-US", phonemes, error));
+    CHECK(error.find("UTF-8") != std::string::npos);
+
+    CHECK_FALSE(kokopop::espeak_phonemize_piper(truncated, "gmw/en-US", phonemes, error));
     CHECK(error.find("UTF-8") != std::string::npos);
 
     CHECK_FALSE(sano::phonemize_piper_sanotts(truncated, "gmw/en-US",

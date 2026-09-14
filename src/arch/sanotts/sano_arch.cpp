@@ -8,6 +8,7 @@
 // the disagreement named, not silently reinterpreted.
 
 #include "arch/sanotts/sano_arch.h"
+#include "synthesis/phonemizer.h"
 
 #include "arch/sanotts/sano_frontend_text.h"
 #include "arch/sanotts/sano_noise.h"
@@ -314,13 +315,12 @@ const IstftPlan * SanoArch::istft_plan(uint32_t n_fft, uint32_t hop) const {
 
 bool SanoArch::phonemize(const std::string & text, const VoiceDesc & voice,
                          std::string & phonemes, std::string & error) const {
-    if (is_piper_frontend(voice.frontend)) {
-        // The only thing the two Piper contracts disagree on, and the voice
-        // says which it was trained with.
-        const char * marks = voice.frontend == FrontendKind::Piper
-            ? sano::PIPER_PUNCTUATION_MARKS
-            : sano::PIPER_ESPEAK_PUNCTUATION_MARKS;
-        return sano::phonemize_piper_sanotts(text, voice.espeak_voice, marks,
+    if (voice.frontend == FrontendKind::PiperEspeak) {
+        return espeak_phonemize_piper(text, voice.espeak_voice, phonemes, error);
+    }
+    if (voice.frontend == FrontendKind::Piper) {
+        return sano::phonemize_piper_sanotts(text, voice.espeak_voice,
+                                             sano::PIPER_PUNCTUATION_MARKS,
                                              phonemes, error);
     }
     return sano::phonemize_misaki_sanotts(text, voice.espeak_voice, phonemes, error);

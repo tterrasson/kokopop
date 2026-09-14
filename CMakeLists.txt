@@ -163,13 +163,32 @@ if(ESPEAK_NG_FOUND)
 else()
   find_path(ESPEAK_NG_INCLUDE_DIR espeak-ng/speak_lib.h)
   find_library(ESPEAK_NG_LIBRARY espeak-ng)
-  if(NOT ESPEAK_NG_INCLUDE_DIR OR NOT ESPEAK_NG_LIBRARY)
-    message(FATAL_ERROR "libespeak-ng is required but was not found")
+  if(ESPEAK_NG_INCLUDE_DIR AND ESPEAK_NG_LIBRARY)
+    set(KOKOPOP_ESPEAK_LIBRARIES ${ESPEAK_NG_LIBRARY})
+    set(KOKOPOP_ESPEAK_INCLUDE_DIRS ${ESPEAK_NG_INCLUDE_DIR})
   endif()
-  set(KOKOPOP_ESPEAK_LIBRARIES ${ESPEAK_NG_LIBRARY})
-  set(KOKOPOP_ESPEAK_INCLUDE_DIRS ${ESPEAK_NG_INCLUDE_DIR})
 endif()
 
+endif()
+
+# Prefer a compatible system library, otherwise build the pinned API backport.
+if(NOT EMSCRIPTEN)
+  include(CMakePushCheckState)
+  include(CheckCXXSymbolExists)
+  cmake_push_check_state(RESET)
+  set(CMAKE_REQUIRED_INCLUDES ${KOKOPOP_ESPEAK_INCLUDE_DIRS})
+  set(CMAKE_REQUIRED_LIBRARIES ${KOKOPOP_ESPEAK_LIBRARIES})
+  # Recheck when users upgrade or change the selected system library.
+  unset(KOKOPOP_SYSTEM_ESPEAK_TERMINATOR CACHE)
+  if(KOKOPOP_ESPEAK_LIBRARIES)
+    check_cxx_symbol_exists(espeak_TextToPhonemesWithTerminator
+      "espeak-ng/speak_lib.h" KOKOPOP_SYSTEM_ESPEAK_TERMINATOR)
+  endif()
+  cmake_pop_check_state()
+  if(NOT KOKOPOP_ESPEAK_LIBRARIES OR NOT KOKOPOP_SYSTEM_ESPEAK_TERMINATOR)
+    message(STATUS "kokopop: using bundled eSpeak-ng with Piper clause API")
+    include(cmake/bundled-espeak.cmake)
+  endif()
 endif()
 
 option(KOKOPOP_ENABLE_OPUS "Enable Ogg/Opus streaming output" ON)
@@ -314,6 +333,14 @@ add_library(kokopop
   ${_kokopop_playback_sources}
   src/kokopop.cpp
 )
+
+if(KOKOPOP_BUNDLED_ESPEAK)
+  include(GNUInstallDirs)
+  add_dependencies(kokopop ${KOKOPOP_ESPEAK_DATA_TARGET})
+  target_compile_definitions(kokopop PRIVATE
+    KOKOPOP_ESPEAK_BUILD_DATA_DIR="${KOKOPOP_ESPEAK_DATA_DIR}"
+    KOKOPOP_ESPEAK_INSTALL_DATA_DIR="${CMAKE_INSTALL_FULL_DATADIR}/kokopop/espeak-ng-data")
+endif()
 
 target_include_directories(kokopop
   PUBLIC
@@ -592,6 +619,17 @@ if(KOKOPOP_INSTALL)
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
   )
   install(FILES include/kokopop.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+  if(KOKOPOP_BUNDLED_ESPEAK)
+    # Private names avoid overwriting an older system eSpeak installation.
+    install(FILES $<TARGET_FILE:espeak-ng>
+      DESTINATION ${CMAKE_INSTALL_LIBDIR}
+      RENAME ${CMAKE_STATIC_LIBRARY_PREFIX}kokopop-espeak${CMAKE_STATIC_LIBRARY_SUFFIX})
+    install(FILES $<TARGET_FILE:ucd>
+      DESTINATION ${CMAKE_INSTALL_LIBDIR}
+      RENAME ${CMAKE_STATIC_LIBRARY_PREFIX}kokopop-espeak-ucd${CMAKE_STATIC_LIBRARY_SUFFIX})
+    install(DIRECTORY ${KOKOPOP_ESPEAK_DATA_DIR}
+      DESTINATION ${CMAKE_INSTALL_DATADIR}/kokopop)
+  endif()
 
   if(KOKOPOP_BUILD_TOOLS)
     install(TARGETS kokopop_say kokopop_stream kokopop_play kokopop_probe
@@ -628,6 +666,10 @@ if(KOKOPOP_INSTALL)
       ggml::ggml yyjson::yyjson Threads::Threads
       ${KOKOPOP_ESPEAK_LIBRARIES}
       ${CMAKE_CXX_IMPLICIT_LINK_LIBRARIES})
+  if(KOKOPOP_BUNDLED_ESPEAK)
+    list(REMOVE_ITEM KOKOPOP_STATIC_LINK_LIBRARIES espeak-ng)
+    list(APPEND KOKOPOP_STATIC_LINK_LIBRARIES kokopop::espeak)
+  endif()
   if(KOKOPOP_ENABLE_OPUS)
     list(APPEND KOKOPOP_STATIC_LINK_LIBRARIES
       ${KOKOPOP_OPUSENC_LIBRARIES}

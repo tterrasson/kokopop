@@ -22,14 +22,6 @@ const char * const MISAKI_PUNCTUATION_MARKS = ";:,.!?¡¿—…\"«»“”(){}[
 // were trained on.
 const char * const PIPER_PUNCTUATION_MARKS = "!'(),-.:;?\"";
 
-// Piper's *own* frontend hides nothing: it hands espeak the whole clause and
-// appends only the terminator espeak reports back, which is one of these. A
-// pack trained through `PiperVoice.phonemize` rather than through sanoTTS's
-// `phonemizer` wrapper therefore never saw an apostrophe, a hyphen, a quote or
-// a bracket -- and, crucially, saw "l'acier" as one word (`lasjˈe`) instead of
-// two (`ˈɛl'asjˈe`, "elle acier").
-const char * const PIPER_ESPEAK_PUNCTUATION_MARKS = "!,.:;?";
-
 namespace {
 
 /// espeak phoneme mode: IPA, plus the tie character in bits 8-23.

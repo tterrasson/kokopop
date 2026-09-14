@@ -35,11 +35,9 @@ enum class Arch {
 /// than the espeak flags: misaki normalises espeak's output and frames the ids
 /// as [BOS] ids [EOS], Piper decomposes to NFD and interleaves a PAD id.
 ///
-/// The two Piper kinds share everything but the punctuation they hide from
-/// espeak. `Piper` is sanoTTS's own frontend, which hides Piper's whole
-/// phoneme-table punctuation set; `PiperEspeak` is Piper's, which hides only
-/// espeak's clause terminators. An apostrophe is the visible difference:
-/// hidden, it splits "l'acier" into "elle acier".
+/// `Piper` is sanoTTS's frontend, which hides phoneme-table punctuation before
+/// eSpeak. `PiperEspeak` passes the full text, retains eSpeak's reported clause
+/// terminators and removes language-switch flags, as Piper itself does.
 enum class FrontendKind {
     Misaki      = 0,
     Piper       = 1,

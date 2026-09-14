@@ -2,7 +2,7 @@
 
 // sanoTTS text -> phonemes.
 //
-// Two contracts, neither of them kokopop's Kokoro path:
+// The sanoTTS contracts, distinct from kokopop's Kokoro path:
 //
 //   misaki (heart, heartnano)
 //       espeak-ng with `tie='^'`, punctuation hidden from espeak and restored
@@ -17,11 +17,9 @@
 //       normalisation at all — the tokenizer maps raw IPA code points.
 //
 //   piper_espeak (packs trained through Piper's own `PiperVoice.phonemize`)
-//       The same contract, with a narrower punctuation set. The difference is
-//       not cosmetic: the wider set hides an apostrophe from espeak, which
-//       makes "l'acier" two words and "doctor's" end in a spelled-out "ess".
-//       Which of the two a voice wants is which one it was trained with, so it
-//       is a property of the voice and not of the architecture.
+//       Implemented by espeak_phonemize_piper in synthesis/phonemizer.h:
+//       whole text passed to eSpeak, reported clause terminators retained,
+//       language-switch flags removed. No punctuation is hidden beforehand.
 //
 // The reference implementations are `phonemizer` (GPL-3.0) and `misaki`
 // (Apache-2.0), driven by `pypkg/sanotts/frontend.py` (MIT). Nothing here is a
@@ -54,8 +52,8 @@ bool phonemize_misaki_sanotts(const std::string & text,
 /// Text -> raw espeak IPA for a sanoTTS piperlite voice.
 ///
 /// No normalisation, `marks` preserved, and the trailing separator space that
-/// the reference strips is stripped here too. `marks` is the voice's own set:
-/// `PIPER_PUNCTUATION_MARKS` or `PIPER_ESPEAK_PUNCTUATION_MARKS`.
+/// the reference strips is stripped here too. The sanoTTS Piper frontend uses
+/// `PIPER_PUNCTUATION_MARKS`. Piper's own frontend uses espeak_phonemize_piper.
 bool phonemize_piper_sanotts(const std::string & text,
                              const std::string & espeak_voice,
                              std::string_view marks,
@@ -69,11 +67,9 @@ bool phonemize_piper_sanotts(const std::string & text,
 /// The punctuation marks each contract hides from espeak.
 ///
 /// misaki uses phonemizer's default set; sanoTTS's Piper frontend passes the
-/// ASCII punctuation present in Piper's phoneme tables; Piper's own frontend
-/// hides only the clause terminators espeak reports back.
+/// ASCII punctuation present in Piper's phoneme tables.
 extern const char * const MISAKI_PUNCTUATION_MARKS;
 extern const char * const PIPER_PUNCTUATION_MARKS;
-extern const char * const PIPER_ESPEAK_PUNCTUATION_MARKS;
 
 /// Phonemize `text` while keeping its punctuation.
 ///

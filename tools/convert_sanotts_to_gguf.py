@@ -1054,9 +1054,9 @@ def sibilant_contract(name: str, manifest: dict, out_channels: int,
 def piper_frontend_kind(name: str, manifest: dict) -> str:
     """Which of the two Piper G2P contracts this pack was *trained* with.
 
-    They differ only in the punctuation hidden from espeak, but that decides
-    whether "l'acier" is one word or two ("elle acier"), so it has to follow
-    the pack rather than the architecture.
+    Piper passes the whole text to espeak and removes language-switch flags;
+    sanoTTS hides punctuation first. This decides whether "l'acier" is one
+    word or two ("elle acier"), so the frontend has to follow the pack.
 
       sanotts  sanoTTS's own frontend: `phonemizer` with `preserve_punctuation`
                and Piper's whole phoneme-table set. The upstream voices.
