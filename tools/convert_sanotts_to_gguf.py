@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Convert sanoTTS voices to a kokopop GGUF.
 
 Two input families, packaged very differently:
@@ -337,7 +336,7 @@ def fetch(relative: str, cache_dir: Path, revision: str) -> Path:
     url = hf_url(relative, revision)
     logger.info("downloading %s", url)
     try:
-        with urllib.request.urlopen(url, timeout=300) as response:  # noqa: S310
+        with urllib.request.urlopen(url, timeout=300) as response:
             payload = response.read()
     except OSError as exc:
         raise ConversionError(
@@ -964,7 +963,7 @@ class VoiceBuild:
     length_scale: float
     espeak_voice: str
     normalization_lang: str
-    frontend: str  # "piper" | "misaki"
+    frontend: str  # "piper" | "piper_espeak" | "misaki"
     decoder: str  # "piperlite" | "vocos"
     max_tokens: int
     token_symbols: list[str]
@@ -1003,6 +1002,84 @@ def flatten_conv1d(name: str, array: np.ndarray) -> np.ndarray:
         raise ConversionError(f"{name}: expected a 3D conv1d kernel, got {array.shape}")
     oc, ic, k = array.shape
     return array.reshape(oc, ic * k)
+
+
+def sibilant_contract(name: str, manifest: dict, out_channels: int,
+                      vocab: int) -> dict | None:
+    """The voice's sibilant-noise calibration, or None when it has one.
+
+    A deterministic acoustic student regresses the mean latent, and the mean of
+    broadband hiss is a whistle: /s z ʃ ʒ/ come out tonal. The training-side
+    fix is to put the teacher's per-channel variance back at exactly those
+    frames, at inference, which means a pack that omits the calibration
+    describes a voice nobody listened to.
+
+    The draw is independent per frame and per channel, so what crosses the file
+    is the *distribution* -- a strength, a per-channel standard deviation and
+    the phoneme ids it applies to -- and never a noise stream. Two runtimes draw
+    different noise and render the same voice.
+    """
+    contract = manifest.get("inference", {}).get("sibilants")
+    if contract is None:
+        return None
+    capability = contract.get("capability")
+    if capability != "sanofr.sibilant-noise.v1":
+        raise ConversionError(
+            f"{name}: unknown sibilant capability {capability!r}"
+        )
+    beta = float(contract["beta"])
+    std = [float(x) for x in contract["channel_std"]]
+    ids = [int(x) for x in contract["phoneme_ids"]]
+    if not (beta > 0.0 and math.isfinite(beta)):
+        raise ConversionError(f"{name}: sibilant beta must be finite and positive")
+    if len(std) != out_channels:
+        raise ConversionError(
+            f"{name}: sibilant channel_std has {len(std)} entries for "
+            f"{out_channels} latent channels"
+        )
+    if not all(math.isfinite(x) and x >= 0.0 for x in std):
+        raise ConversionError(f"{name}: sibilant channel_std must be finite and non-negative")
+    if not ids or len(set(ids)) != len(ids):
+        raise ConversionError(f"{name}: sibilant phoneme_ids must be a nonempty set")
+    # An id the acoustic embedding cannot hold would never match a token, so it
+    # is a calibration built against a different voice rather than a harmless
+    # extra.
+    if any(not 0 <= i < vocab for i in ids):
+        raise ConversionError(
+            f"{name}: sibilant phoneme_ids fall outside the acoustic vocab of {vocab}"
+        )
+    return {"beta": beta, "channel_std": std, "phoneme_ids": sorted(ids)}
+
+
+def piper_frontend_kind(name: str, manifest: dict) -> str:
+    """Which of the two Piper G2P contracts this pack was *trained* with.
+
+    They differ only in the punctuation hidden from espeak, but that decides
+    whether "l'acier" is one word or two ("elle acier"), so it has to follow
+    the pack rather than the architecture.
+
+      sanotts  sanoTTS's own frontend: `phonemizer` with `preserve_punctuation`
+               and Piper's whole phoneme-table set. The upstream voices.
+      piper    Piper's own `PiperVoice.phonemize`: the clause goes to espeak
+               whole and only espeak's terminator comes back.
+
+    Absent, it is the sanoTTS contract -- which is what every upstream pack
+    was, and the only thing this converter could produce before. A pack that
+    carries a `sanofr` record but no declaration predates the declaration and
+    is a Piper-frontend pack: sanofr has only ever trained through
+    `PiperVoice.phonemize`.
+    """
+    declared = manifest.get("frontend", {}).get("phonemizer")
+    if declared is None:
+        return "piper_espeak" if "sanofr" in manifest else "piper"
+    if declared == "sanotts":
+        return "piper"
+    if declared == "piper":
+        return "piper_espeak"
+    raise ConversionError(
+        f"{name}: unknown frontend.phonemizer {declared!r} "
+        "(expected \"sanotts\" or \"piper\")"
+    )
 
 
 def build_piperlite_voice(
@@ -1086,6 +1163,7 @@ def build_piperlite_voice(
             )
 
     table = parse_piper_phoneme_config(name, pack.phoneme_config)
+    frontend = piper_frontend_kind(name, manifest)
 
     dur_vocab = int(dur_base_cfg["vocab_size"])
     dur_hidden = int(dur_base_cfg["hidden"])
@@ -1097,6 +1175,8 @@ def build_piperlite_voice(
     ac_token_depth = int(ac_base_cfg["token_depth"])
     ac_kernel = int(ac_base_cfg.get("kernel_size") or 5)
     ac_out = int(ac_base_cfg["out_channels"])
+    ac_token_dilation = int(ac_base_cfg.get("token_dilation_base") or 1)
+    ac_frame_dilation = int(ac_base_cfg.get("frame_dilation_base") or 1)
     channels = [int(c) for c in dec_cfg["channels"][:4]]
 
     build = VoiceBuild(
@@ -1110,7 +1190,7 @@ def build_piperlite_voice(
         # The Piper frontend applies no misaki normalisation; the field is
         # carried anyway so every voice has one well-defined value.
         normalization_lang="a",
-        frontend="piper",
+        frontend=frontend,
         decoder="piperlite",
         max_tokens=int(dur_base_cfg["max_tokens"]),
         token_symbols=table.symbols,
@@ -1138,6 +1218,11 @@ def build_piperlite_voice(
             "ac.depth": ac_depth,
             "ac.kernel": ac_kernel,
             "ac.out_channels": ac_out,
+            # Reach, not size. Block i of a stack dilates by base ** i; 1 is
+            # the undilated stack, and is what the runtime assumes of a file
+            # that carries neither key.
+            "ac.token_dilation_base": ac_token_dilation,
+            "ac.frame_dilation_base": ac_frame_dilation,
             "dec.post_filter_channels": int(dec_cfg.get("post_filter_channels") or 0),
             "dec.post_filter_layers": int(dec_cfg.get("post_filter_layers") or 0),
             "dec.post_filter_kernel": int(dec_cfg.get("post_filter_kernel") or 9),
@@ -1149,6 +1234,12 @@ def build_piperlite_voice(
     build.array_meta["dec.channels"] = channels
     for stage in range(3):
         build.array_meta[f"dec.branches.{stage}"] = [0, 1, 2]
+
+    sibilants = sibilant_contract(name, manifest, ac_out, ac_vocab)
+    if sibilants is not None:
+        build.float_meta["sib.beta"] = sibilants["beta"]
+        build.float_array_meta["sib.channel_std"] = sibilants["channel_std"]
+        build.array_meta["sib.phoneme_ids"] = sibilants["phoneme_ids"]
 
     # -- duration ----------------------------------------------------------
     def take(tensors: dict[str, np.ndarray], key: str, where: str) -> np.ndarray:
@@ -1273,6 +1364,51 @@ def build_piperlite_voice(
                 f32=True,
             )
         )
+    # Optional, and only ever written by a run that trained it: absent means
+    # the token stack carries no line-wide term, which is what every voice
+    # exported before the option existed was trained as.
+    if base_prefix + "token_global.weight" in ac_tensors:
+        add(
+            VoiceTensor(
+                "ac.token_global.weight",
+                expect(
+                    take(ac_tensors, base_prefix + "token_global.weight", "acoustic"),
+                    (ac_hidden, 3 * ac_hidden),
+                    "ac.token_global.weight",
+                ),
+            )
+        )
+        add(
+            VoiceTensor(
+                "ac.token_global.bias",
+                expect(
+                    take(ac_tensors, base_prefix + "token_global.bias", "acoustic"),
+                    (ac_hidden,),
+                    "ac.token_global.bias",
+                ),
+                f32=True,
+            )
+        )
+    modulation_keys = ("global_norm.weight", "global_norm.bias",
+                       "global_gate.weight", "global_gate.bias")
+    has_modulation = any(base_prefix + key in ac_tensors for key in modulation_keys)
+    context_mode = ac_base_cfg.get("global_context_mode", "additive")
+    if context_mode not in ("additive", "local_gate"):
+        raise ConversionError(f"Unsupported global context mode: {context_mode}")
+    if has_modulation != (bool(ac_base_cfg.get("global_context")) and context_mode == "local_gate"):
+        raise ConversionError("Global modulation weights disagree with acoustic config")
+    if has_modulation:
+        for key, shape in (
+            ("global_norm.weight", (3 * ac_hidden,)),
+            ("global_norm.bias", (3 * ac_hidden,)),
+            ("global_gate.weight", (ac_hidden, 2 * ac_hidden, 1)),
+            ("global_gate.bias", (ac_hidden,)),
+        ):
+            tensor = expect(take(ac_tensors, base_prefix + key, "acoustic"), shape, key)
+            if key == "global_gate.weight":
+                tensor = tensor.squeeze(-1)
+            add(VoiceTensor("ac." + key, tensor,
+                            f32=key != "global_gate.weight"))
     _add_residual_blocks(
         build, name, ac_tensors, base_prefix + "token_blocks", "ac.token_blocks",
         ac_token_depth, ac_hidden, ac_kernel,
@@ -2705,7 +2841,7 @@ def build_voice(
                 "front": directory / voice.front_blob,
                 "dec": directory / voice.dec_blob,
             }
-            for label, path in paths.items():
+            for path in paths.values():
                 if not path.is_file():
                     raise ConversionError(f"--voice-dir {directory}: missing {path.name}")
         else:

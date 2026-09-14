@@ -114,6 +114,51 @@ ggml_tensor * residual_stack(ggml_context * ctx, ggml_tensor * x_ct,
     return ggml_cont(ctx, ggml_transpose(ctx, x));
 }
 
+/// Adds the line's summary to every token of a `[C, T]` activation.
+///
+/// `cat(mean_t, first, last) @ W + b`, added back to each of the T columns.
+/// The mean is the only reduction over T, so it is the only place the whole
+/// line enters; the two ends are the phrase boundaries. Returns `x`
+/// unchanged for a voice that carries no such layer, which is every voice
+/// exported before it existed.
+ggml_tensor * global_context(ggml_context * ctx, ggml_tensor * x,
+                             const SanoAcousticWeights & w, int64_t n_tokens,
+                             int64_t hidden) {
+    if (!w.has_global_context()) {
+        return x;
+    }
+    // x is [C, T]: ggml_mean reduces ne[0], so the mean over tokens is taken
+    // on the transpose and put back as a [C] vector.
+    ggml_tensor * mean = ggml_cont(ctx, ggml_transpose(ctx, x));
+    mean = ggml_reshape_1d(ctx, ggml_cont(ctx, ggml_mean(ctx, mean)), hidden);
+
+    ggml_tensor * first = ggml_view_1d(ctx, x, hidden, 0);
+    ggml_tensor * last =
+        ggml_view_1d(ctx, x, hidden, static_cast<size_t>(n_tokens - 1) * x->nb[1]);
+
+    ggml_tensor * summary = ggml_concat(ctx, mean, ggml_cont(ctx, first), 0);
+    summary = ggml_concat(ctx, summary, ggml_cont(ctx, last), 0);
+
+    if (w.global_norm_w != nullptr) {
+        summary = ggml_add(ctx,
+            ggml_mul(ctx, ggml_norm(ctx, summary, 1e-5f), w.global_norm_w),
+            w.global_norm_b);
+    }
+    ggml_tensor * term = ggml_mul_mat(ctx, w.token_global_w, summary);
+    ggml_mul_mat_set_prec(term, GGML_PREC_F32);
+    term = ggml_add(ctx, term, w.token_global_b);
+    if (w.global_gate_w != nullptr) {
+        term = ggml_repeat(ctx, term, x);
+        ggml_tensor * gate_input = ggml_concat(ctx, x, term, 0);
+        ggml_tensor * gate = ggml_mul_mat(ctx, w.global_gate_w, gate_input);
+        ggml_mul_mat_set_prec(gate, GGML_PREC_F32);
+        gate = ggml_sigmoid(ctx, ggml_add(ctx, gate, w.global_gate_b));
+        term = ggml_mul(ctx, gate, term);
+    }
+    // [C, 1] against [C, T]: broadcast along the token axis.
+    return ggml_add(ctx, x, term);
+}
+
 // ---------------------------------------------------------------------------
 // Host arithmetic for the emotion heads
 //
@@ -761,6 +806,7 @@ bool sano_run_acoustic_token(SanoArch & arch, const SanoVoice & voice,
 
     ggml_tensor * x = project(ctx, w.token_proj_w, w.token_proj_b, in.concat);
     x = residual_stack(ctx, x, w.token_blocks, hidden);
+    x = global_context(ctx, x, w, n_tokens, hidden);
 
     ggml_set_name(x, "sanotts_token_context");
     ggml_set_output(x);

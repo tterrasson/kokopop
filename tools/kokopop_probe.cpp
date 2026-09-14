@@ -121,6 +121,15 @@ void print_int_list(const char * key, const std::vector<int> & values) {
     std::printf("\n");
 }
 
+const char * frontend_name(kokopop::FrontendKind kind) {
+    switch (kind) {
+    case kokopop::FrontendKind::Misaki:      return "misaki";
+    case kokopop::FrontendKind::Piper:       return "piper";
+    case kokopop::FrontendKind::PiperEspeak: return "piper_espeak";
+    }
+    return "unknown";
+}
+
 int64_t utf8_codepoint_count(const std::string & text) {
     int64_t count = 0;
     size_t off = 0;
@@ -172,7 +181,7 @@ int probe_sanotts(kokopop::Model & model, const Options & options) {
     std::printf("arch=%s\n", arch->name());
     std::printf("voice=%s\n", voice->name.c_str());
     std::printf("frontend=%s\n",
-                voice->frontend == kokopop::FrontendKind::Piper ? "piper" : "misaki");
+                frontend_name(voice->frontend));
     std::printf("decoder=%s\n",
                 voice->decoder == kokopop::DecoderKind::PiperLite ? "piperlite" : "vocos");
     std::printf("sample_rate=%d\n", voice->sample_rate);
@@ -187,6 +196,15 @@ int probe_sanotts(kokopop::Model & model, const Options & options) {
         std::printf("style=%s\n",
                     options.style.empty() ? voice->default_style.c_str()
                                           : options.style.c_str());
+    }
+    const kokopop::SanoVoice * weights = arch->voice_for(*voice);
+    if (weights != nullptr && weights->sib.present()) {
+        std::string sib_ids;
+        for (const uint32_t id : weights->sib.phoneme_ids) {
+            sib_ids += (sib_ids.empty() ? "" : ",") + std::to_string(id);
+        }
+        std::printf("sibilant_beta=%.6f\n", static_cast<double>(weights->sib.beta));
+        std::printf("sibilant_ids=%s\n", sib_ids.c_str());
     }
     std::printf("phonemes=%s\n", phonemes.c_str());
     std::printf("token_count=%zu\n", ids.size());

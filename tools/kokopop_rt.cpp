@@ -160,8 +160,9 @@ std::string known_language_list() {
 
 const char * frontend_name(kokopop::FrontendKind kind) {
     switch (kind) {
-    case kokopop::FrontendKind::Misaki: return "misaki";
-    case kokopop::FrontendKind::Piper:  return "piper";
+    case kokopop::FrontendKind::Misaki:      return "misaki";
+    case kokopop::FrontendKind::Piper:       return "piper";
+    case kokopop::FrontendKind::PiperEspeak: return "piper_espeak";
     }
     return "unknown";
 }

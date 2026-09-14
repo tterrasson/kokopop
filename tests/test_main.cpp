@@ -28,6 +28,7 @@
 #include "test_sanotts_duration.cpp"
 #include "test_sanotts_emotion.cpp"
 #include "test_sanotts_decoder.cpp"
+#include "test_sanotts_sibilants.cpp"
 #include "test_sanotts_backends.cpp"
 #include "test_sanotts_http.cpp"
 #include "test_audio_utils.cpp"

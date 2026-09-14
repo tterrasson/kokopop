@@ -15,8 +15,20 @@ namespace kokopop::sano {
 // stays readable next to the ASCII half.
 const char * const MISAKI_PUNCTUATION_MARKS = ";:,.!?¡¿—…\"«»“”(){}[]";
 
-// Piper's set: the ASCII punctuation that appears in its phoneme_id_map.
+// Piper's set: the ASCII punctuation that appears in its phoneme_id_map. This
+// is the set sanoTTS's own frontend passes to `phonemizer`, so a voice trained
+// through it saw "doctor's" as `dˈɑːktɚ'ˈɛs` -- the apostrophe splits the word
+// and espeak spells the tail out. Wrong-looking, but it is what those voices
+// were trained on.
 const char * const PIPER_PUNCTUATION_MARKS = "!'(),-.:;?\"";
+
+// Piper's *own* frontend hides nothing: it hands espeak the whole clause and
+// appends only the terminator espeak reports back, which is one of these. A
+// pack trained through `PiperVoice.phonemize` rather than through sanoTTS's
+// `phonemizer` wrapper therefore never saw an apostrophe, a hyphen, a quote or
+// a bracket -- and, crucially, saw "l'acier" as one word (`lasjˈe`) instead of
+// two (`ˈɛl'asjˈe`, "elle acier").
+const char * const PIPER_ESPEAK_PUNCTUATION_MARKS = "!,.:;?";
 
 namespace {
 
@@ -355,11 +367,12 @@ bool phonemize_misaki_sanotts(const std::string & text,
 
 bool phonemize_piper_sanotts(const std::string & text,
                              const std::string & espeak_voice,
+                             std::string_view marks,
                              std::string & phonemes,
                              std::string & error) {
     std::string raw;
     if (!phonemize_preserving_punctuation(text, espeak_voice, ipa_mode_with_tie('\0'),
-                                          PIPER_PUNCTUATION_MARKS, raw, error)) {
+                                          marks, raw, error)) {
         return false;
     }
     // The reference right-strips before decomposing: phonemizer emits a

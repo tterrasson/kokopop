@@ -33,6 +33,8 @@ constexpr uint32_t SANO_MAX_DIM = 1u << 16;
 constexpr uint32_t SANO_MAX_DEPTH = 64;
 constexpr uint32_t SANO_MAX_KERNEL = 63;
 constexpr uint32_t SANO_MAX_VOICES = 256;
+constexpr int64_t SANO_MAX_DILATION = 1 << 20;
+constexpr uint32_t SANO_MAX_DILATION_BASE = 16;
 constexpr uint32_t SANO_SUPPORTED_VERSION = 1;
 
 /// Frames one chunk may reach. At hop 256 this is a little over three minutes
@@ -61,6 +63,15 @@ struct VoiceMeta {
             return false;
         }
         return true;
+    }
+
+    /// A key that older files legitimately do not carry, with the value their
+    /// absence means. Only for options whose default *is* the behaviour the
+    /// file was written with -- never for one where a guess would differ from
+    /// what the model was trained as.
+    uint32_t u32_or(const std::string & suffix, uint32_t fallback) const {
+        uint32_t value = 0;
+        return gguf_get_u32(ctx, (prefix + suffix).c_str(), value) ? value : fallback;
     }
 
     bool f32(const std::string & suffix, float & out, std::string & error) const {
@@ -205,16 +216,30 @@ bool read_scalar(Backend & backend, ggml_tensor * tensor, float & out,
 bool load_res_blocks(TensorLoader & loader, Backend & backend,
                      const std::string & prefix, const std::string & stem,
                      uint32_t count, uint32_t channels, uint32_t kernel,
-                     std::vector<SanoResBlock> & blocks, std::string & error) {
+                     std::vector<SanoResBlock> & blocks, std::string & error,
+                     uint32_t dilation_base = 1) {
     const int64_t ch = static_cast<int64_t>(channels);
     const int64_t flat = ch * static_cast<int64_t>(kernel);
 
     blocks.clear();
     blocks.reserve(count);
+    int64_t dilation = 1;
     for (uint32_t i = 0; i < count; ++i) {
         const std::string base = stem + "." + std::to_string(i) + ".";
         SanoResBlock block;
         block.kernel = static_cast<int32_t>(kernel);
+        // `base ** i`, accumulated rather than exponentiated: the padding it
+        // drives is `dilation * (kernel / 2)` per side, so a value that
+        // overflowed here would allocate a padded buffer from a wrapped
+        // number instead of failing.
+        if (dilation > SANO_MAX_DILATION) {
+            error = "voice " + prefix + ": " + stem + " dilates to "
+                  + std::to_string(dilation) + " at block " + std::to_string(i)
+                  + ", past the supported " + std::to_string(SANO_MAX_DILATION);
+            return false;
+        }
+        block.dilation = static_cast<int32_t>(dilation);
+        dilation *= static_cast<int64_t>(dilation_base);
         block.net0_w = loader.get(base + "net0.weight", flat, ch);
         block.net0_b = loader.get_f32(base + "net0.bias", ch);
         block.net2_w = loader.get(base + "net2.weight", flat, ch);
@@ -289,8 +314,14 @@ const IstftPlan * SanoArch::istft_plan(uint32_t n_fft, uint32_t hop) const {
 
 bool SanoArch::phonemize(const std::string & text, const VoiceDesc & voice,
                          std::string & phonemes, std::string & error) const {
-    if (voice.frontend == FrontendKind::Piper) {
-        return sano::phonemize_piper_sanotts(text, voice.espeak_voice, phonemes, error);
+    if (is_piper_frontend(voice.frontend)) {
+        // The only thing the two Piper contracts disagree on, and the voice
+        // says which it was trained with.
+        const char * marks = voice.frontend == FrontendKind::Piper
+            ? sano::PIPER_PUNCTUATION_MARKS
+            : sano::PIPER_ESPEAK_PUNCTUATION_MARKS;
+        return sano::phonemize_piper_sanotts(text, voice.espeak_voice, marks,
+                                             phonemes, error);
     }
     return sano::phonemize_misaki_sanotts(text, voice.espeak_voice, phonemes, error);
 }
@@ -302,7 +333,7 @@ bool SanoArch::tokenize(const std::string & phonemes, const VoiceDesc & voice,
         error = "unknown sanoTTS voice: " + voice.name;
         return false;
     }
-    if (voice.frontend == FrontendKind::Piper) {
+    if (is_piper_frontend(voice.frontend)) {
         return sano::tokenize_piper(phonemes, resolved->tokens, nfd, ids, error);
     }
     return sano::tokenize_misaki(phonemes, resolved->tokens, ids, error);
@@ -312,7 +343,7 @@ namespace {
 
 // Piper adds a PAD after each tokenized symbol.
 int ids_per_phoneme(FrontendKind frontend) {
-    return frontend == FrontendKind::Piper ? 2 : 1;
+    return is_piper_frontend(frontend) ? 2 : 1;
 }
 
 } // namespace
@@ -485,6 +516,17 @@ bool load_acoustic(const VoiceMeta & meta, TensorLoader & loader, Backend & back
         !in_range(w.out_channels, SANO_MAX_DIM, "ac.out_channels", meta, error)) {
         return false;
     }
+    // Absent means 1, which is the undilated stack every voice exported before
+    // the option existed was trained as -- so this defaults to the truth about
+    // those files rather than to a guess about them.
+    w.token_dilation_base = meta.u32_or("ac.token_dilation_base", 1);
+    w.frame_dilation_base = meta.u32_or("ac.frame_dilation_base", 1);
+    if (!in_range(w.token_dilation_base, SANO_MAX_DILATION_BASE,
+                  "ac.token_dilation_base", meta, error) ||
+        !in_range(w.frame_dilation_base, SANO_MAX_DILATION_BASE,
+                  "ac.frame_dilation_base", meta, error)) {
+        return false;
+    }
 
     const int64_t hidden = static_cast<int64_t>(w.hidden);
     w.embedding     = loader.get("ac.embedding.weight", hidden, w.vocab);
@@ -495,10 +537,34 @@ bool load_acoustic(const VoiceMeta & meta, TensorLoader & loader, Backend & back
     if (!error.empty()) {
         return false;
     }
+    // Optional, and all-or-nothing: a file carrying one half of the layer is
+    // malformed, and `get` reports the missing name for whichever it is.
+    if (loader.has_prefix("ac.token_global.")) {
+        w.token_global_w = loader.get("ac.token_global.weight", 3 * hidden, hidden);
+        w.token_global_b = loader.get_f32("ac.token_global.bias", hidden);
+        if (!error.empty()) {
+            return false;
+        }
+    }
+    if (loader.has_prefix("ac.global_norm.") || loader.has_prefix("ac.global_gate.")) {
+        if (!w.has_global_context()) {
+            error = "global modulation requires ac.token_global weights";
+            return false;
+        }
+        w.global_norm_w = loader.get_f32("ac.global_norm.weight", 3 * hidden);
+        w.global_norm_b = loader.get_f32("ac.global_norm.bias", 3 * hidden);
+        w.global_gate_w = loader.get("ac.global_gate.weight", 2 * hidden, hidden);
+        w.global_gate_b = loader.get_f32("ac.global_gate.bias", hidden);
+        if (!error.empty()) {
+            return false;
+        }
+    }
     if (!load_res_blocks(loader, backend, meta.prefix, "ac.token_blocks", w.token_depth,
-                         w.hidden, w.kernel, w.token_blocks, error) ||
+                         w.hidden, w.kernel, w.token_blocks, error,
+                         w.token_dilation_base) ||
         !load_res_blocks(loader, backend, meta.prefix, "ac.frame_blocks", w.depth,
-                         w.hidden, w.kernel, w.frame_blocks, error)) {
+                         w.hidden, w.kernel, w.frame_blocks, error,
+                         w.frame_dilation_base)) {
         return false;
     }
     w.output_w = loader.get("ac.output.weight", hidden, w.out_channels);
@@ -950,6 +1016,68 @@ bool load_piperlite(const VoiceMeta & meta, TensorLoader & loader, Backend & bac
     return error.empty();
 }
 
+/// The voice's sibilant calibration. Absent is not an error: a voice trained
+/// without one injects nothing, which is also what every file written before
+/// the calibration existed means.
+///
+/// All-or-nothing. Half a contract is a file that would inject the right noise
+/// at the wrong frames, or the wrong noise everywhere, and either renders a
+/// plausible voice that is not this one.
+bool load_sibilants(const VoiceMeta & meta, uint32_t out_channels,
+                    uint32_t vocab, SanoSibilants & w, std::string & error) {
+    const std::string beta_key = meta.prefix + "sib.beta";
+    float beta = 0.0f;
+    const bool has_beta = gguf_get_f32(meta.ctx, beta_key.c_str(), beta);
+    std::vector<float> std_dev;
+    const bool has_std = gguf_get_f32_array(
+        meta.ctx, (meta.prefix + "sib.channel_std").c_str(), std_dev);
+    std::vector<uint32_t> ids;
+    const bool has_ids = gguf_get_u32_array(
+        meta.ctx, (meta.prefix + "sib.phoneme_ids").c_str(), ids);
+
+    if (!has_beta && !has_std && !has_ids) {
+        return true;
+    }
+    if (!has_beta || !has_std || !has_ids) {
+        error = meta.where("sib.beta") + ": a sibilant calibration needs beta, "
+                "channel_std and phoneme_ids together";
+        return false;
+    }
+    if (!std::isfinite(beta) || beta <= 0.0f) {
+        error = meta.where("sib.beta") + " must be finite and positive";
+        return false;
+    }
+    if (std_dev.size() != out_channels) {
+        error = meta.where("sib.channel_std") + " has " + std::to_string(std_dev.size())
+              + " entries for " + std::to_string(out_channels) + " latent channels";
+        return false;
+    }
+    for (const float value : std_dev) {
+        if (!std::isfinite(value) || value < 0.0f) {
+            error = meta.where("sib.channel_std") + " must be finite and non-negative";
+            return false;
+        }
+    }
+    if (ids.empty()) {
+        error = meta.where("sib.phoneme_ids") + " is empty";
+        return false;
+    }
+    for (const uint32_t id : ids) {
+        if (id >= vocab) {
+            // An id the embedding cannot hold never matches a token, so this is
+            // a calibration from another voice rather than a harmless extra.
+            error = meta.where("sib.phoneme_ids") + " contains " + std::to_string(id)
+                  + ", outside the acoustic vocab of " + std::to_string(vocab);
+            return false;
+        }
+    }
+    std::sort(ids.begin(), ids.end());
+    w.beta = beta;
+    w.channel_std = std::move(std_dev);
+    w.phoneme_ids = std::move(ids);
+    return true;
+}
+
 bool load_vocos(const VoiceMeta & meta, TensorLoader & loader, uint32_t mels,
                 SanoVocosWeights & w, std::string & error) {
     if (!meta.u32("dec.dim", w.dim, error) ||
@@ -1154,10 +1282,13 @@ bool SanoArch::load(Model & base_model, std::string & error) {
         }
         if (frontend == "piper") {
             voice.desc.frontend = FrontendKind::Piper;
+        } else if (frontend == "piper_espeak") {
+            voice.desc.frontend = FrontendKind::PiperEspeak;
         } else if (frontend == "misaki") {
             voice.desc.frontend = FrontendKind::Misaki;
         } else {
-            error = info.where("frontend") + " = " + frontend + " is not \"piper\" or \"misaki\"";
+            error = info.where("frontend") + " = " + frontend +
+                    " is not \"piper\", \"piper_espeak\" or \"misaki\"";
             return false;
         }
         if (decoder == "piperlite") {
@@ -1180,7 +1311,7 @@ bool SanoArch::load(Model & base_model, std::string & error) {
             return false;
         }
         voice.tokens.max_tokens = max_tokens;
-        const uint32_t framing_min = voice.desc.frontend == FrontendKind::Piper ? 5 : 3;
+        const uint32_t framing_min = is_piper_frontend(voice.desc.frontend) ? 5 : 3;
         if (max_tokens < framing_min) {
             error = info.where("max_tokens") + " cannot fit framing and one phoneme";
             return false;
@@ -1190,7 +1321,9 @@ bool SanoArch::load(Model & base_model, std::string & error) {
         if (!load_duration(info, loader, *backend, voice.dur, error) ||
             !load_acoustic(info, loader, *backend, voice.ac, error) ||
             !load_emotion(info, loader, *backend, voice.dur, voice.ac,
-                          declared_style_dim(info), voice.emo, error)) {
+                          declared_style_dim(info), voice.emo, error) ||
+            !load_sibilants(info, voice.ac.out_channels, voice.ac.vocab,
+                            voice.sib, error)) {
             return false;
         }
         voice.desc.styles = voice.emo.styles;
@@ -1206,7 +1339,7 @@ bool SanoArch::load(Model & base_model, std::string & error) {
             error = info.where("token_ids") + ": special ids must fit both embedding vocabularies";
             return false;
         }
-        if (voice.desc.frontend == FrontendKind::Piper &&
+        if (is_piper_frontend(voice.desc.frontend) &&
             (voice.tokens.pad_id < 0 || !nfd.present())) {
             error = "voice " + declared + ": Piper requires a PAD id and an NFD table";
             return false;
@@ -1305,7 +1438,12 @@ SanoGraphBudget sano_emotion_conditioner_budget(const SanoVoice & voice) {
 }
 
 SanoGraphBudget sano_acoustic_token_budget(const SanoVoice & voice) {
-    return budget(SANO_FRONTEND_BASE_NODES +
+    // The global term, when the voice has one: a mean and its transposes, two
+    // views made contiguous, two concatenations, a projection, the bias and
+    // the broadcast add. Same margin the emotion conditioner's summary takes.
+    const size_t global = voice.ac.has_global_context() ?
+        (voice.ac.global_gate_w != nullptr ? 64 : 32) : 0;
+    return budget(SANO_FRONTEND_BASE_NODES + global +
                   SANO_NODES_PER_RES_BLOCK * voice.ac.token_depth);
 }
 
@@ -1486,6 +1624,76 @@ bool SanoArch::resolve_style_tag(const VoiceDesc & desc, std::string_view tag,
 // Inference
 // ---------------------------------------------------------------------------
 
+namespace {
+
+/// A seed of its own for the sibilant draw, so that adding or removing the
+/// injection does not shift the vocos decoder's noise stream underneath it.
+uint64_t sib_noise_seed(uint64_t seed) {
+    return sano::chunk_seed(seed, 0x51B1u);
+}
+
+} // namespace
+
+/// Puts the teacher's per-channel variance back at the voice's sibilant frames.
+///
+/// `latent[c, f] += beta * channel_std[c] * N(0, 1)` for every frame `f` that
+/// belongs to a token whose phoneme id the calibration covers. A no-op for a
+/// voice that carries no calibration.
+///
+/// The draw is independent per frame and per channel, so this reproduces the
+/// reference's *distribution* and not its numpy stream — the two render
+/// different noise and the same voice. It is still seeded rather than random:
+/// the same request has to render identically twice, and a chunk must not
+/// repeat its neighbour's draw.
+bool sano_inject_sibilant_noise(const SanoVoice & voice,
+                                const std::vector<uint32_t> & ids,
+                                const std::vector<int32_t> & durations,
+                                int64_t frames, uint64_t seed,
+                                std::vector<float> & latent,
+                                std::string & error) {
+    const SanoSibilants & sib = voice.sib;
+    if (!sib.present()) {
+        return true;
+    }
+    const int64_t channels = static_cast<int64_t>(sib.channel_std.size());
+    if (latent.size() != static_cast<size_t>(channels * frames)) {
+        error = "sanoTTS sibilant injection: the latent is "
+              + std::to_string(latent.size()) + " floats for "
+              + std::to_string(channels) + " x " + std::to_string(frames);
+        return false;
+    }
+
+    // One draw for the whole latent, indexed by the frames that need it, rather
+    // than a draw per sibilant run: which frames are sibilant then does not
+    // change the stream, so a voice renders the same way whether the caller
+    // split the line into chunks at a sibilant or not.
+    std::vector<float> noise;
+    if (!sano::seeded_noise(sib_noise_seed(seed), static_cast<size_t>(channels),
+                            static_cast<size_t>(frames), noise, error)) {
+        return false;
+    }
+
+    int64_t frame = 0;
+    for (size_t token = 0; token < ids.size() && token < durations.size(); ++token) {
+        const int64_t duration = durations[token];
+        const int64_t begin = frame;
+        frame += duration;
+        if (!sib.covers(ids[token])) {
+            continue;
+        }
+        const int64_t end = std::min(frame, frames);
+        for (int64_t c = 0; c < channels; ++c) {
+            const float scale = sib.beta * sib.channel_std[static_cast<size_t>(c)];
+            float * row = latent.data() + c * frames;
+            const float * noise_row = noise.data() + c * frames;
+            for (int64_t f = begin; f < end; ++f) {
+                row[f] += scale * noise_row[f];
+            }
+        }
+    }
+    return true;
+}
+
 bool SanoArch::run(const std::vector<uint32_t> & ids, const VoiceDesc & desc,
                    float speed, const SynthesisExtras & extras,
                    SanoProbe & probe, std::string & error) {
@@ -1585,10 +1793,6 @@ bool SanoArch::run(const std::vector<uint32_t> & ids, const VoiceDesc & desc,
         }
     }
 
-    if (desc.decoder == DecoderKind::PiperLite) {
-        return sano_run_piperlite(*this, *voice, probe.latent, frames, probe.audio, error);
-    }
-
     // Chunk 0 draws from the base seed itself, so a caller who pins a seed gets
     // exactly the stream that seed names — which is what lets a test inject the
     // seed a golden fixture was rendered with. Later chunks fold their index in:
@@ -1599,6 +1803,18 @@ bool SanoArch::run(const std::vector<uint32_t> & ids, const VoiceDesc & desc,
     const uint64_t seed = extras.chunk_index == 0
         ? base_seed
         : sano::chunk_seed(base_seed, extras.chunk_index);
+
+    // Before the decoder and after everything acoustic, style included: this
+    // restores variance the acoustic student cannot produce, and the style head
+    // is a correction on what that student produced.
+    if (!sano_inject_sibilant_noise(*voice, ids, probe.durations, frames, seed,
+                                    probe.latent, error)) {
+        return false;
+    }
+
+    if (desc.decoder == DecoderKind::PiperLite) {
+        return sano_run_piperlite(*this, *voice, probe.latent, frames, probe.audio, error);
+    }
 
     return sano_run_vocos(*this, *voice, probe.latent, frames, seed, probe.audio, error);
 }

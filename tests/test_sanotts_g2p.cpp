@@ -88,7 +88,8 @@ TEST_CASE("sanotts_piper_phonemization_matches_the_reference_exactly") {
         std::string phonemes;
         std::string error;
         REQUIRE_MESSAGE(
-            sano::phonemize_piper_sanotts(entry.text, entry.espeak_voice, phonemes, error),
+            sano::phonemize_piper_sanotts(entry.text, entry.espeak_voice,
+                                          sano::PIPER_PUNCTUATION_MARKS, phonemes, error),
             error);
         if (phonemes != entry.phonemes) {
             divergences.push_back(entry.voice + " text=[" + entry.text + "] got=[" +
@@ -124,7 +125,8 @@ TEST_CASE("sanotts_g2p_ids_match_the_reference_exactly") {
         std::string error;
         const bool ok = entry.frontend == "misaki"
             ? sano::phonemize_misaki_sanotts(entry.text, entry.espeak_voice, phonemes, error)
-            : sano::phonemize_piper_sanotts(entry.text, entry.espeak_voice, phonemes, error);
+            : sano::phonemize_piper_sanotts(entry.text, entry.espeak_voice,
+                                            sano::PIPER_PUNCTUATION_MARKS, phonemes, error);
         REQUIRE_MESSAGE(ok, error);
 
         std::vector<uint32_t> ids;
@@ -272,6 +274,34 @@ TEST_CASE("sanotts_the_two_contracts_use_different_punctuation_sets") {
     CHECK(misaki_marks.find('\'') == std::string::npos);
 }
 
+// Piper's own frontend hands espeak the whole clause and appends only the
+// terminator espeak reports, so a pack trained through it never saw an
+// apostrophe, a hyphen, a quote or a bracket. Hiding those -- which sanoTTS's
+// frontend does -- cuts words in half and espeak spells the halves out, which
+// is audible: "l'acier" becomes "elle acier".
+TEST_CASE("sanotts_the_piper_espeak_contract_keeps_words_whole") {
+    std::string phonemes;
+    std::string error;
+    const std::string_view marks = sano::PIPER_ESPEAK_PUNCTUATION_MARKS;
+    CHECK(marks.find('\'') == std::string_view::npos);
+    CHECK(marks.find('-') == std::string_view::npos);
+    CHECK(marks.find('"') == std::string_view::npos);
+
+    REQUIRE(sano::phonemize_piper_sanotts("L'acier est froid.", "fr", marks,
+                                          phonemes, error));
+    CHECK_EQ(phonemes, "lasjˈe ɛ fʁwˈa.");
+    REQUIRE(sano::phonemize_piper_sanotts("peut-être", "fr", marks, phonemes, error));
+    CHECK_EQ(phonemes, "pˈøtˈɛtʁ");
+    REQUIRE(sano::phonemize_piper_sanotts("Un (deux) trois.", "fr", marks, phonemes, error));
+    CHECK_EQ(phonemes, "œ̃ dˈø tʁwˈa.");
+
+    // The same text under sanoTTS's set, which is what those voices trained on.
+    REQUIRE(sano::phonemize_piper_sanotts("L'acier est froid.", "fr",
+                                          sano::PIPER_PUNCTUATION_MARKS,
+                                          phonemes, error));
+    CHECK_EQ(phonemes, "ˈɛl'asjˈe ɛ fʁwˈa.");
+}
+
 // Malformed input used to be dropped silently at the first bad byte, which
 // turned a broken request into a shorter, plausible utterance.
 TEST_CASE("sanotts_phonemization_rejects_invalid_utf8_input") {
@@ -281,7 +311,8 @@ TEST_CASE("sanotts_phonemization_rejects_invalid_utf8_input") {
     CHECK_FALSE(sano::phonemize_misaki_sanotts(truncated, "gmw/en-US", phonemes, error));
     CHECK(error.find("UTF-8") != std::string::npos);
 
-    CHECK_FALSE(sano::phonemize_piper_sanotts(truncated, "gmw/en-US", phonemes, error));
+    CHECK_FALSE(sano::phonemize_piper_sanotts(truncated, "gmw/en-US",
+                                              sano::PIPER_PUNCTUATION_MARKS, phonemes, error));
     CHECK(error.find("UTF-8") != std::string::npos);
 }
 

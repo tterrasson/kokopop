@@ -44,6 +44,9 @@ struct SanoVoice {
     /// Empty (`dim == 0`) unless the pack declared an emotion capability.
     SanoEmotionWeights emo;
 
+    /// Empty (`beta == 0`) unless the pack declared a sibilant calibration.
+    SanoSibilants sib;
+
     /// Exactly one of these is populated, per `desc.decoder`.
     SanoPiperliteWeights piperlite;
     SanoVocosWeights vocos;
@@ -308,6 +311,24 @@ bool sano_apply_emotion_latent(const SanoVoice & voice,
 bool sano_run_piperlite(SanoArch & arch, const SanoVoice & voice,
                         const std::vector<float> & latent, int64_t frames,
                         std::vector<float> & audio, std::string & error);
+
+/// Restores the teacher's per-channel variance at the voice's sibilant frames.
+///
+/// `latent[c, f] += beta * channel_std[c] * N(0, 1)` for every frame belonging
+/// to a token whose phoneme id the voice's calibration covers; a no-op for a
+/// voice without one. `latent` is `[frames, out_channels]` with frames fastest,
+/// which is graph 3's layout.
+///
+/// Seeded rather than random -- the same request has to render identically
+/// twice -- but only reproducible against itself: the draw is independent per
+/// frame and channel, so this and the reference's numpy generator produce
+/// different noise and the same voice.
+bool sano_inject_sibilant_noise(const SanoVoice & voice,
+                                const std::vector<uint32_t> & ids,
+                                const std::vector<int32_t> & durations,
+                                int64_t frames, uint64_t seed,
+                                std::vector<float> & latent,
+                                std::string & error);
 
 /// Graph 4b: mel `[frames, mels]` + deterministic noise -> PCM.
 bool sano_run_vocos(SanoArch & arch, const SanoVoice & voice,

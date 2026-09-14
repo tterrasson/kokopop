@@ -16,6 +16,13 @@
 //       espeak-ng with no tie, Piper's own punctuation set preserved, and no
 //       normalisation at all — the tokenizer maps raw IPA code points.
 //
+//   piper_espeak (packs trained through Piper's own `PiperVoice.phonemize`)
+//       The same contract, with a narrower punctuation set. The difference is
+//       not cosmetic: the wider set hides an apostrophe from espeak, which
+//       makes "l'acier" two words and "doctor's" end in a spelled-out "ess".
+//       Which of the two a voice wants is which one it was trained with, so it
+//       is a property of the voice and not of the architecture.
+//
 // The reference implementations are `phonemizer` (GPL-3.0) and `misaki`
 // (Apache-2.0), driven by `pypkg/sanotts/frontend.py` (MIT). Nothing here is a
 // port of the GPL code: the punctuation handling is written from its observable
@@ -46,10 +53,12 @@ bool phonemize_misaki_sanotts(const std::string & text,
 
 /// Text -> raw espeak IPA for a sanoTTS piperlite voice.
 ///
-/// No normalisation, Piper's punctuation set (`!'(),-.:;?"`) preserved, and the
-/// trailing separator space that the reference strips is stripped here too.
+/// No normalisation, `marks` preserved, and the trailing separator space that
+/// the reference strips is stripped here too. `marks` is the voice's own set:
+/// `PIPER_PUNCTUATION_MARKS` or `PIPER_ESPEAK_PUNCTUATION_MARKS`.
 bool phonemize_piper_sanotts(const std::string & text,
                              const std::string & espeak_voice,
+                             std::string_view marks,
                              std::string & phonemes,
                              std::string & error);
 
@@ -59,10 +68,12 @@ bool phonemize_piper_sanotts(const std::string & text,
 
 /// The punctuation marks each contract hides from espeak.
 ///
-/// misaki uses phonemizer's default set; Piper passes its own, which is exactly
-/// the ASCII punctuation present in its phoneme tables.
+/// misaki uses phonemizer's default set; sanoTTS's Piper frontend passes the
+/// ASCII punctuation present in Piper's phoneme tables; Piper's own frontend
+/// hides only the clause terminators espeak reports back.
 extern const char * const MISAKI_PUNCTUATION_MARKS;
 extern const char * const PIPER_PUNCTUATION_MARKS;
+extern const char * const PIPER_ESPEAK_PUNCTUATION_MARKS;
 
 /// Phonemize `text` while keeping its punctuation.
 ///

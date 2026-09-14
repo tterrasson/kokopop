@@ -31,13 +31,25 @@ enum class Arch {
     SanoTTS = 2,
 };
 
-/// Which grapheme-to-phoneme contract a voice follows. The two differ in more
+/// Which grapheme-to-phoneme contract a voice follows. They differ in more
 /// than the espeak flags: misaki normalises espeak's output and frames the ids
 /// as [BOS] ids [EOS], Piper decomposes to NFD and interleaves a PAD id.
+///
+/// The two Piper kinds share everything but the punctuation they hide from
+/// espeak. `Piper` is sanoTTS's own frontend, which hides Piper's whole
+/// phoneme-table punctuation set; `PiperEspeak` is Piper's, which hides only
+/// espeak's clause terminators. An apostrophe is the visible difference:
+/// hidden, it splits "l'acier" into "elle acier".
 enum class FrontendKind {
-    Misaki = 0,
-    Piper  = 1,
+    Misaki      = 0,
+    Piper       = 1,
+    PiperEspeak = 2,
 };
+
+/// True for both Piper contracts: NFD, PAD-interleaved framing, raw IPA.
+inline bool is_piper_frontend(FrontendKind kind) {
+    return kind == FrontendKind::Piper || kind == FrontendKind::PiperEspeak;
+}
 
 enum class DecoderKind {
     Kokoro    = 0,

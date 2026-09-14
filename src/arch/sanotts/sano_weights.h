@@ -11,6 +11,7 @@
 // incomplete or mis-shaped file must fail in `SanoArch::load()`, not halfway
 // through a graph build.
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <string>
@@ -222,6 +223,36 @@ struct SanoEmotionWeights {
     bool enabled() const { return dim > 0; }
 };
 
+/// The voice's sibilant-noise calibration, empty for a voice without one.
+///
+/// A deterministic acoustic student regresses the *mean* latent, and the mean
+/// of broadband hiss is a whistle -- /s z ʃ ʒ/ come out tonal. Putting the
+/// teacher's per-channel variance back at exactly those frames is what the
+/// reference does at inference, so a voice that carries this and a runtime that
+/// ignores it are two different voices.
+///
+/// What crosses the file is a distribution, not a stream: the draw is
+/// independent per frame and per channel, so the reference's numpy generator
+/// and this runtime's produce different noise and the same voice. Nothing here
+/// needs to be bit-reproducible against the reference -- only against itself,
+/// which the seeded draw gives.
+struct SanoSibilants {
+    /// Multiplies `channel_std`. Zero (the default) is no injection at all.
+    float beta = 0.0f;
+
+    /// `[ac.out_channels]`, the teacher's per-channel standard deviation.
+    std::vector<float> channel_std;
+
+    /// Sorted phoneme ids whose frames are injected into.
+    std::vector<uint32_t> phoneme_ids;
+
+    bool present() const { return beta > 0.0f && !channel_std.empty(); }
+
+    bool covers(uint32_t id) const {
+        return std::binary_search(phoneme_ids.begin(), phoneme_ids.end(), id);
+    }
+};
+
 struct SanoAcousticWeights {
     uint32_t vocab = 0;
     uint32_t hidden = 0;
@@ -230,15 +261,37 @@ struct SanoAcousticWeights {
     uint32_t kernel = 0;
     uint32_t out_channels = 0;
 
+    /// Block `i` of a stack dilates by `base ** i`. A base of 1 is the
+    /// undilated stack every voice exported before the option existed, and is
+    /// what an absent key means. Kept here as well as on the blocks so the
+    /// probe can report the reach a voice was actually trained with.
+    uint32_t token_dilation_base = 1;
+    uint32_t frame_dilation_base = 1;
+
     ggml_tensor * embedding = nullptr;
     ggml_tensor * token_proj_w = nullptr;
     ggml_tensor * token_proj_b = nullptr;
     std::vector<SanoResBlock> token_blocks;
+
+    /// Optional: `Linear(3 * hidden, hidden)` over the token states' mean,
+    /// first and last, added back to every token. Null for a voice trained
+    /// without it, which is every voice that predates it. A convolution stack
+    /// reads a fixed window; this is the whole line, and the teacher's
+    /// self-attentive text encoder is why the student wants it.
+    ggml_tensor * token_global_w = nullptr;
+    ggml_tensor * token_global_b = nullptr;
+    ggml_tensor * global_norm_w = nullptr;
+    ggml_tensor * global_norm_b = nullptr;
+    ggml_tensor * global_gate_w = nullptr;
+    ggml_tensor * global_gate_b = nullptr;
+
     ggml_tensor * frame_proj_w = nullptr;
     ggml_tensor * frame_proj_b = nullptr;
     std::vector<SanoResBlock> frame_blocks;
     ggml_tensor * output_w = nullptr;
     ggml_tensor * output_b = nullptr;
+
+    bool has_global_context() const { return token_global_w != nullptr; }
 };
 
 // ---------------------------------------------------------------------------
