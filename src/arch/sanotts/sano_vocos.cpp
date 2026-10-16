@@ -55,11 +55,11 @@ ggml_tensor * convnext_block(ggml_context * ctx, ggml_tensor * x,
     r = sano_layer_norm(ctx, r, block.norm_w, block.norm_b);
 
     ggml_tensor * hidden = ggml_mul_mat(ctx, block.pw0_w, r);
-    ggml_mul_mat_set_prec(hidden, GGML_PREC_F32);
+    ggml_prec_set_acc(hidden, GGML_PREC_F32);
     hidden = ggml_gelu_erf(ctx, ggml_add(ctx, hidden, block.pw0_b));
 
     ggml_tensor * out = ggml_mul_mat(ctx, block.pw1_w, hidden);
-    ggml_mul_mat_set_prec(out, GGML_PREC_F32);
+    ggml_prec_set_acc(out, GGML_PREC_F32);
     out = ggml_add(ctx, out, block.pw1_b);
 
     return ggml_add(ctx, x, ggml_mul(ctx, out, block.gamma));
@@ -156,7 +156,7 @@ bool sano_run_vocos(SanoArch & arch, const SanoVoice & voice,
     x = sano_layer_norm(ctx, x, w.final_norm_w, w.final_norm_b);
 
     ggml_tensor * head = ggml_mul_mat(ctx, w.head_w, x);
-    ggml_mul_mat_set_prec(head, GGML_PREC_F32);
+    ggml_prec_set_acc(head, GGML_PREC_F32);
     head = ggml_add(ctx, head, w.head_b);   // [2 * bins, frames]
 
     ggml_tensor * log_magnitude = ggml_cont(

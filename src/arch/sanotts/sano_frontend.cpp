@@ -98,7 +98,7 @@ FrontendInput embed_with_features(ggml_context * ctx, ggml_tensor * embedding,
 ggml_tensor * project(ggml_context * ctx, ggml_tensor * weight,
                       ggml_tensor * bias, ggml_tensor * x) {
     ggml_tensor * out = ggml_mul_mat(ctx, weight, x);
-    ggml_mul_mat_set_prec(out, GGML_PREC_F32);
+    ggml_prec_set_acc(out, GGML_PREC_F32);
     return ggml_add(ctx, out, bias);
 }
 
@@ -145,13 +145,13 @@ ggml_tensor * global_context(ggml_context * ctx, ggml_tensor * x,
             w.global_norm_b);
     }
     ggml_tensor * term = ggml_mul_mat(ctx, w.token_global_w, summary);
-    ggml_mul_mat_set_prec(term, GGML_PREC_F32);
+    ggml_prec_set_acc(term, GGML_PREC_F32);
     term = ggml_add(ctx, term, w.token_global_b);
     if (w.global_gate_w != nullptr) {
         term = ggml_repeat(ctx, term, x);
         ggml_tensor * gate_input = ggml_concat(ctx, x, term, 0);
         ggml_tensor * gate = ggml_mul_mat(ctx, w.global_gate_w, gate_input);
-        ggml_mul_mat_set_prec(gate, GGML_PREC_F32);
+        ggml_prec_set_acc(gate, GGML_PREC_F32);
         gate = ggml_sigmoid(ctx, ggml_add(ctx, gate, w.global_gate_b));
         term = ggml_mul(ctx, gate, term);
     }

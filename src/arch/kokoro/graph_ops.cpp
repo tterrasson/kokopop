@@ -602,7 +602,7 @@ static ggml_tensor * conv1d_im2col_mulmat(
 
     ggml_tensor * out = ggml_mul_mat(ctx, weight, im2col_2d);
     // Force fp32 accumulation; see linear() above for rationale.
-    ggml_mul_mat_set_prec(out, GGML_PREC_F32);
+    ggml_prec_set_acc(out, GGML_PREC_F32);
 
     if (channel_first) {
         return ggml_reshape_3d(ctx, out, oc, ol, n);
@@ -649,7 +649,7 @@ ggml_tensor * linear(
     // discrete GPUs), which combined with K-quant dequant noise produces
     // ~0.1+ drift on 768-dim matmuls — enough to flip duration rounding at
     // k+0.5 boundaries and cause "deformed voice" on Vulkan.
-    ggml_mul_mat_set_prec(mm, GGML_PREC_F32);
+    ggml_prec_set_acc(mm, GGML_PREC_F32);
     return ggml_add(ctx, mm, bias);
 }
 
@@ -1459,7 +1459,7 @@ ggml_tensor * lstm_direction(
     // path with quantized weights is numerically stable across all backends.
     ggml_tensor * mul_result = ggml_mul_mat(ctx, w.w_ih_packed, input);
     // Force fp32 accumulation; see linear() above for rationale.
-    ggml_mul_mat_set_prec(mul_result, GGML_PREC_F32);
+    ggml_prec_set_acc(mul_result, GGML_PREC_F32);
     ggml_tensor * pre_input_gates_packed = ggml_add(ctx, mul_result, w.b_ih_packed);
 
     const std::string whh_key = prefix + ".weight_hh_l0" + (reverse ? "_reverse" : "");
@@ -1619,7 +1619,7 @@ ggml_tensor * text_encoder(
         ctx,
         ggml_cont(ctx, ggml_transpose(ctx, cur)),
         ggml_cont(ctx, ggml_transpose(ctx, duration_mask)));
-    ggml_mul_mat_set_prec(out, GGML_PREC_F32);
+    ggml_prec_set_acc(out, GGML_PREC_F32);
     return out;
 }
 

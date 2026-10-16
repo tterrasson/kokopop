@@ -50,7 +50,7 @@ ggml_tensor * sano_conv1d(ggml_context * ctx, ggml_tensor * weight,
     // it would duplicate the largest activation in every convolution.
     ggml_tensor * flat = ggml_reshape_2d(ctx, im2col, im2col->ne[0], out_len);
     ggml_tensor * out  = ggml_mul_mat(ctx, weight, flat);   // [out_ch, out_len]
-    ggml_mul_mat_set_prec(out, GGML_PREC_F32);
+    ggml_prec_set_acc(out, GGML_PREC_F32);
 
     return ggml_cont(ctx, ggml_transpose(ctx, out));        // [out_len, out_ch]
 }
@@ -65,7 +65,7 @@ ggml_tensor * sano_conv1d_dw(ggml_context * ctx, ggml_tensor * weight,
     ggml_tensor * im2col = ggml_im2col(ctx, kernel3d, data, 1, 0, padding, 0,
                                        1, 0, false, GGML_TYPE_F32);
     ggml_tensor * out = ggml_mul_mat(ctx, im2col, kernel3d);  // [out_len, 1, C]
-    ggml_mul_mat_set_prec(out, GGML_PREC_F32);
+    ggml_prec_set_acc(out, GGML_PREC_F32);
 
     return ggml_cont(ctx, ggml_reshape_2d(ctx, out, out->ne[0], channels));
 }
