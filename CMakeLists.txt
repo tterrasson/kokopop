@@ -321,6 +321,16 @@ if(APPLE)
   set(KOKOPOP_HAS_COREAUDIO 1)
 endif()
 
+# Warnings apply to kokopop's own targets only. Dependencies fetched via
+# FetchContent (ggml, doctest, yyjson) and the bundled eSpeak build keep
+# their own compile flags.
+add_library(kokopop_warnings INTERFACE)
+if(MSVC)
+  target_compile_options(kokopop_warnings INTERFACE /W4)
+else()
+  target_compile_options(kokopop_warnings INTERFACE -Wall -Wextra -Wpedantic)
+endif()
+
 add_library(kokopop
   ${_kokopop_core_sources}
   ${_kokopop_backend_sources}
@@ -369,6 +379,7 @@ target_link_libraries(kokopop
     Threads::Threads
     ${KOKOPOP_ESPEAK_LIBRARIES}
     yyjson
+    kokopop_warnings
 )
 
 if(KOKOPOP_ENABLE_OPUS)
@@ -432,19 +443,13 @@ if(KOKOPOP_BUILD_WEB)
   add_subdirectory(web)
 endif()
 
-if(MSVC)
-  target_compile_options(kokopop PRIVATE /W4)
-else()
-  target_compile_options(kokopop PRIVATE -Wall -Wextra -Wpedantic)
-endif()
-
 if(KOKOPOP_BUILD_TOOLS)
   add_executable(kokopop_say tools/kokopop_say.cpp)
   target_include_directories(kokopop_say PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/src/playback
   )
-  target_link_libraries(kokopop_say PRIVATE kokopop)
+  target_link_libraries(kokopop_say PRIVATE kokopop kokopop_warnings)
 
   add_executable(kokopop_probe tools/kokopop_probe.cpp)
   target_include_directories(kokopop_probe PRIVATE
@@ -462,7 +467,7 @@ if(KOKOPOP_BUILD_TOOLS)
     ${CMAKE_CURRENT_SOURCE_DIR}/src/playback
     $<BUILD_INTERFACE:${ggml_SOURCE_DIR}/include>
   )
-  target_link_libraries(kokopop_probe PRIVATE kokopop)
+  target_link_libraries(kokopop_probe PRIVATE kokopop kokopop_warnings)
 
   # Streaming tool (stdio + HTTP server)
   add_executable(kokopop_stream
@@ -490,7 +495,7 @@ if(KOKOPOP_BUILD_TOOLS)
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     $<BUILD_INTERFACE:${ggml_SOURCE_DIR}/include>
   )
-  target_link_libraries(kokopop_stream PRIVATE kokopop yyjson)
+  target_link_libraries(kokopop_stream PRIVATE kokopop yyjson kokopop_warnings)
 
   # Audio playback tool
   add_executable(kokopop_play tools/kokopop_play.cpp)
@@ -498,7 +503,7 @@ if(KOKOPOP_BUILD_TOOLS)
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/src/playback
   )
-  target_link_libraries(kokopop_play PRIVATE kokopop)
+  target_link_libraries(kokopop_play PRIVATE kokopop kokopop_warnings)
 
   # Adaptive mode benchmark (TTFB + inter-chunk timing)
   add_executable(kokopop_bench_adaptative
@@ -519,7 +524,7 @@ if(KOKOPOP_BUILD_TOOLS)
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     $<BUILD_INTERFACE:${ggml_SOURCE_DIR}/include>
   )
-  target_link_libraries(kokopop_bench_adaptative PRIVATE kokopop yyjson)
+  target_link_libraries(kokopop_bench_adaptative PRIVATE kokopop yyjson kokopop_warnings)
 
   # RT benchmark tool (synthesis speed measurement)
   add_executable(kokopop_rt tools/kokopop_rt.cpp)
@@ -532,7 +537,7 @@ if(KOKOPOP_BUILD_TOOLS)
     ${CMAKE_CURRENT_SOURCE_DIR}/src/synthesis/chunker
     $<BUILD_INTERFACE:${ggml_SOURCE_DIR}/include>
   )
-  target_link_libraries(kokopop_rt PRIVATE kokopop)
+  target_link_libraries(kokopop_rt PRIVATE kokopop kokopop_warnings)
 endif()
 
 if(KOKOPOP_BUILD_TESTS)
@@ -563,7 +568,7 @@ if(KOKOPOP_BUILD_TESTS)
   # happens to sit inside the source tree.
   target_compile_definitions(kokopop_tests PRIVATE
     KOKOPOP_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
-  target_link_libraries(kokopop_tests PRIVATE kokopop doctest::doctest ggml yyjson)
+  target_link_libraries(kokopop_tests PRIVATE kokopop doctest::doctest ggml yyjson kokopop_warnings)
   include(${doctest_SOURCE_DIR}/scripts/cmake/doctest.cmake)
   doctest_discover_tests(kokopop_tests)
 
@@ -573,7 +578,7 @@ if(KOKOPOP_BUILD_TESTS)
     tests/test_playback_coreaudio.cpp
     src/playback/playback_coreaudio.cpp)
   target_include_directories(kokopop_playback_tests PRIVATE tests/mocks src)
-  target_link_libraries(kokopop_playback_tests PRIVATE doctest::doctest Threads::Threads)
+  target_link_libraries(kokopop_playback_tests PRIVATE doctest::doctest Threads::Threads kokopop_warnings)
   add_test(NAME kokopop_playback_tests COMMAND kokopop_playback_tests)
   set_tests_properties(kokopop_playback_tests PROPERTIES TIMEOUT 15)
 endif()
@@ -586,7 +591,7 @@ if(KOKOPOP_BUILD_BENCH)
   target_include_directories(kokopop_bench_istft PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
   )
-  target_link_libraries(kokopop_bench_istft PRIVATE kokopop)
+  target_link_libraries(kokopop_bench_istft PRIVATE kokopop kokopop_warnings)
 
   add_executable(kokopop_bench tests/bench_main.cpp)
   target_include_directories(kokopop_bench PRIVATE
@@ -597,7 +602,7 @@ if(KOKOPOP_BUILD_BENCH)
     ${CMAKE_CURRENT_SOURCE_DIR}/src/synthesis
     $<BUILD_INTERFACE:${ggml_SOURCE_DIR}/include>
   )
-  target_link_libraries(kokopop_bench PRIVATE kokopop ggml)
+  target_link_libraries(kokopop_bench PRIVATE kokopop ggml kokopop_warnings)
 endif()
 
 # ---------------------------------------------------------------------------
