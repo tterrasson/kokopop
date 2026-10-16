@@ -122,7 +122,7 @@ unset(CMAKE_POLICY_VERSION_MINIMUM)
 FetchContent_Declare(
   yyjson
   GIT_REPOSITORY https://github.com/ibireme/yyjson.git
-  GIT_TAG        0.12.0
+  GIT_TAG        0.13.0
   GIT_SHALLOW    TRUE
 )
 FetchContent_MakeAvailable(yyjson)
