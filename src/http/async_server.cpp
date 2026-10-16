@@ -369,7 +369,6 @@ void AsyncHttpServer::_event_loop() {
             }
 
             auto rs  = conn.req_ctx->state.load();
-            auto fmt = conn.req_ctx->format;
             bool is_terminal = (rs == RequestContext::State::DONE ||
                                 rs == RequestContext::State::ERROR ||
                                 rs == RequestContext::State::CANCELLED);
@@ -401,10 +400,10 @@ void AsyncHttpServer::_event_loop() {
                         fds_to_close.push_back(fd);
                     }
                 } else if (rs == RequestContext::State::DONE) {
-                    _send_wav_response(fd, conn);
+                    _send_wav_response(conn);
                 } else {
                     const std::string & msg = conn.req_ctx->error;
-                    _send_error(fd, conn, 500, "Internal Server Error",
+                    _send_error(conn, 500, "Internal Server Error",
                                 json_error(msg.empty() ? "synthesis failed" : msg));
                 }
             }
@@ -475,7 +474,7 @@ void AsyncHttpServer::_process_pending_requests(int fd, Connection & conn) {
         if (parsed.status == AsyncHttpParseResult::Status::Error) {
             conn.keep_alive = false;
             conn.close_after_write = true;
-            _send_error(fd, conn, parsed.status_code, parsed.status_text,
+            _send_error(conn, parsed.status_code, parsed.status_text,
                         json_error(parsed.error_message));
             return;
         }
@@ -522,14 +521,14 @@ void AsyncHttpServer::_dispatch_request(int fd, Connection & conn) {
     // ---- /tts: submit to scheduler, streaming response ----
     if (req.path == "/tts") {
         if (req.method != "POST") {
-            _send_error(fd, conn, 405, "Method Not Allowed",
+            _send_error(conn, 405, "Method Not Allowed",
                         json_error("POST required"));
             return;
         }
 
         if (req.headers.find("content-length") == req.headers.end() &&
             req.headers.find("transfer-encoding") == req.headers.end()) {
-            _send_error(fd, conn, 411, "Length Required",
+            _send_error(conn, 411, "Length Required",
                         json_error("Content-Length or Transfer-Encoding: chunked required"));
             return;
         }
@@ -540,7 +539,7 @@ void AsyncHttpServer::_dispatch_request(int fd, Connection & conn) {
             if (!_model_loaded.load()) {
                 std::fprintf(stderr, "[http] Reloading model for incoming request\n");
                 if (!_reload_fn || !_reload_fn()) {
-                    _send_error(fd, conn, 503, "Service Unavailable",
+                    _send_error(conn, 503, "Service Unavailable",
                                 json_error("Model reload failed"));
                     return;
                 }
@@ -551,7 +550,7 @@ void AsyncHttpServer::_dispatch_request(int fd, Connection & conn) {
         }
 
         if (!_scheduler) {
-            _send_error(fd, conn, 503, "Service Unavailable",
+            _send_error(conn, 503, "Service Unavailable",
                         json_error("Scheduler not configured"));
             return;
         }
@@ -562,7 +561,7 @@ void AsyncHttpServer::_dispatch_request(int fd, Connection & conn) {
             static_cast<char *>(req.body.data()), req.body.size(),
             YYJSON_READ_ALLOW_TRAILING_COMMAS, nullptr, &err);
         if (!doc) {
-            _send_error(fd, conn, 400, "Bad Request",
+            _send_error(conn, 400, "Bad Request",
                         json_error(std::string("JSON parse error: ") + err.msg));
             return;
         }
@@ -570,7 +569,7 @@ void AsyncHttpServer::_dispatch_request(int fd, Connection & conn) {
         yyjson_val * root = yyjson_doc_get_root(doc);
         if (!yyjson_is_obj(root)) {
             yyjson_doc_free(doc);
-            _send_error(fd, conn, 400, "Bad Request",
+            _send_error(conn, 400, "Bad Request",
                         json_error("JSON is not an object"));
             return;
         }
@@ -610,7 +609,7 @@ void AsyncHttpServer::_dispatch_request(int fd, Connection & conn) {
             // would hand back UINT64_MAX. Both are silently wrong seeds.
             if (!yyjson_is_uint(noise_seed_val)) {
                 yyjson_doc_free(doc);
-                _send_error(fd, conn, 400, "Bad Request",
+                _send_error(conn, 400, "Bad Request",
                             json_error("'noise_seed' must be a non-negative integer"));
                 return;
             }
@@ -626,7 +625,7 @@ void AsyncHttpServer::_dispatch_request(int fd, Connection & conn) {
         if (style_val && !yyjson_is_null(style_val)) {
             if (!yyjson_is_str(style_val)) {
                 yyjson_doc_free(doc);
-                _send_error(fd, conn, 400, "Bad Request",
+                _send_error(conn, 400, "Bad Request",
                             json_error("'style' must be a string"));
                 return;
             }
@@ -641,7 +640,7 @@ void AsyncHttpServer::_dispatch_request(int fd, Connection & conn) {
             diffusion.enabled = yyjson_get_bool(diff_val);
         } else if (diff_val && !yyjson_is_null(diff_val)) {
             yyjson_doc_free(doc);
-            _send_error(fd, conn, 400, "Bad Request",
+            _send_error(conn, 400, "Bad Request",
                         json_error("'diffusion' must be a boolean"));
             return;
         }
@@ -678,7 +677,7 @@ void AsyncHttpServer::_dispatch_request(int fd, Connection & conn) {
             else if (fs == "ogg") fmt = RequestContext::AudioFormat::OGG_OPUS;
             else {
                 yyjson_doc_free(doc);
-                _send_error(fd, conn, 400, "Bad Request",
+                _send_error(conn, 400, "Bad Request",
                             json_error(std::string("Unknown format: ") + fs));
                 return;
             }
@@ -686,14 +685,14 @@ void AsyncHttpServer::_dispatch_request(int fd, Connection & conn) {
 
         if (!http_audio_format_available(fmt)) {
             yyjson_doc_free(doc);
-            _send_error(fd, conn, 501, "Not Implemented",
+            _send_error(conn, 501, "Not Implemented",
                         json_error("Ogg/Opus output is not available in this build"));
             return;
         }
 
         if (!voice || std::string(voice).empty()) {
             yyjson_doc_free(doc);
-            _send_error(fd, conn, 400, "Bad Request",
+            _send_error(conn, 400, "Bad Request",
                         json_error("Missing or empty 'voice' field"));
             return;
         }
@@ -708,7 +707,7 @@ void AsyncHttpServer::_dispatch_request(int fd, Connection & conn) {
                 current_mode = StreamMode::Adaptative;
             } else {
                 yyjson_doc_free(doc);
-                _send_error(fd, conn, 400, "Bad Request",
+                _send_error(conn, 400, "Bad Request",
                             json_error(std::string("Unknown mode: ") + ms));
                 return;
             }
@@ -716,7 +715,7 @@ void AsyncHttpServer::_dispatch_request(int fd, Connection & conn) {
 
         if (!text || std::string(text).empty()) {
             yyjson_doc_free(doc);
-            _send_error(fd, conn, 400, "Bad Request",
+            _send_error(conn, 400, "Bad Request",
                         json_error("Missing or empty 'text' field"));
             return;
         }
@@ -724,7 +723,7 @@ void AsyncHttpServer::_dispatch_request(int fd, Connection & conn) {
         std::string text_str(text);
         yyjson_doc_free(doc);
         if (text_str.size() > 100000) {
-            _send_error(fd, conn, 413, "Payload Too Large",
+            _send_error(conn, 413, "Payload Too Large",
                         json_error("Text too long (max 100,000 chars)"));
             return;
         }
@@ -733,7 +732,7 @@ void AsyncHttpServer::_dispatch_request(int fd, Connection & conn) {
         // instead of aborting mid-stream after headers are already sent.
         if (diffusion.enabled &&
             (!_model || _model->cached_tensor("kokopop.diffusion.to_out.1.weight") == nullptr)) {
-            _send_error(fd, conn, 400, "Bad Request",
+            _send_error(conn, 400, "Bad Request",
                         json_error("diffusion requested, but this model has no diffusion tensors"));
             return;
         }
@@ -772,9 +771,9 @@ void AsyncHttpServer::_dispatch_request(int fd, Connection & conn) {
                 conn.keep_alive = false;
                 conn.close_after_write = true;
             }
-            _send_response(fd, conn, res);
+            _send_response(conn, res);
         } else {
-            _send_error(fd, conn, 404, "Not Found", json_error("not_found"));
+            _send_error(conn, 404, "Not Found", json_error("not_found"));
         }
         return;
     }
@@ -785,14 +784,14 @@ void AsyncHttpServer::_dispatch_request(int fd, Connection & conn) {
         conn.keep_alive = false;
         conn.close_after_write = true;
     }
-    _send_response(fd, conn, res);
+    _send_response(conn, res);
 }
 
 // ---------------------------------------------------------------------------
 // Response helpers
 // ---------------------------------------------------------------------------
 
-void AsyncHttpServer::_send_response(int fd, Connection & conn,
+void AsyncHttpServer::_send_response(Connection & conn,
                                      const HttpResponse & res) {
     auto conn_header = res.headers.find("Connection");
     if (conn_header == res.headers.end()) {
@@ -834,7 +833,7 @@ void AsyncHttpServer::_send_streaming_response(int fd, Connection & conn,
     conn.state = Connection::STATE_STREAMING;
 }
 
-void AsyncHttpServer::_send_wav_response(int fd, Connection & conn) {
+void AsyncHttpServer::_send_wav_response(Connection & conn) {
     auto & acc = conn.req_ctx->wav_accumulator;
     AudioEncoderOptions enc_options;
     enc_options.format = EncodedAudioFormat::WavPcm16;
@@ -847,7 +846,7 @@ void AsyncHttpServer::_send_wav_response(int fd, Connection & conn) {
     if (!encoder.start(ignored, error) ||
         !encoder.push(acc.data(), acc.size(), true, ignored, error) ||
         !encoder.finish(true, wav, error)) {
-        _send_error(fd, conn, 500, "Internal Server Error",
+        _send_error(conn, 500, "Internal Server Error",
                     json_error(error.empty() ? "WAV encoding failed" : error));
         return;
     }
@@ -880,7 +879,7 @@ void AsyncHttpServer::_send_final_chunk(int fd, Connection & conn) {
     conn.state = Connection::STATE_WRITING;
 }
 
-void AsyncHttpServer::_send_error(int fd, Connection & conn,
+void AsyncHttpServer::_send_error(Connection & conn,
                                   int status_code, const std::string & status_text,
                                   const std::string & error_json) {
     HttpResponse res;
@@ -888,7 +887,7 @@ void AsyncHttpServer::_send_error(int fd, Connection & conn,
     res.status_text = status_text;
     res.body.insert(res.body.end(), error_json.begin(), error_json.end());
     res.set_content_type("application/json");
-    _send_response(fd, conn, res);
+    _send_response(conn, res);
 }
 
 void AsyncHttpServer::_close_connection(int fd) {

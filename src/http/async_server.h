@@ -144,13 +144,13 @@ private:
     void _handle_connection_write(int fd, Connection & conn);
     void _process_pending_requests(int fd, Connection & conn);
     void _dispatch_request(int fd, Connection & conn);
-    void _send_response(int fd, Connection & conn, const HttpResponse & res);
+    void _send_response(Connection & conn, const HttpResponse & res);
     void _send_http_chunk(int fd, Connection & conn, const std::vector<char> & data);
     void _send_final_chunk(int fd, Connection & conn);
     void _send_streaming_response(int fd, Connection & conn,
                                    std::shared_ptr<RequestContext> ctx);
-    void _send_wav_response(int fd, Connection & conn);
-    void _send_error(int fd, Connection & conn, int status_code,
+    void _send_wav_response(Connection & conn);
+    void _send_error(Connection & conn, int status_code,
                      const std::string & status_text,
                      const std::string & error_json);
     void _close_connection(int fd);

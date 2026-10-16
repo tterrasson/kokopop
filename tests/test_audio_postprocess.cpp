@@ -273,7 +273,6 @@ TEST_CASE("postprocess_chunk_audio_first_chunk_no_trim_leading") {
 
     auto result = postprocess_chunk_audio(audio, chunk, 0, 3, cfg, 24000);
 
-    int pause_samples = (180 * 24000) / 1000; // 4320
     // The result should be longer due to pause addition
     CHECK_GT(result.size(), audio.size());
     // Leading content preserved (not trimmed for first chunk)
@@ -295,7 +294,6 @@ TEST_CASE("postprocess_chunk_audio_not_first_trims_leading") {
     auto result = postprocess_chunk_audio(audio, chunk, 1, 3, cfg, 24000);
     CHECK(result.size() > 0);
     // Comma pause added
-    int comma_samples = (80 * 24000) / 1000; // 1920
     CHECK(result.size() > audio.size());
 }
 

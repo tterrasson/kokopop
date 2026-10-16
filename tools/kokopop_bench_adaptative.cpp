@@ -215,7 +215,6 @@ int main(int argc, char ** argv) {
 
         while (true) {
             kokopop::RequestContext::AudioChunk chunk;
-            auto t_poll_start = Clock::now();
 
             // Poll with generous timeout (prepare + first inference can take time)
             bool got = poll_chunk(*ctx, chunk, 60000);
@@ -223,7 +222,6 @@ int main(int argc, char ** argv) {
 
             if (!got) break;
 
-            auto delay = Ms(t_poll_start - t_last);
             auto chunk_result = ChunkResult{
                 chunk.chunk_index,
                 0,  // tokens unknown from audio alone — scheduler logs them
