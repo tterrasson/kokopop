@@ -26,7 +26,6 @@
 #include "audio/istft.h"
 #include "backend/backend.h"
 
-#include <cmath>
 #include <string>
 #include <vector>
 

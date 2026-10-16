@@ -687,7 +687,7 @@ bool sano_apply_emotion_latent(const SanoVoice & voice,
                 }
                 matvec(w.mix_basis, coords, w.mix_rank, channels, mixed);
                 for (size_t c = 0; c < channels; ++c) {
-                    raw[c * static_cast<size_t>(frames) + first + d] +=
+                    raw[c * static_cast<size_t>(frames) + static_cast<size_t>(first + d)] +=
                         style.amount * bounded(mixed[c], w.mix_bound);
                 }
             }
@@ -701,9 +701,9 @@ bool sano_apply_emotion_latent(const SanoVoice & voice,
     // `transition_frames` frames on each side of a boundary and at most half
     // of either phone it joins, which is what keeps a short phone from being
     // smeared across its neighbours.
-    std::vector<int64_t> low(frames, 0), high(frames, 0);
-    std::vector<float>   weight(frames, 0.0f);
-    std::vector<char>    blend(frames, 0);
+    std::vector<int64_t> low(static_cast<size_t>(frames), 0), high(static_cast<size_t>(frames), 0);
+    std::vector<float>   weight(static_cast<size_t>(frames), 0.0f);
+    std::vector<char>    blend(static_cast<size_t>(frames), 0);
     if (w.transition_frames > 0 && voiced.size() > 1) {
         const int64_t reach = static_cast<int64_t>(w.transition_frames);
         for (size_t i = 0; i < voiced.size(); ++i) {
@@ -727,13 +727,13 @@ bool sano_apply_emotion_latent(const SanoVoice & voice,
                 }
                 const int64_t width = near_start ? before : after;
                 const int64_t edge = near_start ? first : boundary;
-                low[f] = std::clamp(edge - width, int64_t{0}, frames - 1);
-                high[f] = std::clamp(edge + width - 1, int64_t{0}, frames - 1);
-                const float position = static_cast<float>(f - low[f] + 1) /
+                low[static_cast<size_t>(f)] = std::clamp(edge - width, int64_t{0}, frames - 1);
+                high[static_cast<size_t>(f)] = std::clamp(edge + width - 1, int64_t{0}, frames - 1);
+                const float position = static_cast<float>(f - low[static_cast<size_t>(f)] + 1) /
                                        static_cast<float>(2 * width + 1);
-                weight[f] = 0.5f - 0.5f * std::cos(
+                weight[static_cast<size_t>(f)] = 0.5f - 0.5f * std::cos(
                     static_cast<float>(M_PI) * position);
-                blend[f] = 1;
+                blend[static_cast<size_t>(f)] = 1;
             }
         }
     }
@@ -744,8 +744,12 @@ bool sano_apply_emotion_latent(const SanoVoice & voice,
         for (size_t c = 0; c < channels; ++c) {
             const float * out = raw.data() + c * static_cast<size_t>(frames);
             const float value =
-                blend[f] ? out[low[f]] + weight[f] * (out[high[f]] - out[low[f]])
-                         : out[f];
+                blend[static_cast<size_t>(f)]
+                    ? out[low[static_cast<size_t>(f)]] +
+                          weight[static_cast<size_t>(f)] *
+                              (out[high[static_cast<size_t>(f)]] -
+                               out[low[static_cast<size_t>(f)]])
+                    : out[f];
             delta[c] = bounded(value, w.max_delta);
         }
 
@@ -764,7 +768,7 @@ bool sano_apply_emotion_latent(const SanoVoice & voice,
         }
 
         for (size_t c = 0; c < channels; ++c) {
-            latent[c * static_cast<size_t>(frames) + f] += delta[c];
+            latent[c * static_cast<size_t>(frames) + static_cast<size_t>(f)] += delta[c];
         }
     }
     return true;
@@ -857,7 +861,7 @@ void sano_expand_to_frames(const std::vector<float> & token_ctx, int64_t n_token
                            int64_t hidden, const std::vector<int32_t> & durations,
                            int64_t frames, std::vector<float> & frame_input) {
     const int64_t rows = hidden + 3;
-    frame_input.assign(static_cast<size_t>(rows * frames), 0.0f);
+    frame_input.resize(static_cast<size_t>(rows * frames));
 
     const int64_t token_span = n_tokens > 1 ? n_tokens - 1 : 1;
     int64_t frame = 0;

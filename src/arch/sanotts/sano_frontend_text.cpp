@@ -5,8 +5,8 @@
 
 #include <espeak-ng/speak_lib.h>
 
-#include <algorithm>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace kokopop::sano {
@@ -38,18 +38,18 @@ bool is_ascii_space(char c) {
 }
 
 /// Splits `marks`, a UTF-8 string of single-code-point marks, into a set.
-std::vector<std::string> mark_set(std::string_view marks) {
-    std::vector<std::string> out;
+std::unordered_set<std::string> mark_set(std::string_view marks) {
+    std::unordered_set<std::string> out;
     size_t offset = 0;
     std::string_view ch;
     while (utf8_next(marks, offset, ch)) {
-        out.emplace_back(ch);
+        out.emplace(ch);
     }
     return out;
 }
 
-bool contains(const std::vector<std::string> & set, std::string_view value) {
-    return std::find(set.begin(), set.end(), value) != set.end();
+bool contains(const std::unordered_set<std::string> & set, std::string_view value) {
+    return set.find(std::string(value)) != set.end();
 }
 
 /// One punctuation run, with the whitespace that surrounds it.
@@ -69,7 +69,7 @@ struct Unit {
 };
 
 /// Classifies every code point of `text` once. Fails on invalid UTF-8.
-bool classify(std::string_view text, const std::vector<std::string> & marks,
+bool classify(std::string_view text, const std::unordered_set<std::string> & marks,
               std::vector<Unit> & units, std::string & error) {
     units.clear();
     size_t offset = 0;
@@ -103,7 +103,7 @@ bool classify(std::string_view text, const std::vector<std::string> & marks,
 /// `"ph, ph"` rather than `"ph ,ph"`. Such a run is exactly a maximal stretch
 /// of whitespace-or-mark code points containing at least one mark, so one
 /// forward pass over the classified units finds them all.
-bool find_mark_runs(std::string_view text, const std::vector<std::string> & marks,
+bool find_mark_runs(std::string_view text, const std::unordered_set<std::string> & marks,
                     std::vector<MarkRun> & runs, std::string & error) {
     runs.clear();
     std::vector<Unit> units;
@@ -295,9 +295,9 @@ bool phonemize_preserving_punctuation(const std::string & text,
                                       std::string & phonemes,
                                       std::string & error) {
     phonemes.clear();
-    const std::vector<std::string> mark_list = mark_set(marks);
+    const std::unordered_set<std::string> mark_lookup = mark_set(marks);
     std::vector<MarkRun> runs;
-    if (!find_mark_runs(text, mark_list, runs, error)) {
+    if (!find_mark_runs(text, mark_lookup, runs, error)) {
         return false;
     }
 
