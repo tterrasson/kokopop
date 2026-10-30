@@ -1,0 +1,12 @@
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index fe001a0..8fc9a18 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -93,4 +93,7 @@ execute_process(
+     COMMAND ${CMAKE_C_COMPILER} ${CMAKE_EXE_LINKER_FLAGS} -Wl,-v
+     ERROR_VARIABLE output
+     OUTPUT_QUIET
++    # Emscripten links a.out.js/a.out.wasm into the current directory
++    # when no -o is given; keep the probe out of the source tree.
++    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+ )

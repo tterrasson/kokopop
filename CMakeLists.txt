@@ -57,10 +57,16 @@ FetchContent_Declare(
   # Fix 6: Adreno-targeted ggml-opencl work (SIN/COS kernels, a conv1d kernel,
   #         a dim-0 broadcast path for add/mul/div and a retiled f16 GEMM).
   #         Worth 26.6 s -> 7.8 s on a Kokoro utterance on a Snapdragon 845.
+  # Fix 7: run ggml's `-Wl,-v` linker probe inside the ggml build dir. With
+  #         Emscripten the probe has no -o, so emcc otherwise links
+  #         a.out.js/a.out.wasm into the directory emcmake was invoked from
+  #         (the source tree root) at every configure.
   PATCH_COMMAND
     ${CMAKE_COMMAND} -DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/patches/ggml-conv-transpose-1d-simd.patch -P ${CMAKE_CURRENT_SOURCE_DIR}/tools/apply_patch_if_needed.cmake
     COMMAND
     ${CMAKE_COMMAND} -DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/patches/ggml-opencl-adreno.patch -P ${CMAKE_CURRENT_SOURCE_DIR}/tools/apply_patch_if_needed.cmake
+    COMMAND
+    ${CMAKE_COMMAND} -DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/patches/ggml-emscripten-probe-workdir.patch -P ${CMAKE_CURRENT_SOURCE_DIR}/tools/apply_patch_if_needed.cmake
 )
 if(KOKOPOP_ENABLE_CUDA)
   set(GGML_CUDA ON CACHE BOOL "" FORCE)
