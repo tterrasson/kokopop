@@ -28,8 +28,9 @@ constexpr float KOKOPOP_SINE_AMP          = 0.1f;
 // Miscellaneous math constants
 // ---------------------------------------------------------------------------
 // M_PI from <math.h>/<cmath>; provide fallback if the platform omits it.
+// Double literal: callers may use it in double-precision contexts.
 #ifndef M_PI
-#define M_PI 3.14159265358979323846f
+#define M_PI 3.14159265358979323846
 #endif
 
 // ---------------------------------------------------------------------------
