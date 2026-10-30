@@ -35,9 +35,27 @@ struct kokopop_audio_encoder {
 
 namespace {
 
-int fail(int code, const std::string & message) {
-    kokopop::set_error(message);
+int fail(int code, std::string_view message) noexcept {
+    try {
+        kokopop::set_error(std::string(message));
+    } catch (...) {
+        // Even recording an out-of-memory error may fail to allocate.
+    }
     return code;
+}
+
+/// Runs f() and converts any C++ exception into an error code + last_error.
+/// Keep exceptions inside the library for callers that cannot handle C++
+/// unwinding (bad_alloc on OOM, runtime_error from the Opus encoder, …).
+template <typename F>
+int guarded(F && f, int code = KOKOPOP_ERROR_INFERENCE) noexcept {
+    try {
+        return f();
+    } catch (const std::exception & e) {
+        return fail(code, e.what());
+    } catch (...) {
+        return fail(code, "unknown C++ exception");
+    }
 }
 
 bool allocate_audio_from_vector(const std::vector<float> & samples, int sample_rate, kokopop_audio & out) {
@@ -172,7 +190,7 @@ int kokopop_model_load(const char * path, const kokopop_model_options * options,
         return fail(KOKOPOP_ERROR_INVALID_ARGUMENT, "model path is empty");
     }
 
-    try {
+    return guarded([&]() -> int {
         std::unique_ptr<kokopop::Model> impl;
         std::string error;
         if (!kokopop::load_model_from_gguf(path, options, impl, error)) {
@@ -182,9 +200,7 @@ int kokopop_model_load(const char * path, const kokopop_model_options * options,
         wrapper->impl = std::move(impl);
         *out_model = wrapper.release();
         return KOKOPOP_OK;
-    } catch (const std::exception & e) {
-        return fail(KOKOPOP_ERROR_MODEL, e.what());
-    }
+    }, KOKOPOP_ERROR_MODEL);
 }
 
 int kokopop_synthesize_text(
@@ -200,43 +216,45 @@ int kokopop_synthesize_text(
     if (model == nullptr || model->impl == nullptr) {
         return fail(KOKOPOP_ERROR_INVALID_ARGUMENT, "model is null");
     }
-    if (text == nullptr || kokopop::trim_ascii(text).empty()) {
+    if (text == nullptr || std::string_view(text).find_first_not_of(" \t\r\n\f\v") == std::string_view::npos) {
         return fail(KOKOPOP_ERROR_INVALID_ARGUMENT, "text is empty");
     }
 
-    std::string error;
-    const std::string voice_s = voice ? voice : "";
+    return guarded([&]() -> int {
+        std::string error;
+        const std::string voice_s = voice ? voice : "";
 
-    kokopop::SynthesisSessionOptions options;
-    options.voice = voice_s;
-    options.speed = speed;
-    options.mode = kokopop::StreamMode::LongForm;
-    options.chunk_config = text_synthesis_config_for_voice(voice_s);
-    options.has_chunk_config = true;
-    options.use_exact_chunk_config = true;
-    kokopop::SynthesisSession session(*model->impl, options);
-    if (!session.push_text(text, error) || !session.finish_input(error)) {
-        return fail(KOKOPOP_ERROR_INVALID_ARGUMENT, error);
-    }
-    std::vector<float> combined;
-    combined.reserve(4096);
-    while (!session.done()) {
-        std::vector<kokopop::SynthesisAudioChunk> chunks;
-        if (!session.next(1, 0, chunks, error)) {
-            return fail(KOKOPOP_ERROR_INFERENCE, error);
+        kokopop::SynthesisSessionOptions options;
+        options.voice = voice_s;
+        options.speed = speed;
+        options.mode = kokopop::StreamMode::LongForm;
+        options.chunk_config = text_synthesis_config_for_voice(voice_s);
+        options.has_chunk_config = true;
+        options.use_exact_chunk_config = true;
+        kokopop::SynthesisSession session(*model->impl, options);
+        if (!session.push_text(text, error) || !session.finish_input(error)) {
+            return fail(KOKOPOP_ERROR_INVALID_ARGUMENT, error);
         }
-        for (auto & chunk : chunks) {
-            combined.insert(combined.end(), chunk.samples.begin(), chunk.samples.end());
+        std::vector<float> combined;
+        combined.reserve(4096);
+        while (!session.done()) {
+            std::vector<kokopop::SynthesisAudioChunk> chunks;
+            if (!session.next(1, 0, chunks, error)) {
+                return fail(KOKOPOP_ERROR_INFERENCE, error);
+            }
+            for (auto & chunk : chunks) {
+                combined.insert(combined.end(), chunk.samples.begin(), chunk.samples.end());
+            }
         }
-    }
 
-    if (combined.empty()) {
-        return fail(KOKOPOP_ERROR_INFERENCE, "synthesis produced no audio");
-    }
-    if (!allocate_audio_from_vector(combined, session.sample_rate(), *out_audio)) {
-        return fail(KOKOPOP_ERROR_INFERENCE, "failed to allocate output audio");
-    }
-    return KOKOPOP_OK;
+        if (combined.empty()) {
+            return fail(KOKOPOP_ERROR_INFERENCE, "synthesis produced no audio");
+        }
+        if (!allocate_audio_from_vector(combined, session.sample_rate(), *out_audio)) {
+            return fail(KOKOPOP_ERROR_INFERENCE, "failed to allocate output audio");
+        }
+        return KOKOPOP_OK;
+    });
 }
 
 int kokopop_synthesize_phonemes(
@@ -252,27 +270,31 @@ int kokopop_synthesize_phonemes(
     if (model == nullptr || model->impl == nullptr) {
         return fail(KOKOPOP_ERROR_INVALID_ARGUMENT, "model is null");
     }
-    if (phonemes == nullptr || kokopop::trim_ascii(phonemes).empty()) {
+    if (phonemes == nullptr || std::string_view(phonemes).find_first_not_of(" \t\r\n\f\v") == std::string_view::npos) {
         return fail(KOKOPOP_ERROR_INVALID_ARGUMENT, "phonemes are empty");
     }
 
-    std::string error;
-    const std::string voice_s = voice ? voice : "";
-    if (!kokopop::synthesize_phonemes(*model->impl, phonemes, voice_s, speed, *out_audio, error)) {
-        return fail(KOKOPOP_ERROR_INFERENCE, error);
-    }
-    return KOKOPOP_OK;
+    return guarded([&]() -> int {
+        std::string error;
+        const std::string voice_s = voice ? voice : "";
+        if (!kokopop::synthesize_phonemes(*model->impl, phonemes, voice_s, speed, *out_audio, error)) {
+            return fail(KOKOPOP_ERROR_INFERENCE, error);
+        }
+        return KOKOPOP_OK;
+    });
 }
 
 int kokopop_write_wav(const char * path, const kokopop_audio * audio) {
     if (path == nullptr || audio == nullptr) {
         return fail(KOKOPOP_ERROR_INVALID_ARGUMENT, "invalid WAV write argument");
     }
-    std::string error;
-    if (!kokopop::write_wav_file(path, *audio, error)) {
-        return fail(KOKOPOP_ERROR_IO, error);
-    }
-    return KOKOPOP_OK;
+    return guarded([&]() -> int {
+        std::string error;
+        if (!kokopop::write_wav_file(path, *audio, error)) {
+            return fail(KOKOPOP_ERROR_IO, error);
+        }
+        return KOKOPOP_OK;
+    }, KOKOPOP_ERROR_IO);
 }
 
 int kokopop_synthesis_create(
@@ -295,36 +317,42 @@ int kokopop_synthesis_create(
         }
     }
 
-    auto session_options = make_session_options(options);
-    auto wrapper = std::unique_ptr<kokopop_synthesis>(new kokopop_synthesis());
-    wrapper->impl.reset(new kokopop::SynthesisSession(*model->impl, std::move(session_options)));
-    *out_synthesis = wrapper.release();
-    return KOKOPOP_OK;
+    return guarded([&]() -> int {
+        auto session_options = make_session_options(options);
+        auto wrapper = std::unique_ptr<kokopop_synthesis>(new kokopop_synthesis());
+        wrapper->impl.reset(new kokopop::SynthesisSession(*model->impl, std::move(session_options)));
+        *out_synthesis = wrapper.release();
+        return KOKOPOP_OK;
+    });
 }
 
 int kokopop_synthesis_push_text(kokopop_synthesis * synthesis, const char * text) {
     if (synthesis == nullptr || synthesis->impl == nullptr) {
         return fail(KOKOPOP_ERROR_INVALID_ARGUMENT, "synthesis is null");
     }
-    if (text == nullptr || kokopop::trim_ascii(text).empty()) {
+    if (text == nullptr || std::string_view(text).find_first_not_of(" \t\r\n\f\v") == std::string_view::npos) {
         return fail(KOKOPOP_ERROR_INVALID_ARGUMENT, "text is empty");
     }
-    std::string error;
-    if (!synthesis->impl->push_text(text, error)) {
-        return fail(KOKOPOP_ERROR_INVALID_ARGUMENT, error);
-    }
-    return KOKOPOP_OK;
+    return guarded([&]() -> int {
+        std::string error;
+        if (!synthesis->impl->push_text(text, error)) {
+            return fail(KOKOPOP_ERROR_INVALID_ARGUMENT, error);
+        }
+        return KOKOPOP_OK;
+    });
 }
 
 int kokopop_synthesis_finish_input(kokopop_synthesis * synthesis) {
     if (synthesis == nullptr || synthesis->impl == nullptr) {
         return fail(KOKOPOP_ERROR_INVALID_ARGUMENT, "synthesis is null");
     }
-    std::string error;
-    if (!synthesis->impl->finish_input(error)) {
-        return fail(KOKOPOP_ERROR_INVALID_ARGUMENT, error);
-    }
-    return KOKOPOP_OK;
+    return guarded([&]() -> int {
+        std::string error;
+        if (!synthesis->impl->finish_input(error)) {
+            return fail(KOKOPOP_ERROR_INVALID_ARGUMENT, error);
+        }
+        return KOKOPOP_OK;
+    });
 }
 
 int kokopop_synthesis_next(
@@ -341,39 +369,41 @@ int kokopop_synthesis_next(
         return fail(KOKOPOP_ERROR_INVALID_ARGUMENT, "synthesis is null");
     }
 
-    std::vector<kokopop::SynthesisAudioChunk> chunks;
-    std::string error;
-    if (!synthesis->impl->next(max_chunks, 0, chunks, error)) {
-        return fail(KOKOPOP_ERROR_INFERENCE, error);
-    }
-    if (chunks.empty()) return KOKOPOP_OK;
-
-    auto * out = static_cast<kokopop_audio_chunk *>(
-        std::calloc(chunks.size(), sizeof(kokopop_audio_chunk)));
-    if (out == nullptr) {
-        return fail(KOKOPOP_ERROR_INFERENCE, "failed to allocate output chunks");
-    }
-
-    for (size_t i = 0; i < chunks.size(); ++i) {
-        const auto & src = chunks[i];
-        out[i].n_samples = src.samples.size();
-        out[i].sample_rate = synthesis->impl->sample_rate();
-        out[i].chunk_index = src.chunk_index;
-        out[i].is_final = src.is_final ? 1 : 0;
-        if (!src.samples.empty()) {
-            out[i].samples = static_cast<float *>(
-                std::malloc(src.samples.size() * sizeof(float)));
-            if (out[i].samples == nullptr) {
-                kokopop_audio_chunks_free(out, chunks.size());
-                return fail(KOKOPOP_ERROR_INFERENCE, "failed to allocate output audio chunk");
-            }
-            std::memcpy(out[i].samples, src.samples.data(), src.samples.size() * sizeof(float));
+    return guarded([&]() -> int {
+        std::vector<kokopop::SynthesisAudioChunk> chunks;
+        std::string error;
+        if (!synthesis->impl->next(max_chunks, 0, chunks, error)) {
+            return fail(KOKOPOP_ERROR_INFERENCE, error);
         }
-    }
+        if (chunks.empty()) return KOKOPOP_OK;
 
-    *out_chunks = out;
-    *out_n_chunks = chunks.size();
-    return KOKOPOP_OK;
+        auto * out = static_cast<kokopop_audio_chunk *>(
+            std::calloc(chunks.size(), sizeof(kokopop_audio_chunk)));
+        if (out == nullptr) {
+            return fail(KOKOPOP_ERROR_INFERENCE, "failed to allocate output chunks");
+        }
+
+        for (size_t i = 0; i < chunks.size(); ++i) {
+            const auto & src = chunks[i];
+            out[i].n_samples = src.samples.size();
+            out[i].sample_rate = synthesis->impl->sample_rate();
+            out[i].chunk_index = src.chunk_index;
+            out[i].is_final = src.is_final ? 1 : 0;
+            if (!src.samples.empty()) {
+                out[i].samples = static_cast<float *>(
+                    std::malloc(src.samples.size() * sizeof(float)));
+                if (out[i].samples == nullptr) {
+                    kokopop_audio_chunks_free(out, chunks.size());
+                    return fail(KOKOPOP_ERROR_INFERENCE, "failed to allocate output audio chunk");
+                }
+                std::memcpy(out[i].samples, src.samples.data(), src.samples.size() * sizeof(float));
+            }
+        }
+
+        *out_chunks = out;
+        *out_n_chunks = chunks.size();
+        return KOKOPOP_OK;
+    });
 }
 
 void kokopop_audio_chunks_free(kokopop_audio_chunk * chunks, size_t n_chunks) {
@@ -414,10 +444,12 @@ int kokopop_audio_encoder_create(
     encoder_options.ogg_prebuffer_chunks =
         options ? std::max<int32_t>(0, options->ogg_prebuffer_chunks) : 0;
 
-    auto wrapper = std::unique_ptr<kokopop_audio_encoder>(new kokopop_audio_encoder());
-    wrapper->impl.reset(new kokopop::AudioEncoder(encoder_options));
-    *out_encoder = wrapper.release();
-    return KOKOPOP_OK;
+    return guarded([&]() -> int {
+        auto wrapper = std::unique_ptr<kokopop_audio_encoder>(new kokopop_audio_encoder());
+        wrapper->impl.reset(new kokopop::AudioEncoder(encoder_options));
+        *out_encoder = wrapper.release();
+        return KOKOPOP_OK;
+    }, KOKOPOP_ERROR_IO);
 }
 
 int kokopop_audio_encoder_start(kokopop_audio_encoder * encoder, kokopop_bytes * out_bytes) {
@@ -429,15 +461,17 @@ int kokopop_audio_encoder_start(kokopop_audio_encoder * encoder, kokopop_bytes *
     if (encoder == nullptr || encoder->impl == nullptr) {
         return fail(KOKOPOP_ERROR_INVALID_ARGUMENT, "encoder is null");
     }
-    std::vector<uint8_t> bytes;
-    std::string error;
-    if (!encoder->impl->start(bytes, error)) {
-        return fail(KOKOPOP_ERROR_IO, error);
-    }
-    if (!allocate_bytes_from_vector(bytes, *out_bytes)) {
-        return fail(KOKOPOP_ERROR_IO, "failed to allocate encoded bytes");
-    }
-    return KOKOPOP_OK;
+    return guarded([&]() -> int {
+        std::vector<uint8_t> bytes;
+        std::string error;
+        if (!encoder->impl->start(bytes, error)) {
+            return fail(KOKOPOP_ERROR_IO, error);
+        }
+        if (!allocate_bytes_from_vector(bytes, *out_bytes)) {
+            return fail(KOKOPOP_ERROR_IO, "failed to allocate encoded bytes");
+        }
+        return KOKOPOP_OK;
+    }, KOKOPOP_ERROR_IO);
 }
 
 int kokopop_audio_encoder_push(
@@ -454,15 +488,17 @@ int kokopop_audio_encoder_push(
     if (encoder == nullptr || encoder->impl == nullptr) {
         return fail(KOKOPOP_ERROR_INVALID_ARGUMENT, "encoder is null");
     }
-    std::vector<uint8_t> bytes;
-    std::string error;
-    if (!encoder->impl->push(samples, n_samples, is_final != 0, bytes, error)) {
-        return fail(KOKOPOP_ERROR_IO, error);
-    }
-    if (!allocate_bytes_from_vector(bytes, *out_bytes)) {
-        return fail(KOKOPOP_ERROR_IO, "failed to allocate encoded bytes");
-    }
-    return KOKOPOP_OK;
+    return guarded([&]() -> int {
+        std::vector<uint8_t> bytes;
+        std::string error;
+        if (!encoder->impl->push(samples, n_samples, is_final != 0, bytes, error)) {
+            return fail(KOKOPOP_ERROR_IO, error);
+        }
+        if (!allocate_bytes_from_vector(bytes, *out_bytes)) {
+            return fail(KOKOPOP_ERROR_IO, "failed to allocate encoded bytes");
+        }
+        return KOKOPOP_OK;
+    }, KOKOPOP_ERROR_IO);
 }
 
 int kokopop_audio_encoder_finish(
@@ -477,15 +513,17 @@ int kokopop_audio_encoder_finish(
     if (encoder == nullptr || encoder->impl == nullptr) {
         return fail(KOKOPOP_ERROR_INVALID_ARGUMENT, "encoder is null");
     }
-    std::vector<uint8_t> bytes;
-    std::string error;
-    if (!encoder->impl->finish(success != 0, bytes, error)) {
-        return fail(KOKOPOP_ERROR_IO, error);
-    }
-    if (!allocate_bytes_from_vector(bytes, *out_bytes)) {
-        return fail(KOKOPOP_ERROR_IO, "failed to allocate encoded bytes");
-    }
-    return KOKOPOP_OK;
+    return guarded([&]() -> int {
+        std::vector<uint8_t> bytes;
+        std::string error;
+        if (!encoder->impl->finish(success != 0, bytes, error)) {
+            return fail(KOKOPOP_ERROR_IO, error);
+        }
+        if (!allocate_bytes_from_vector(bytes, *out_bytes)) {
+            return fail(KOKOPOP_ERROR_IO, "failed to allocate encoded bytes");
+        }
+        return KOKOPOP_OK;
+    }, KOKOPOP_ERROR_IO);
 }
 
 void kokopop_bytes_free(kokopop_bytes * bytes) {

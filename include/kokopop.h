@@ -186,6 +186,10 @@ KOKOPOP_API void kokopop_audio_encoder_free(kokopop_audio_encoder * encoder);
 
 KOKOPOP_API void kokopop_audio_free(kokopop_audio * audio);
 KOKOPOP_API void kokopop_model_free(kokopop_model * model);
+
+/// Message of the last failed call on this thread, or an empty string.
+/// Successful calls preserve it; the pointer stays valid until the next
+/// error on the same thread.
 KOKOPOP_API const char * kokopop_last_error(void);
 
 /// Sample rate of the model's default voice, in Hz. Use
