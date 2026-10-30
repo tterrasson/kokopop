@@ -44,9 +44,9 @@ include(FetchContent)
 FetchContent_Declare(
   ggml
   GIT_REPOSITORY https://github.com/ggml-org/ggml.git
-  GIT_TAG        v0.27.0
+  GIT_TAG        v0.28.0
   GIT_SHALLOW    FALSE
-  # Patches (bumped to v0.27.0):
+  # Patches (bumped to v0.28.0):
   # Fix 4: dispatch CONV_TRANSPOSE_1D with 32 threads/group and simd_sum
   #         reduction, avoiding GPU watchdog on large generator dims.
   # Apply only when the patch still matches. This keeps re-configure
@@ -54,9 +54,9 @@ FetchContent_Declare(
   # Note: Fix 3 (scalar NORM kernel) is merged upstream in GGML a056a26, and
   #       Fix 5 (CUDA IM2COL grid-dim Y overflow) in GGML 0ce7ad3; both patches
   #       have been dropped.
-  # Fix 6: Adreno-targeted ggml-opencl work (SIN/COS kernels, a conv1d kernel,
-  #         a dim-0 broadcast path for add/mul/div and a retiled f16 GEMM).
-  #         Worth 26.6 s -> 7.8 s on a Kokoro utterance on a Snapdragon 845.
+  # Fix 6: retain the OpenCL SIN/COS, conv1d, convtranspose1d, LSTM and snake
+  #         kernels and the flat/dim-0 broadcast paths. Use upstream's Adreno
+  #         xmem f16 GEMM and narrow-N variants instead of the local GEMM patch.
   # Fix 7: run ggml's `-Wl,-v` linker probe inside the ggml build dir. With
   #         Emscripten the probe has no -o, so emcc otherwise links
   #         a.out.js/a.out.wasm into the directory emcmake was invoked from
