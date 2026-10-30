@@ -31,8 +31,18 @@ FileMapping::FileMapping(const std::string & path) {
         return;
     }
     LARGE_INTEGER fsize{};
-    if (!GetFileSizeEx(file, &fsize) || fsize.QuadPart <= 0) {
+    if (!GetFileSizeEx(file, &fsize)) {
         _error = "FileMapping: GetFileSizeEx failed for " + path;
+        CloseHandle(file);
+        return;
+    }
+    if (fsize.QuadPart <= 0) {
+        _error = "FileMapping: empty file: " + path;
+        CloseHandle(file);
+        return;
+    }
+    if (static_cast<uint64_t>(fsize.QuadPart) > static_cast<uint64_t>(SIZE_MAX)) {
+        _error = "FileMapping: file too large for this platform: " + path;
         CloseHandle(file);
         return;
     }
@@ -61,8 +71,18 @@ FileMapping::FileMapping(const std::string & path) {
         return;
     }
     struct stat st{};
-    if (::fstat(fd, &st) != 0 || st.st_size <= 0) {
+    if (::fstat(fd, &st) != 0) {
         _error = "FileMapping: fstat() failed for " + path + ": " + std::strerror(errno);
+        ::close(fd);
+        return;
+    }
+    if (st.st_size <= 0) {
+        _error = "FileMapping: empty file: " + path;
+        ::close(fd);
+        return;
+    }
+    if (static_cast<uint64_t>(st.st_size) > static_cast<uint64_t>(SIZE_MAX)) {
+        _error = "FileMapping: file too large for this platform: " + path;
         ::close(fd);
         return;
     }

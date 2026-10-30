@@ -148,7 +148,7 @@ struct KokoroArch final : ModelArch {
     // underlying data always outlives the map entries.
     using token_map = std::unordered_map<
         std::string_view, uint32_t,
-        Model::transparent_string_hash,
+        std::hash<std::string_view>,
         std::equal_to<>
     >;
     token_map token_to_id;

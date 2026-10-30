@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <thread>
 #include <ggml.h>
 #include <ggml-backend.h>
@@ -54,12 +55,16 @@ bool load_tensor_data_to_backend(
                 error = std::string("GGUF tensor missing from weight context: ") + (name ? name : "");
                 return false;
             }
-            const size_t offset = data_origin + gguf_get_tensor_offset(meta, i);
+            // Overflow-safe bounds check: a corrupt GGUF can carry offsets
+            // near UINT64_MAX, and `offset + nbytes` would wrap.
+            const uint64_t relative_offset = gguf_get_tensor_offset(meta, i);
             const size_t nbytes = ggml_nbytes(tensor);
-            if (offset + nbytes > total_size) {
+            if (data_origin > total_size || relative_offset > total_size - data_origin ||
+                nbytes > total_size - data_origin - static_cast<size_t>(relative_offset)) {
                 error = std::string("GGUF tensor extends past EOF: ") + (name ? name : "");
                 return false;
             }
+            const size_t offset = data_origin + static_cast<size_t>(relative_offset);
             backend.tensor_set(tensor, base + offset, 0, nbytes);
         }
         // Subsequent file access (if any) will be random, not sequential —
@@ -88,8 +93,25 @@ bool load_tensor_data_to_backend(
             return false;
         }
 
-        const size_t offset = data_origin + gguf_get_tensor_offset(meta, i);
-        if (std::fseek(file, static_cast<long>(offset), SEEK_SET) != 0) {
+        const uint64_t relative_offset = gguf_get_tensor_offset(meta, i);
+#if defined(_WIN32)
+        const uint64_t max_offset = std::numeric_limits<__int64>::max();
+#else
+        const uint64_t max_offset = std::numeric_limits<off_t>::max();
+#endif
+        if (data_origin > max_offset || relative_offset > max_offset - data_origin) {
+            std::fclose(file);
+            error = "GGUF tensor offset exceeds platform seek range";
+            return false;
+        }
+        const uint64_t off64 = data_origin + relative_offset;
+        // 64-bit seek: static_cast<long> would truncate offsets > 2 GiB on
+        // LLP64 platforms (Windows) and read the wrong bytes silently.
+#if defined(_WIN32)
+        if (_fseeki64(file, static_cast<__int64>(off64), SEEK_SET) != 0) {
+#else
+        if (fseeko(file, static_cast<off_t>(off64), SEEK_SET) != 0) {
+#endif
             std::fclose(file);
             error = std::string("failed to seek GGUF tensor data: ") + (name ? name : "");
             return false;
@@ -228,12 +250,12 @@ std::string resolve_voice_name(const std::string & requested_voice,
     return {};
 }
 
-ggml_tensor * Model::tensor(const std::string & logical_name) const {
+ggml_tensor * Model::tensor(std::string_view logical_name) const {
     const auto it = tensors.find(logical_name);
     return it == tensors.end() ? nullptr : it->second;
 }
 
-ggml_tensor * Model::cached_tensor(const std::string & logical_name) const {
+ggml_tensor * Model::cached_tensor(std::string_view logical_name) const {
     auto it = tensor_cache.find(logical_name);
     if (it != tensor_cache.end()) {
         return it->second;
@@ -354,7 +376,7 @@ bool load_model_from_gguf(
     }
 
     bool tensor_failed = false;
-    for_each_tensor(meta, weight_ctx, [&](const char * name, ggml_tensor * tensor) {
+    const bool tensors_ok = for_each_tensor(meta, weight_ctx, [&](const char * name, ggml_tensor * tensor) {
         std::string logical = name;
         const auto mapped = physical_to_logical.find(logical);
         if (mapped != physical_to_logical.end()) {
@@ -374,7 +396,10 @@ bool load_model_from_gguf(
         }
         m->tensors[logical] = tensor;
     });
-    if (tensor_failed) {
+    if (!tensors_ok && error.empty()) {
+        error = "GGUF tensor missing from weight context";
+    }
+    if (tensor_failed || !tensors_ok) {
         if (error.empty()) {
             error = "failed to load GGUF tensors";
         }

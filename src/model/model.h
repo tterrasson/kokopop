@@ -5,9 +5,10 @@
 #include "kokopop.h"
 
 #include <cstdint>
+#include <functional>
+#include <map>
 #include <memory>
 #include <string>
-#include <functional>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
@@ -40,32 +41,18 @@ struct Model {
     int32_t backend_type = KOKOPOP_BACKEND_CPU;  // actual backend used
     bool is_mock = false;
 
-    // Hash functor that accepts both std::string and std::string_view.
-    // Required for heterogeneous (string_view) lookups on maps keyed by std::string.
-    struct transparent_string_hash {
-        size_t operator()(std::string_view sv) const noexcept {
-            return std::hash<std::string_view>{}(sv);
-        }
-    };
-
-    // Tensor lookup map with transparent hash + equality so that
-    // tensor(string_view) and cached_tensor(string_view) avoid constructing
-    // temporary std::string keys on the hot inference path.
-    using tensor_map = std::unordered_map<
-        std::string, ggml_tensor *,
-        transparent_string_hash,
-        std::equal_to<>
-    >;
+    // Tensor lookup map with a transparent comparator (std::less<>) so that
+    // tensor(string_view) and cached_tensor(string_view) perform heterogeneous
+    // lookups without constructing a temporary std::string key on the hot
+    // inference path. std::map gives C++14 heterogeneous find; iteration order
+    // is irrelevant here (callers either look up or sort explicitly).
+    using tensor_map = std::map<std::string, ggml_tensor *, std::less<>>;
     tensor_map tensors;
     std::unordered_map<std::string, std::string> tensor_physical_names;
 
-    // Cache for frequently accessed tensors to avoid hash lookups. Populated
+    // Cache for frequently accessed tensors to avoid fallback lookups. Populated
     // by the architecture at load time; the map itself is a neutral mechanism.
-    using tensor_cache_map = std::unordered_map<
-        std::string, ggml_tensor *,
-        transparent_string_hash,
-        std::equal_to<>
-    >;
+    using tensor_cache_map = std::map<std::string, ggml_tensor *, std::less<>>;
     tensor_cache_map tensor_cache;
 
     /// Voice metadata, name -> descriptor. Lookup index over `arch->voices()`,
@@ -110,8 +97,8 @@ struct Model {
     bool tokenize_phonemes(const std::string & phonemes,
                            std::vector<uint32_t> & ids, std::string & error) const;
 
-    ggml_tensor * tensor(const std::string & logical_name) const;
-    ggml_tensor * cached_tensor(const std::string & logical_name) const;
+    ggml_tensor * tensor(std::string_view logical_name) const;
+    ggml_tensor * cached_tensor(std::string_view logical_name) const;
 };
 
 /// The three closures the chunker needs, bound to one resolved voice.

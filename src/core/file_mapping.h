@@ -33,9 +33,9 @@ public:
     const std::string & error() const { return _error; }
 
     // Hint the kernel about expected access patterns. No-op on Windows.
-    // call_after_init=true switches from SEQUENTIAL hint to RANDOM after the
-    // initial linear read, so subsequent on-demand pages don't pre-fetch
-    // pointlessly.
+    // The constructor already hints SEQUENTIAL for the initial linear read;
+    // call this afterwards to switch to RANDOM so on-demand pages of later
+    // random accesses don't pre-fetch pointlessly.
     void advise_random();
 
 private:
