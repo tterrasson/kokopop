@@ -18,32 +18,59 @@ namespace {
 // UTF-8 helpers
 // ────────────────────────────────────────────────────────────────────────
 
-inline uint32_t utf8_decode(const char * p, size_t & byte_len) {
+// Decodes one codepoint at p. `avail` is the number of readable bytes at p:
+// a multi-byte sequence that would run past the end of the buffer is never
+// read — it decodes as invalid (0xFFFFFFFF) consuming a single byte.
+inline uint32_t utf8_decode(const char * p, size_t avail, size_t & byte_len) {
     unsigned char c = static_cast<unsigned char>(p[0]);
+    size_t len = 1;
     if ((c & 0x80) == 0) {
         byte_len = 1;
         return static_cast<uint32_t>(c);
     }
     if ((c & 0xE0) == 0xC0) {
-        byte_len = 2;
-        return (static_cast<uint32_t>(c & 0x1F) << 6) |
-               (static_cast<uint32_t>(p[1] & 0x3F));
+        len = 2;
+    } else if ((c & 0xF0) == 0xE0) {
+        len = 3;
+    } else if ((c & 0xF8) == 0xF0) {
+        len = 4;
+    } else {
+        byte_len = 1;
+        return 0xFFFFFFFF;
     }
-    if ((c & 0xF0) == 0xE0) {
-        byte_len = 3;
-        return (static_cast<uint32_t>(c & 0x0F) << 12) |
-               (static_cast<uint32_t>(p[1] & 0x3F) << 6) |
-               (static_cast<uint32_t>(p[2] & 0x3F));
+    if (len > avail) {
+        // Truncated sequence: consume one byte, do not read past the buffer.
+        byte_len = 1;
+        return 0xFFFFFFFF;
     }
-    if ((c & 0xF8) == 0xF0) {
-        byte_len = 4;
-        return (static_cast<uint32_t>(c & 0x07) << 18) |
-               (static_cast<uint32_t>(p[1] & 0x3F) << 12) |
-               (static_cast<uint32_t>(p[2] & 0x3F) << 6) |
-               (static_cast<uint32_t>(p[3] & 0x3F));
+    for (size_t i = 1; i < len; ++i) {
+        if ((static_cast<unsigned char>(p[i]) & 0xC0) != 0x80) {
+            byte_len = 1;
+            return 0xFFFFFFFF;
+        }
     }
-    byte_len = 1;
-    return 0xFFFFFFFF;
+    uint32_t cp = 0;
+    if (len == 2) {
+        cp = (static_cast<uint32_t>(c & 0x1F) << 6) |
+             (static_cast<uint32_t>(p[1] & 0x3F));
+    } else if (len == 3) {
+        cp = (static_cast<uint32_t>(c & 0x0F) << 12) |
+             (static_cast<uint32_t>(p[1] & 0x3F) << 6) |
+             (static_cast<uint32_t>(p[2] & 0x3F));
+    } else {
+        cp = (static_cast<uint32_t>(c & 0x07) << 18) |
+             (static_cast<uint32_t>(p[1] & 0x3F) << 12) |
+             (static_cast<uint32_t>(p[2] & 0x3F) << 6) |
+             (static_cast<uint32_t>(p[3] & 0x3F));
+    }
+    if ((len == 2 && cp < 0x80) || (len == 3 && cp < 0x800) ||
+        (len == 4 && cp < 0x10000) || cp > 0x10FFFF ||
+        (cp >= 0xD800 && cp <= 0xDFFF)) {
+        byte_len = 1;
+        return 0xFFFFFFFF;
+    }
+    byte_len = len;
+    return cp;
 }
 
 inline bool is_cjk_ideograph(uint32_t cp) {
@@ -89,7 +116,7 @@ std::vector<Utf8Char> split_utf8_chars(std::string_view text) {
     size_t i = 0;
     while (i < text.size()) {
         size_t len = 1;
-        uint32_t cp = utf8_decode(text.data() + i, len);
+        uint32_t cp = utf8_decode(text.data() + i, text.size() - i, len);
         if (i + len > text.size()) len = 1;
         chars.push_back({std::string(text.substr(i, len)), cp, is_cjk_ideograph(cp)});
         i += len;
@@ -285,7 +312,6 @@ inline constexpr LexemeEntry g_lexicon[] = {
     {"随着", "sui2 zhe5"},
     {"人工智能", "ren2 gong1 zhi4 neng2"},
     {"发展", "fa1 zhan3"},
-    {"生活", "sheng1 huo2"},
     {"方式", "fang1 shi4"},
     {"发生", "fa1 sheng1"},
     {"巨大", "ju4 da4"},
@@ -336,7 +362,6 @@ inline constexpr LexemeEntry g_lexicon[] = {
     {"饮食文化", "yin3 shi2 wen2 hua4"},
     {"飲食文化", "yin3 shi2 wen2 hua4"},
     {"博大精深", "bo2 da4 jing1 shen1"},
-    {"不仅", "bu4 jin3"},
     {"不僅", "bu4 jin3"},
     {"讲究", "jiang3 jiu1"},
     {"講究", "jiang3 jiu1"},
@@ -349,7 +374,6 @@ inline constexpr LexemeEntry g_lexicon[] = {
     {"歷史背景", "li4 shi3 bei4 jing3"},
     {"哲学思想", "zhe2 xue2 si1 xiang3"},
     {"哲學思想", "zhe2 xue2 si1 xiang3"},
-    {"包含", "bao1 han2"},
     {"背景", "bei4 jing3"},
     {"思想", "si1 xiang3"},
     {"哲学", "zhe2 xue2"},
@@ -407,7 +431,7 @@ inline std::string map_punctuation(const std::string & text) {
     size_t i = 0;
     while (i < text.size()) {
         size_t char_len;
-        uint32_t cp = utf8_decode(text.data() + i, char_len);
+        uint32_t cp = utf8_decode(text.data() + i, text.size() - i, char_len);
 
         switch (cp) {
             case 0x3001: result += ", "; break;
@@ -458,9 +482,10 @@ inline std::string strip_combining_marks(const std::string & text) {
 
     for (size_t i = 0; i < text.size(); ++i) {
         unsigned char c = static_cast<unsigned char>(text[i]);
-        if (c == 0xCC && i + 1 < text.size() &&
+        // 0xCC leads U+0300–U+033F, 0xCD leads U+0340–U+036F.
+        if ((c == 0xCC || c == 0xCD) && i + 1 < text.size() &&
             static_cast<unsigned char>(text[i + 1]) >= 0x80 &&
-            static_cast<unsigned char>(text[i + 1]) <= 0xBF) {
+            static_cast<unsigned char>(text[i + 1]) <= (c == 0xCC ? 0xBF : 0xAF)) {
             ++i;
             continue;
         }

@@ -517,3 +517,31 @@ TEST_CASE("zh_g2p_full_pipeline_10000_no_crash") {
     CHECK(error.empty());
     CHECK(!phonemes.empty());
 }
+
+TEST_CASE("zh_g2p_truncated_utf8_tail_does_not_read_out_of_bounds") {
+    // A truncated multi-byte sequence at the end of the input must be handled
+    // without reading past the buffer (latent heap OOB before the fix).
+    std::string phonemes, error;
+    kokopop::g2p::zh::g2p_chinese(std::string("你好") + "\xE4\xBD", phonemes, error);
+    CHECK(!phonemes.empty());
+    kokopop::g2p::zh::g2p_chinese(std::string("你好") + "\xF0\x9F\x98", phonemes, error);
+    CHECK(!phonemes.empty());
+    kokopop::g2p::zh::g2p_chinese(std::string("价格") + "\xC3", phonemes, error);
+    CHECK(!phonemes.empty());
+    // lone continuation bytes
+    kokopop::g2p::zh::g2p_chinese(std::string("你好") + "\x80\x80", phonemes, error);
+}
+
+TEST_CASE("zh_g2p_invalid_continuation_does_not_decode_as_chinese") {
+    // Masking the low six bits without checking continuation bytes turns
+    // this malformed sequence into U+4F60 (你).
+    CHECK(zh_pinyin("\xE4\x7D\xA0").find("ni3") == std::string::npos);
+}
+
+TEST_CASE("zh_g2p_combining_mark_filter_preserves_greek_range") {
+    std::string phonemes, error;
+    REQUIRE(kokopop::g2p::zh::g2p_chinese("\xCD\xB0", phonemes, error));  // U+0370
+    CHECK(phonemes.find("\xCD\xB0") != std::string::npos);
+    REQUIRE(kokopop::g2p::zh::g2p_chinese("a\xCD\xA0", phonemes, error));  // U+0360
+    CHECK(phonemes.find("\xCD\xA0") == std::string::npos);
+}
