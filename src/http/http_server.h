@@ -2,6 +2,7 @@
 
 #include <functional>
 #include <map>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -88,9 +89,20 @@ public:
     bool is_running() const { return _running.load(); }
 
 private:
+    // A finished connection thread cannot join itself, so each entry carries
+    // a done flag: the accept loop joins and erases finished entries. Without
+    // this the vector grows by one per connection for the life of the process
+    // (and its size is the concurrency gauge, so the server would eventually
+    // reject every new connection).
+    struct ConnThread {
+        std::thread thread;
+        std::shared_ptr<std::atomic<bool>> done;
+    };
+
     void _accept_loop();
-    void _handle_connection(int client_fd);
-    HttpRequest _parse_request(int fd);
+    void _reap_finished_threads();  // call with _threads_mutex held
+    void _handle_connection(int client_fd, std::shared_ptr<std::atomic<bool>> done);
+    HttpRequest _parse_request(int fd, std::string & pending);
     bool _send_response(int fd, const HttpResponse & res, bool close_conn);
 
     std::map<std::string, RequestHandler> _routes;
@@ -101,7 +113,7 @@ private:
 
     std::atomic<bool> _running{false};
     std::thread _accept_thread;
-    std::vector<std::thread> _conn_threads;
+    std::vector<ConnThread> _conn_threads;
     std::mutex _threads_mutex;
 };
 

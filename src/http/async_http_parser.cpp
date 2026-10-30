@@ -1,4 +1,5 @@
 #include "http/async_http_parser.h"
+#include "http/http_response_writer.h"  // shared http_lower_ascii/http_trim_ascii/token helpers
 
 #include <algorithm>
 #include <cctype>
@@ -52,29 +53,13 @@ AsyncHttpParseResult AsyncHttpRequestParser::next() {
                 return result;
             }
         } else if (_state == State::ReadingFixedBody) {
-            auto result = _parse_fixed_body();
-            if (result.status != AsyncHttpParseResult::Status::NeedMore) {
-                return result;
-            }
-            return result;
+            return _parse_fixed_body();
         } else if (_state == State::ReadingChunkSize) {
-            auto result = _parse_chunk_size();
-            if (result.status != AsyncHttpParseResult::Status::NeedMore) {
-                return result;
-            }
-            return result;
+            return _parse_chunk_size();
         } else if (_state == State::ReadingChunkData) {
-            auto result = _parse_chunk_data();
-            if (result.status != AsyncHttpParseResult::Status::NeedMore) {
-                return result;
-            }
-            return result;
+            return _parse_chunk_data();
         } else if (_state == State::ReadingChunkTrailer) {
-            auto result = _parse_chunk_trailer();
-            if (result.status != AsyncHttpParseResult::Status::NeedMore) {
-                return result;
-            }
-            return result;
+            return _parse_chunk_trailer();
         }
     }
 }
@@ -317,34 +302,16 @@ bool AsyncHttpRequestParser::_parse_request_line(const std::string & request_lin
 }
 
 std::string AsyncHttpRequestParser::_lower_ascii(std::string s) {
-    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
-    return s;
+    return http_lower_ascii(std::move(s));
 }
 
 std::string AsyncHttpRequestParser::_trim_ascii(std::string s) {
-    while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) {
-        s.erase(s.begin());
-    }
-    while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r')) {
-        s.pop_back();
-    }
-    return s;
+    return http_trim_ascii(std::move(s));
 }
 
 bool AsyncHttpRequestParser::_header_has_token(const std::string & value,
                                                const std::string & token) {
-    std::string lower = _lower_ascii(value);
-    size_t start = 0;
-    while (start <= lower.size()) {
-        size_t comma = lower.find(',', start);
-        std::string part = _trim_ascii(lower.substr(start, comma - start));
-        if (part == token) return true;
-        if (comma == std::string::npos) break;
-        start = comma + 1;
-    }
-    return false;
+    return http_header_value_has_token(value, token);
 }
 
 } // namespace kokopop

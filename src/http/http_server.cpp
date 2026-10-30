@@ -43,6 +43,9 @@ static constexpr size_t MAX_BODY_SIZE = 16 * 1024 * 1024;
 /// Maximum HTTP header size (64 KiB).
 static constexpr size_t MAX_HEADER_SIZE = 64 * 1024;
 
+/// Maximum number of header lines per request.
+static constexpr int MAX_HEADER_COUNT = 100;
+
 /// Maximum number of concurrent connections.
 /// Prevents thread-explosion DoS.
 static constexpr int MAX_CONCURRENT_CONNECTIONS = 64;
@@ -225,16 +228,28 @@ void HttpResponse::set_json_string(const std::string & json_str) {
 
 // Helper: build a simple JSON error object
 std::string json_error(const std::string & msg) {
-    // Escape the message for JSON (handle quotes and backslashes)
+    // Escape the message for JSON. All C0 control characters must be escaped
+    // (\u00XX), not just the named ones — anything else produces invalid JSON.
     std::string escaped;
     escaped.reserve(msg.size() + 2);
-    for (char c : msg) {
-        if (c == '"') escaped += "\\\"";
-        else if (c == '\\') escaped += "\\\\";
-        else if (c == '\n') escaped += "\\n";
-        else if (c == '\r') escaped += "\\r";
-        else if (c == '\t') escaped += "\\t";
-        else escaped += c;
+    char buf[8];
+    for (unsigned char c : msg) {
+        switch (c) {
+            case '"':  escaped += "\\\""; break;
+            case '\\': escaped += "\\\\"; break;
+            case '\n': escaped += "\\n"; break;
+            case '\r': escaped += "\\r"; break;
+            case '\t': escaped += "\\t"; break;
+            case '\b': escaped += "\\b"; break;
+            case '\f': escaped += "\\f"; break;
+            default:
+                if (c < 0x20) {
+                    std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+                    escaped += buf;
+                } else {
+                    escaped += static_cast<char>(c);
+                }
+        }
     }
     return "{\"error\":\"" + escaped + "\"}";
 }
@@ -373,10 +388,23 @@ void HttpServer::join() {
     }
     {
         std::lock_guard<std::mutex> lock(_threads_mutex);
-        for (auto & t : _conn_threads) {
-            if (t.joinable()) t.join();
+        for (auto & ct : _conn_threads) {
+            if (ct.thread.joinable()) ct.thread.join();
         }
         _conn_threads.clear();
+    }
+}
+
+void HttpServer::_reap_finished_threads() {
+    // Caller must hold _threads_mutex. A finished thread has already closed
+    // its socket and no longer touches the mutex, so joining here is safe.
+    for (auto it = _conn_threads.begin(); it != _conn_threads.end();) {
+        if (it->done && it->done->load() && it->thread.joinable()) {
+            it->thread.join();
+            it = _conn_threads.erase(it);
+        } else {
+            ++it;
+        }
     }
 }
 
@@ -385,6 +413,7 @@ void HttpServer::_accept_loop() {
         // Reject new connections if we're already at max concurrency.
         {
             std::lock_guard<std::mutex> lock(_threads_mutex);
+            _reap_finished_threads();
             if (static_cast<int>(_conn_threads.size()) >= MAX_CONCURRENT_CONNECTIONS) {
                 // Wait a bit before trying again — prevents busy-wait.
                 std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -442,8 +471,12 @@ void HttpServer::_accept_loop() {
         // Spawn thread for this connection
         {
             std::lock_guard<std::mutex> lock(_threads_mutex);
+            _reap_finished_threads();
             if (static_cast<int>(_conn_threads.size()) < MAX_CONCURRENT_CONNECTIONS) {
-                _conn_threads.emplace_back(&HttpServer::_handle_connection, this, client_fd);
+                auto done = std::make_shared<std::atomic<bool>>(false);
+                _conn_threads.push_back(ConnThread{
+                    std::thread(&HttpServer::_handle_connection, this, client_fd, done),
+                    std::move(done)});
             } else {
                 // Race: thread slots filled between check and lock — reject.
                 std::fprintf(stderr, "[http] Rejecting connection (max %d reached)\n",
@@ -454,10 +487,11 @@ void HttpServer::_accept_loop() {
     }
 }
 
-void HttpServer::_handle_connection(int client_fd) {
+void HttpServer::_handle_connection(int client_fd, std::shared_ptr<std::atomic<bool>> done) {
     try {
+        std::string pending;
         while (_running.load()) {
-            HttpRequest req = _parse_request(client_fd);
+            HttpRequest req = _parse_request(client_fd, pending);
             if (req.path.empty()) {
                 // EOF, parse error, or timeout
                 break;
@@ -498,48 +532,46 @@ void HttpServer::_handle_connection(int client_fd) {
 
     socket_close(client_fd);
 
-    // Reap finished threads from the list
-    {
-        std::lock_guard<std::mutex> lock(_threads_mutex);
-        _conn_threads.erase(
-            std::remove_if(_conn_threads.begin(), _conn_threads.end(),
-                [](std::thread & t) { return !t.joinable(); }),
-            _conn_threads.end());
-    }
+    // Mark finished; the accept loop joins and erases this entry (a thread
+    // cannot join itself).
+    if (done) done->store(true);
 }
 
-HttpRequest HttpServer::_parse_request(int fd) {
+HttpRequest HttpServer::_parse_request(int fd, std::string & pending) {
     HttpRequest req;
     req.content_length = -1;
 
     // -------------------------------------------------------------------
-    // 1. Read headers byte-by-byte until \r\n\r\n  (bounded)
+    // 1. Read headers until \r\n\r\n  (bounded, in blocks — one read() per
+    //    byte would cost up to 64 KiB of syscalls per request)
     // -------------------------------------------------------------------
-    std::vector<char> buf(MAX_HEADER_SIZE);
-    std::string raw_header_data;
-    size_t header_end = 0;
-
-    while (header_end < buf.size()) {
-        ssize_t n = socket_read(fd, buf.data() + header_end, 1);
-        if (n <= 0) {
-            // n == 0  →  peer closed
-            // n < 0  →  error (timeout, ECONNRESET, etc.)
-            return req;
-        }
-
-        // Check for end of headers (\r\n\r\n)
-        if (header_end >= 3) {
-            const char * p = buf.data() + static_cast<ptrdiff_t>(header_end) - 3;
-            if (p[0] == '\r' && p[1] == '\n' && p[2] == '\r' && p[3] == '\n') {
-                raw_header_data.assign(buf.data(), header_end - 3);
+    std::string raw_header_data = std::move(pending);
+    pending.clear();
+    bool found_eoh = false;
+    {
+        char chunk[4096];
+        while (true) {
+            const size_t eoh = raw_header_data.find("\r\n\r\n");
+            if (eoh != std::string::npos) {
+                if (eoh + 4 > MAX_HEADER_SIZE) return {};
+                pending = raw_header_data.substr(eoh + 4);
+                raw_header_data.resize(eoh);
+                found_eoh = true;
                 break;
             }
+            if (raw_header_data.size() >= MAX_HEADER_SIZE) break;
+            const ssize_t n = socket_read(fd, chunk, sizeof(chunk));
+            if (n <= 0) return {};
+            raw_header_data.append(chunk, static_cast<size_t>(n));
         }
-        ++header_end;
-    }
-
-    if (raw_header_data.empty()) {
-        return req; // EOF or timeout
+        if (!found_eoh) {
+            // EOF/timeout before any byte, or headers alone exceed the limit.
+            if (raw_header_data.size() >= MAX_HEADER_SIZE) {
+                std::fprintf(stderr, "[http] Headers too large (%zu bytes), rejecting\n",
+                             raw_header_data.size());
+            }
+            return {};
+        }
     }
 
     // -------------------------------------------------------------------
@@ -552,7 +584,7 @@ HttpRequest HttpServer::_parse_request(int fd) {
     }
     if (line_end == std::string::npos || line_end == 0) {
         std::fprintf(stderr, "[http] Malformed request (no request line)\n");
-        return req;
+        return {};
     }
 
     std::string request_line = raw_header_data.substr(0, line_end);
@@ -562,7 +594,7 @@ HttpRequest HttpServer::_parse_request(int fd) {
     size_t space2 = request_line.rfind(' ');
     if (space1 == std::string::npos || space2 == std::string::npos || space1 == space2) {
         std::fprintf(stderr, "[http] Malformed request line: %.100s\n", request_line.c_str());
-        return req;
+        return {};
     }
 
     req.method = request_line.substr(0, space1);
@@ -587,9 +619,9 @@ HttpRequest HttpServer::_parse_request(int fd) {
     int header_count = 0;
     while (std::getline(iss, header_line)) {
         ++header_count;
-        if (header_count > 100) {
+        if (header_count > MAX_HEADER_COUNT) {
             std::fprintf(stderr, "[http] Too many headers (%d), rejecting\n", header_count);
-            return req;
+            return {};
         }
 
         // Trim trailing \r
@@ -609,39 +641,74 @@ HttpRequest HttpServer::_parse_request(int fd) {
 
         // Normalize key to lowercase
         std::transform(key.begin(), key.end(), key.begin(), ::tolower);
+        if (key == "content-length" && req.headers.count(key) != 0) {
+            return {};  // duplicate framing headers are ambiguous
+        }
         req.headers[key] = val;
     }
 
     // -------------------------------------------------------------------
     // 4. Read body (if Content-Length is present) — bounded
     // -------------------------------------------------------------------
-    auto it = req.headers.find("content-length");
-    if (it != req.headers.end()) {
+    const auto cl_it = req.headers.find("content-length");
+    const auto te_it = req.headers.find("transfer-encoding");
+    if (cl_it != req.headers.end() && te_it != req.headers.end()) {
+        // Ambiguous framing — reject rather than guess (RFC 9112 §6.3).
+        std::fprintf(stderr, "[http] Both Content-Length and Transfer-Encoding, rejecting\n");
+        return {};
+    }
+    if (te_it != req.headers.end()) {
+        // This server does not implement chunked request bodies.
+        std::fprintf(stderr, "[http] Transfer-Encoding request bodies unsupported, rejecting\n");
+        return {};
+    }
+
+    if (cl_it != req.headers.end()) {
         try {
-            // Use stoll so we can detect values that don't fit in int.
-            long long cl = std::stoll(it->second);
+            if (cl_it->second.empty() ||
+                cl_it->second.find_first_not_of("0123456789 \t") != std::string::npos ||
+                cl_it->second.find_first_of("0123456789") != 0) {
+                return {};
+            }
+            // Use stoll so we can detect values that don't fit in int, and
+            // reject trailing garbage ("12abc") instead of parsing "12".
+            size_t pos = 0;
+            const long long cl = std::stoll(cl_it->second, &pos);
+            while (pos < cl_it->second.size() &&
+                   (cl_it->second[pos] == ' ' || cl_it->second[pos] == '\t')) {
+                ++pos;
+            }
+            if (pos != cl_it->second.size()) {
+                throw std::invalid_argument("trailing characters");
+            }
             if (cl < 0 || static_cast<size_t>(cl) > MAX_BODY_SIZE) {
                 std::fprintf(stderr, "[http] Content-Length %lld exceeds limit (%zu), rejecting\n",
                              cl, MAX_BODY_SIZE);
-                return req;
+                return {};
             }
             req.content_length = static_cast<int>(cl);
             req.body.resize(static_cast<size_t>(req.content_length));
         } catch (const std::exception &) {
-            std::fprintf(stderr, "[http] Invalid Content-Length: %s\n", it->second.c_str());
-            return req;
+            std::fprintf(stderr, "[http] Invalid Content-Length: %s\n", cl_it->second.c_str());
+            return {};
         }
 
-        // Read exactly req.content_length bytes
+        // Read exactly req.content_length bytes; `pending` holds the bytes
+        // that arrived together with the headers.
         size_t offset = 0;
+        if (!pending.empty()) {
+            const size_t take = std::min(pending.size(), req.body.size());
+            std::memcpy(req.body.data(), pending.data(), take);
+            pending.erase(0, take);
+            offset = take;
+        }
         while (offset < req.body.size()) {
             ssize_t n = socket_read(fd, req.body.data() + offset,
                                     req.body.size() - offset);
             if (n <= 0) break; // timeout or disconnect
             offset += static_cast<size_t>(n);
         }
-        // Resize in case we got fewer bytes than expected (incomplete read)
-        req.body.resize(offset);
+        if (offset != req.body.size()) return {};  // incomplete body
     }
 
     return req;
@@ -669,11 +736,12 @@ bool HttpServer::_send_response(int fd, const HttpResponse & res, bool close_con
         oss << "Content-Length: " << res.body.size() << "\r\n";
     }
 
-    // Only add Connection: close if not already present
-    // Only add Connection: close if not already set (check case-insensitive)
+    // Only add Connection: close if not already present (case-insensitive)
     bool has_connection_header = false;
     for (auto & [k, v] : res.headers) {
-        if (k == "connection" || k == "Connection" || k == "CONNECTION") {
+        std::string lower_k = k;
+        std::transform(lower_k.begin(), lower_k.end(), lower_k.begin(), ::tolower);
+        if (lower_k == "connection") {
             has_connection_header = true;
             break;
         }

@@ -1,44 +1,27 @@
 #include "http/http_response_writer.h"
 
-#include <algorithm>
 #include <cassert>
-#include <cctype>
 #include <sstream>
 
 namespace kokopop {
 
-namespace {
-std::string lower_ascii(std::string s) {
-    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
-    return s;
-}
-} // namespace
-
 bool http_headers_contain(const std::map<std::string, std::string> & headers,
                           const std::string & name) {
-    const std::string target = lower_ascii(name);
+    const std::string target = http_lower_ascii(name);
     for (const auto & kv : headers) {
-        if (lower_ascii(kv.first) == target) return true;
+        if (http_lower_ascii(kv.first) == target) return true;
     }
     return false;
 }
 
 bool http_header_value_has_token(const std::string & value,
                                  const std::string & token) {
-    const std::string target = lower_ascii(token);
-    std::string lower = lower_ascii(value);
+    const std::string target = http_lower_ascii(token);
+    const std::string lower = http_lower_ascii(value);
     size_t start = 0;
     while (start <= lower.size()) {
-        size_t comma = lower.find(',', start);
-        std::string part = lower.substr(start, comma - start);
-        while (!part.empty() && (part.front() == ' ' || part.front() == '\t')) {
-            part.erase(part.begin());
-        }
-        while (!part.empty() && (part.back() == ' ' || part.back() == '\t')) {
-            part.pop_back();
-        }
+        const size_t comma = lower.find(',', start);
+        const std::string part = http_trim_ascii(lower.substr(start, comma - start));
         if (part == target) return true;
         if (comma == std::string::npos) break;
         start = comma + 1;

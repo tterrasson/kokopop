@@ -34,7 +34,7 @@ int find_free_port() {
 
 // Connect to 127.0.0.1:port, send raw request, return raw response (best-effort,
 // reads until the peer closes or until ~1s of inactivity).
-std::string http_roundtrip(int port, const std::string & request) {
+std::string http_roundtrip(int port, const std::string & request, bool finish_input = false) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     REQUIRE(fd >= 0);
     sockaddr_in addr{};
@@ -55,6 +55,7 @@ std::string http_roundtrip(int port, const std::string & request) {
 
     ssize_t sent = ::send(fd, request.data(), request.size(), 0);
     REQUIRE(sent == static_cast<ssize_t>(request.size()));
+    if (finish_input) ::shutdown(fd, SHUT_WR);
 
     // Read until close or until no data for a short timeout.
     timeval tv{};
@@ -163,4 +164,88 @@ TEST_CASE("http_server_invalid_port") {
     CHECK(!server.start("127.0.0.1", 0));
     CHECK(!server.start("127.0.0.1", 70000));
     CHECK(!server.is_running());
+}
+
+TEST_CASE("http_server_accepts_more_sequential_connections_than_max_concurrent") {
+    // Regression: finished connection threads were never reaped, so
+    // _conn_threads grew by one per connection forever and, once it reached
+    // MAX_CONCURRENT_CONNECTIONS (64), the accept loop rejected every new
+    // connection for the rest of the process lifetime.
+    using namespace kokopop;
+
+    HttpServer server;
+    server.route("/ping", [](HttpRequest &, HttpResponse & res) {
+        res.status_code = 200;
+        res.status_text = "OK";
+        res.set_content_type("text/plain");
+        const char body[] = "pong";
+        res.body.assign(body, body + sizeof(body) - 1);
+        return false;  // close after each response
+    });
+
+    const int port = find_free_port();
+    REQUIRE(server.start("127.0.0.1", port));
+
+    const std::string req =
+        "GET /ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    for (int i = 0; i < 75; ++i) {  // > MAX_CONCURRENT_CONNECTIONS (64)
+        std::string resp = http_roundtrip(port, req);
+        REQUIRE_MESSAGE(resp.find("HTTP/1.1 200") != std::string::npos,
+                        "connection #", i, " was rejected");
+    }
+
+    server.stop();
+    server.join();
+}
+
+TEST_CASE("http_server_preserves_pipelined_requests_and_body_bytes") {
+    kokopop::HttpServer server;
+    std::atomic<int> hits{0};
+    server.route("/echo", [&](kokopop::HttpRequest & req, kokopop::HttpResponse & res) {
+        const int hit = ++hits;
+        CHECK_EQ(std::string(req.body.begin(), req.body.end()), hit == 1 ? "abc" : "");
+        res.body.assign(req.body.begin(), req.body.end());
+        return hit == 1;
+    });
+    const int port = find_free_port();
+    REQUIRE(server.start("127.0.0.1", port));
+    const auto response = http_roundtrip(port,
+        "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 3\r\n\r\nabc"
+        "GET /echo HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    CHECK_EQ(hits.load(), 2);
+    CHECK(response.find("abcHTTP/1.1 200") != std::string::npos);
+    server.stop();
+    server.join();
+}
+
+TEST_CASE("http_server_rejects_invalid_framing_before_dispatch") {
+    kokopop::HttpServer server;
+    std::atomic<int> hits{0};
+    server.route("/echo", [&](kokopop::HttpRequest &, kokopop::HttpResponse &) {
+        ++hits;
+        return false;
+    });
+    const int port = find_free_port();
+    REQUIRE(server.start("127.0.0.1", port));
+    for (const char * headers : {
+             "Content-Length: 3junk\r\n", "Content-Length: +3\r\n",
+             "Content-Length: 3\r\nContent-Length: 4\r\n",
+             "Transfer-Encoding: chunked\r\n",
+             "Content-Length: 3\r\nTransfer-Encoding: chunked\r\n"}) {
+        CHECK(http_roundtrip(port, std::string("POST /echo HTTP/1.1\r\nHost: localhost\r\n") +
+                             headers + "\r\nabc").empty());
+    }
+    CHECK(http_roundtrip(port,
+        "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\nabc",
+        true).empty());
+    CHECK(http_roundtrip(port, "POST /echo HTTP/1.1\r\nHost: localhost\r\nX-Pad: " +
+                         std::string(65536, 'a') + "\r\n\r\n").empty());
+    CHECK_EQ(hits.load(), 0);
+    server.stop();
+    server.join();
+}
+
+TEST_CASE("http_json_error_escapes_control_characters") {
+    CHECK_EQ(kokopop::json_error(std::string("a\x01\0\b\f", 5)),
+             "{\"error\":\"a\\u0001\\u0000\\b\\f\"}");
 }
