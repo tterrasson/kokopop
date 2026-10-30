@@ -27,10 +27,11 @@ public:
     // Write samples into the encoder without pulling pages yet.
     // Call pull_pages() after writing all available synthesis chunks to batch
     // the page emission (avoids inter-chunk gaps in the Ogg stream).
-    void write(const float * samples, int n_samples);
+    // Returns false when libopusenc rejected the samples.
+    bool write(const float * samples, int n_samples);
 
     // Finalize and expose Ogg/Opus header pages before audio is available.
-    void flush_header();
+    bool flush_header();
 
     // Pull Ogg pages accumulated since the last pull_pages() call.
     // Use flush=0 while streaming so pages are emitted on the muxer's natural
@@ -39,7 +40,7 @@ public:
     void pull_pages(int flush = 0);
 
     // Flush remaining buffered frames and write EOS page.
-    void drain();
+    bool drain();
 
     // Returns accumulated Ogg pages and clears the internal buffer.
     std::vector<uint8_t> take_pending();
@@ -47,8 +48,6 @@ public:
     bool has_pending() const { return !_page_buffer.empty(); }
 
 private:
-    void _pull_pages(int flush);
-
     OggOpusComments * _comments = nullptr;
     OggOpusEnc *      _enc      = nullptr;
     std::vector<uint8_t> _page_buffer;

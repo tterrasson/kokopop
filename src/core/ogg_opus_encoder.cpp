@@ -13,14 +13,27 @@
 namespace kokopop {
 
 OggOpusEncoder::OggOpusEncoder(int sample_rate, int channels) {
+    // Allocate C++ storage before acquiring C resources, so allocation failure
+    // cannot leak an encoder from this not-yet-constructed object.
+    _page_buffer.reserve(16 * 1024);
     _comments = ope_comments_create();
+    if (_comments == nullptr) {
+        throw std::bad_alloc();
+    }
     ope_comments_add(_comments, "ENCODER", "kokopop");
 
     int err = OPE_OK;
     _enc = ope_encoder_create_pull(_comments, sample_rate, channels, 0, &err);
     if (!_enc || err != OPE_OK) {
-        ope_comments_destroy(_comments);
-        _comments = nullptr;
+        // Release everything acquired so far: _enc may be non-null on failure.
+        if (_enc != nullptr) {
+            ope_encoder_destroy(_enc);
+            _enc = nullptr;
+        }
+        if (_comments != nullptr) {
+            ope_comments_destroy(_comments);
+            _comments = nullptr;
+        }
         throw std::runtime_error(
             std::string("OggOpusEncoder: ope_encoder_create_pull failed: ")
             + ope_strerror(err));
@@ -32,10 +45,6 @@ OggOpusEncoder::OggOpusEncoder(int sample_rate, int channels) {
     ope_encoder_ctl(_enc, OPE_SET_DECISION_DELAY(0));
     ope_encoder_ctl(_enc, OPE_SET_MUXING_DELAY(40));
 
-    // A typical Opus page is well under 4 KB; reserving 16 KB covers the first
-    // few pages emitted in a streaming session and avoids tiny incremental
-    // allocations from std::vector::insert.
-    _page_buffer.reserve(16 * 1024);
 }
 
 OggOpusEncoder::~OggOpusEncoder() {
@@ -57,32 +66,26 @@ void OggOpusEncoder::pull_pages(int flush) {
     }
 }
 
-void OggOpusEncoder::write(const float * samples, int n_samples) {
-    if (!_enc) return;
-    int ret = ope_encoder_write_float(_enc, samples, n_samples);
-    if (ret != OPE_OK) {
-        std::fprintf(stderr, "[opus] encode error: %s\n", ope_strerror(ret));
-    }
+bool OggOpusEncoder::write(const float * samples, int n_samples) {
+    if (!_enc) return false;
+    return ope_encoder_write_float(_enc, samples, n_samples) == OPE_OK;
 }
 
-void OggOpusEncoder::flush_header() {
-    if (!_enc) return;
-    int ret = ope_encoder_flush_header(_enc);
-    if (ret != OPE_OK) {
-        std::fprintf(stderr, "[opus] flush header error: %s\n", ope_strerror(ret));
-        return;
+bool OggOpusEncoder::flush_header() {
+    if (!_enc) return false;
+    if (ope_encoder_flush_header(_enc) != OPE_OK) {
+        return false;
     }
     pull_pages(1);
+    return true;
 }
 
-void OggOpusEncoder::drain() {
-    if (!_enc) return;
-    int ret = ope_encoder_drain(_enc);
-    if (ret != OPE_OK) {
-        std::fprintf(stderr, "[opus] drain error: %s\n", ope_strerror(ret));
-    }
+bool OggOpusEncoder::drain() {
+    if (!_enc) return false;
+    const bool ok = ope_encoder_drain(_enc) == OPE_OK;
     // flush=1 on drain: force out whatever partial page remains at EOS.
     pull_pages(1);
+    return ok;
 }
 
 std::vector<uint8_t> OggOpusEncoder::take_pending() {

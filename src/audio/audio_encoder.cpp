@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <stdexcept>
 
 #ifdef KOKOPOP_HAS_OPUS
 #include "core/ogg_opus_encoder.h"
@@ -63,15 +64,20 @@ bool AudioEncoder::start(std::vector<uint8_t> & out, std::string & error) {
         error = "Ogg/Opus output is not available in this build";
         return false;
     }
-    _started = true;
 
     if (_options.format == EncodedAudioFormat::OggOpus) {
 #ifdef KOKOPOP_HAS_OPUS
         _ogg = new OggState(_options.sample_rate);
-        _ogg->encoder.flush_header();
+        if (!_ogg->encoder.flush_header()) {
+            delete _ogg;
+            _ogg = nullptr;
+            error = "Ogg/Opus encoder failed to flush the header";
+            return false;
+        }
         take_ogg_pending(out);
 #endif
     }
+    _started = true;
     return true;
 }
 
@@ -81,7 +87,10 @@ bool AudioEncoder::write_ogg_samples(const float * samples, size_t n_samples, st
         return false;
     }
 #ifdef KOKOPOP_HAS_OPUS
-    _ogg->encoder.write(samples, static_cast<int>(n_samples));
+    if (!_ogg->encoder.write(samples, static_cast<int>(n_samples))) {
+        error = "Ogg/Opus encode error";
+        return false;
+    }
 #else
     (void)samples;
     (void)n_samples;
@@ -160,7 +169,12 @@ bool AudioEncoder::finish(bool success, std::vector<uint8_t> & out, std::string 
         audio.samples = _wav_accumulator.data();
         audio.n_samples = _wav_accumulator.size();
         audio.sample_rate = _options.sample_rate;
-        out = wav_bytes(audio);
+        try {
+            out = wav_bytes(audio);
+        } catch (const std::length_error & e) {
+            error = e.what();
+            return false;
+        }
         return true;
     }
 
@@ -172,7 +186,10 @@ bool AudioEncoder::finish(bool success, std::vector<uint8_t> & out, std::string 
             }
             _prebuffered.clear();
         }
-        _ogg->encoder.drain();
+        if (!_ogg->encoder.drain()) {
+            error = "Ogg/Opus drain error";
+            return false;
+        }
         take_ogg_pending(out);
         return true;
 #else
