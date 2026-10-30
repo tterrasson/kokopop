@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <limits>
+#include <stdexcept>
 
 #ifdef __ARM_NEON
 #include <arm_neon.h>
@@ -38,6 +40,18 @@ void put_ascii(uint8_t * & dst, const char * s) {
     while (*s) {
         *dst++ = static_cast<uint8_t>(*s++);
     }
+}
+
+uint16_t get_u16(const uint8_t * src) {
+    uint16_t v;
+    std::memcpy(&v, src, sizeof(v));
+    return v;
+}
+
+uint32_t get_u32(const uint8_t * src) {
+    uint32_t v;
+    std::memcpy(&v, src, sizeof(v));
+    return v;
 }
 
 int16_t float_to_s16(float sample) {
@@ -123,7 +137,18 @@ std::vector<uint8_t> wav_bytes(const kokopop_audio & audio) {
     const uint16_t channels = 1;
     const uint16_t bits_per_sample = 16;
     const uint16_t block_align = channels * bits_per_sample / 8;
-    const uint32_t byte_rate = static_cast<uint32_t>(audio.sample_rate) * block_align;
+
+    // A classic WAV header stores 32-bit sizes: reject anything that would
+    // truncate instead of silently writing a corrupt file (heap overflow if
+    // the truncated size were trusted by a reader).
+    const uint64_t sample_rate = static_cast<uint64_t>(
+        audio.sample_rate > 0 ? audio.sample_rate : 0);
+    const uint64_t byte_rate64 = sample_rate * block_align;
+    if (audio.sample_rate <= 0 || byte_rate64 > std::numeric_limits<uint32_t>::max() ||
+        audio.n_samples > (std::numeric_limits<uint32_t>::max() - 44u) / block_align) {
+        throw std::length_error("WAV output too large for a 32-bit RIFF header");
+    }
+    const uint32_t byte_rate = static_cast<uint32_t>(byte_rate64);
     const uint32_t data_bytes = static_cast<uint32_t>(audio.n_samples * block_align);
 
     // Allocate the entire WAV buffer upfront: 44-byte header + payload.
@@ -159,6 +184,15 @@ bool write_wav_file(const std::string & path, const kokopop_audio & audio, std::
         error = "invalid audio buffer";
         return false;
     }
+    // Same 32-bit RIFF limit as wav_bytes(), reported as an error instead of
+    // an exception so callers of this C++ API get a normal failure.
+    constexpr uint64_t block_align = 2;  // mono, 16-bit
+    if (static_cast<uint64_t>(audio.sample_rate) * block_align >
+            std::numeric_limits<uint32_t>::max() ||
+        audio.n_samples > (std::numeric_limits<uint32_t>::max() - 44u) / block_align) {
+        error = "audio too large for a 32-bit RIFF WAV header";
+        return false;
+    }
 
     const auto bytes = wav_bytes(audio);
     std::ofstream out(path, std::ios::binary);
@@ -171,6 +205,58 @@ bool write_wav_file(const std::string & path, const kokopop_audio & audio, std::
         error = "failed to write output WAV file";
         return false;
     }
+    return true;
+}
+
+bool wav_parse(const uint8_t * data, size_t size, WavFileInfo & out) {
+    out = WavFileInfo{};
+    if (data == nullptr || size < 12) return false;
+    if (std::memcmp(data, "RIFF", 4) != 0 || std::memcmp(data + 8, "WAVE", 4) != 0) {
+        return false;
+    }
+
+    bool have_fmt = false;
+    bool have_data = false;
+    uint16_t format_tag = 0;
+
+    size_t pos = 12;
+    while (pos + 8 <= size) {
+        const uint32_t chunk_size = get_u32(data + pos + 4);
+        const size_t body = pos + 8;
+
+        if (std::memcmp(data + pos, "fmt ", 4) == 0) {
+            // The fixed part of fmt is 16 bytes; require it to be fully present.
+            if (chunk_size < 16 || body + 16 > size) return false;
+            format_tag          = get_u16(data + body);
+            out.channels        = get_u16(data + body + 2);
+            out.sample_rate     = static_cast<int32_t>(get_u32(data + body + 4));
+            out.bits_per_sample = get_u16(data + body + 14);
+            have_fmt = true;
+        } else if (std::memcmp(data + pos, "data", 4) == 0) {
+            out.data_offset = body;
+            // Clamp to the bytes actually present — a hostile/corrupt chunk
+            // size must never turn into an out-of-bounds read downstream.
+            const uint64_t avail = size - body;
+            out.data_size = chunk_size > avail ? static_cast<size_t>(avail)
+                                               : static_cast<size_t>(chunk_size);
+            have_data = true;
+        }
+
+        if (have_fmt && have_data) break;
+
+        // Advance past this chunk (word-aligned), with overflow-safe math.
+        const uint64_t next = static_cast<uint64_t>(body) + chunk_size + (chunk_size & 1u);
+        if (next > size) break;  // truncated chunk: stop scanning
+        pos = static_cast<size_t>(next);
+    }
+
+    if (!have_fmt || !have_data) return false;
+
+    out.is_float = (format_tag == 3 && out.bits_per_sample == 32);
+    const bool pcm_ok = format_tag == 1 &&
+                        (out.bits_per_sample == 16 || out.bits_per_sample == 32);
+    if (!pcm_ok && !out.is_float) return false;
+    if (out.channels < 1 || out.sample_rate <= 0) return false;
     return true;
 }
 

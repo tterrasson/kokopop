@@ -410,3 +410,127 @@ TEST_CASE("wav_bytes_simd_long_buffer_matches_scalar") {
 
     delete[] audio.samples;
 }
+
+// ---- Lecture WAV (wav_parse) — utilisé par kokopop_play sur stdin ----
+
+namespace {
+
+std::vector<uint8_t> make_test_wav(const std::vector<uint8_t> & payload,
+                                   uint16_t fmt_tag = 1, int channels = 1,
+                                   uint32_t rate = 24000, uint16_t bits = 16,
+                                   uint32_t declared_data_size = 0xFFFFFFFFu) {
+    std::vector<uint8_t> w;
+    auto u16 = [&](uint16_t v) { w.push_back((uint8_t)v); w.push_back((uint8_t)(v >> 8)); };
+    auto u32 = [&](uint32_t v) {
+        for (int i = 0; i < 4; ++i) w.push_back((uint8_t)(v >> (8 * i)));
+    };
+    auto tag = [&](const char * s) { w.insert(w.end(), s, s + 4); };
+    tag("RIFF"); u32(36 + (uint32_t)payload.size()); tag("WAVE");
+    tag("fmt "); u32(16); u16(fmt_tag); u16((uint16_t)channels); u32(rate);
+    u32(rate * channels * bits / 8); u16((uint16_t)(channels * bits / 8)); u16(bits);
+    tag("data"); u32(declared_data_size == 0xFFFFFFFFu ? (uint32_t)payload.size()
+                                                       : declared_data_size);
+    w.insert(w.end(), payload.begin(), payload.end());
+    return w;
+}
+
+} // namespace
+
+TEST_CASE("wav_parse_valid_pcm16") {
+    std::vector<uint8_t> payload(200, 0x7F);
+    auto w = make_test_wav(payload);
+    kokopop::WavFileInfo info;
+    REQUIRE(kokopop::wav_parse(w.data(), w.size(), info));
+    CHECK_EQ(info.sample_rate, 24000);
+    CHECK_EQ(info.channels, 1);
+    CHECK_EQ(info.bits_per_sample, 16);
+    CHECK(!info.is_float);
+    CHECK_EQ(info.data_offset, 44u);
+    CHECK_EQ(info.data_size, payload.size());
+}
+
+TEST_CASE("wav_parse_rejects_truncated_fmt_chunk") {
+    // fmt chunk header present but its 16-byte body cut off: must be rejected
+    // without reading past the buffer.
+    std::vector<uint8_t> w;
+    auto tag = [&](const char * s) { w.insert(w.end(), s, s + 4); };
+    auto u32 = [&](uint32_t v) { for (int i = 0; i < 4; ++i) w.push_back((uint8_t)(v >> (8 * i))); };
+    tag("RIFF"); u32(100); tag("WAVE");
+    tag("fmt "); u32(16);  // claims 16 bytes, but nothing follows
+    kokopop::WavFileInfo info;
+    CHECK(!kokopop::wav_parse(w.data(), w.size(), info));
+}
+
+TEST_CASE("wav_parse_clamps_data_chunk_to_buffer") {
+    // A corrupt/huge declared data size must not become an OOB read downstream.
+    std::vector<uint8_t> payload(100, 0);
+    auto w = make_test_wav(payload, 1, 1, 24000, 16, 0xFFFFFF00u);
+    kokopop::WavFileInfo info;
+    REQUIRE(kokopop::wav_parse(w.data(), w.size(), info));
+    CHECK_EQ(info.data_size, payload.size());  // clamped, not 0xFFFFFF00
+}
+
+TEST_CASE("wav_parse_rejects_zero_bits_and_unsupported_formats") {
+    std::vector<uint8_t> payload(64, 0);
+    kokopop::WavFileInfo info;
+    CHECK(!kokopop::wav_parse(make_test_wav(payload, 1, 1, 24000, 0).data(), 0, info)); // size 0
+    auto w0 = make_test_wav(payload, 1, 1, 24000, 0);
+    CHECK(!kokopop::wav_parse(w0.data(), w0.size(), info));   // bits=0 would div-by-zero downstream
+    auto w24 = make_test_wav(payload, 1, 1, 24000, 24);
+    CHECK(!kokopop::wav_parse(w24.data(), w24.size(), info)); // 24-bit not supported
+    auto wbad = make_test_wav(payload, 85, 1, 24000, 16);     // non-PCM format tag
+    CHECK(!kokopop::wav_parse(wbad.data(), wbad.size(), info));
+}
+
+TEST_CASE("wav_parse_accepts_float32_and_skips_odd_chunks") {
+    // float32 WAV (format tag 3)
+    std::vector<uint8_t> payload(64, 0);
+    auto wf = make_test_wav(payload, 3, 1, 22050, 32);
+    kokopop::WavFileInfo info;
+    REQUIRE(kokopop::wav_parse(wf.data(), wf.size(), info));
+    CHECK(info.is_float);
+    CHECK_EQ(info.sample_rate, 22050);
+
+    // an odd-sized chunk before "data" must be skipped with its pad byte
+    std::vector<uint8_t> w;
+    auto tag = [&](const char * s) { w.insert(w.end(), s, s + 4); };
+    auto u32 = [&](uint32_t v) { for (int i = 0; i < 4; ++i) w.push_back((uint8_t)(v >> (8 * i))); };
+    auto u16 = [&](uint16_t v) { w.push_back((uint8_t)v); w.push_back((uint8_t)(v >> 8)); };
+    tag("RIFF"); u32(0); tag("WAVE");
+    tag("LIST"); u32(3); w.push_back('a'); w.push_back('b'); w.push_back('c'); w.push_back(0); // pad
+    tag("fmt "); u32(16); u16(1); u16(1); u32(24000); u32(48000); u16(2); u16(16);
+    tag("data"); u32(8); for (int i = 0; i < 8; ++i) w.push_back(0);
+    REQUIRE(kokopop::wav_parse(w.data(), w.size(), info));
+    CHECK_EQ(info.data_size, 8u);
+    CHECK_EQ(info.data_offset, w.size() - 8);
+
+    // garbage
+    CHECK(!kokopop::wav_parse(nullptr, 0, info));
+    std::vector<uint8_t> junk(100, 0xFF);
+    CHECK(!kokopop::wav_parse(junk.data(), junk.size(), info));
+}
+
+TEST_CASE("wav_bytes_rejects_payload_beyond_32bit_riff") {
+    // >2^31 samples × 2 bytes would truncate the uint32 data size and corrupt
+    // the file (or overflow a reader). wav_bytes must refuse up front.
+    kokopop_audio audio{};
+    audio.samples = nullptr;
+    audio.n_samples = static_cast<size_t>(std::numeric_limits<uint32_t>::max()) / 2 + 100;
+    audio.sample_rate = 24000;
+    CHECK_THROWS_AS(kokopop::wav_bytes(audio), std::length_error);
+    // Multiplying first would wrap size_t/uint64_t and bypass the limit.
+    audio.n_samples = std::numeric_limits<size_t>::max() / 2 + 1;
+    CHECK_THROWS_AS(kokopop::wav_bytes(audio), std::length_error);
+}
+
+TEST_CASE("write_wav_file_reports_oversized_audio_as_error") {
+    kokopop_audio audio{};
+    audio.samples = nullptr;
+    audio.n_samples = static_cast<size_t>(std::numeric_limits<uint32_t>::max());
+    audio.sample_rate = 24000;
+    std::string error;
+    // samples==nullptr with n>0 is rejected as invalid buffer before the size
+    // check; either way it must be a clean error, not a crash or corrupt file.
+    CHECK(!kokopop::write_wav_file("kokopop_oversize_test.wav", audio, error));
+    CHECK(!error.empty());
+}
