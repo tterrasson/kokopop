@@ -319,3 +319,44 @@ TEST_CASE("mock_model_has_voices") {
         CHECK_EQ(kv.first, kv.second.name);
     }
 }
+
+// ---- Régressions: budget first-chunk nul + texte non prononçable ----
+
+TEST_CASE("chunk_text_zero_first_chunk_budget_flushes_at_first_boundary") {
+    std::string error;
+    auto tokenize = [](const std::string & phonemes,
+                       std::vector<uint32_t> & ids,
+                       std::string &) {
+        ids.assign(std::max<size_t>(1, phonemes.size() / 4), 1);
+        return true;
+    };
+
+    auto cfg = kokopop::make_adaptative_config();
+    REQUIRE_EQ(cfg.first_chunk_target_max_tokens, 0);  // 0 = flush at first boundary
+    cfg.target_max_tokens = 4;   // force word-level splitting: intermediate
+    cfg.soft_max_tokens = 6;     // parts carry no boundary
+    // hard_max stays at the default 510 so no flush_before fires first.
+
+    auto chunks = kokopop::chunk_text(
+        "one two three four five six. seven eight nine ten.", cfg,
+        kokoro_phonemizer("af_heart"), tokenize, {}, error);
+    REQUIRE(chunks.size() >= 2);
+    // With budget 0 the first chunk must end on a boundary, not after the very
+    // first (boundary-less) word fragment — that was the old behavior.
+    CHECK(chunks.front().boundary_after != kokopop::Boundary::None);
+}
+
+TEST_CASE("chunk_text_whitespace_only_reports_an_error") {
+    std::string error;
+    auto tokenize = [](const std::string & phonemes,
+                       std::vector<uint32_t> & ids,
+                       std::string &) {
+        ids.assign(std::max<size_t>(1, phonemes.size() / 2), 1);
+        return true;
+    };
+    auto chunks = kokopop::chunk_text(
+        "   \t\n  ", kokopop::make_long_form_config(),
+        kokoro_phonemizer("af_heart"), tokenize, {}, error);
+    CHECK(chunks.empty());
+    CHECK(!error.empty());  // e.g. "text contains no speakable content"
+}

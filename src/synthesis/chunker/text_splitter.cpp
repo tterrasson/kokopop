@@ -164,14 +164,16 @@ static Boundary infer_boundary_type_impl(const std::string & text) {
 /* ---- 3.3: is_protected_token (public API uses this; internal uses pre-compute) ---- */
 
 static bool is_protected_token(const std::string & text, size_t dot_pos) {
-    // Placeholder tags: <ABBR_DOT> etc. (12 chars from dot position)
-    if (dot_pos + 12 <= text.size()) {
-        std::string sub = text.substr(dot_pos, 12);
-        if (starts_with(sub, "<ABBR_DOT>") ||
-            starts_with(sub, "<DECIMAL_DOT>") ||
-            starts_with(sub, "<URL_DOT>")) {
-            return true;
-        }
+    if (dot_pos >= text.size()) return false;
+    // Placeholder tags: <ABBR_DOT> (10), <DECIMAL_DOT> (13), <URL_DOT> (9).
+    // Compare on a string_view — no substr allocation per call, and the
+    // window is no longer truncated to 12 chars (which made <DECIMAL_DOT>,
+    // 13 chars, impossible to match).
+    const std::string_view sub = std::string_view(text).substr(dot_pos);
+    if (sub.substr(0, 10) == "<ABBR_DOT>" ||
+        sub.substr(0, 13) == "<DECIMAL_DOT>" ||
+        sub.substr(0, 9)  == "<URL_DOT>") {
+        return true;
     }
     // Decimal number (digit.digit)
     if (dot_pos > 0 && dot_pos + 1 < text.size()) {

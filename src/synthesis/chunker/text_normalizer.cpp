@@ -100,14 +100,12 @@ std::string protect_urls(const std::string & text) {
                        (std::isalnum(static_cast<unsigned char>(out[end])) || out[end] == '.'))
                     ++end;
                 std::string candidate = out.substr(start, end - start);
-                size_t dot_count = 0;
-                for (char c : candidate) if (c == '.') ++dot_count;
-                if (dot_count >= 1) {
-                    std::string protected_candidate = candidate;
-                    replace_all(protected_candidate, ".", "<URL_DOT>");
-                    out.replace(start, candidate.size(), protected_candidate);
-                    i = start + protected_candidate.size();
-                }
+                // The candidate is built around a '.', so it always contains
+                // at least one dot: protect unconditionally.
+                std::string protected_candidate = candidate;
+                replace_all(protected_candidate, ".", "<URL_DOT>");
+                out.replace(start, candidate.size(), protected_candidate);
+                i = start + protected_candidate.size();
             }
         }
     }

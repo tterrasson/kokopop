@@ -7,31 +7,25 @@ namespace kokopop {
 // ---------------------------------------------------------------------------
 // Text normalization — prepare text before splitting
 //
-// 1. Normalize unicode (NFC)
-// 2. Replace \r\n → \n
-// 3. Collapse spaces (except around newlines)
-// 4. Normalize quotes to standard forms
-// 5. Normalize ellipsis to …
-// 6. Protect abbreviations, decimals, URLs (replace dots with placeholders)
+// normalize_text() is the production path: a single pass that normalizes
+// line endings (\r\n, \r → \n), collapses runs of spaces/tabs and protects
+// dots inside abbreviations, decimals and URLs.
 //
-// The protection tokens (<ABBR_DOT>, etc.) are restored after splitting.
+// The individual helpers below (normalize_line_endings, collapse_spaces,
+// protect_*, restore_protected) are the original multi-pass pipeline. They
+// are no longer called by production code; tests keep them as a reference
+// oracle to differential-test normalize_text() against.
 // ---------------------------------------------------------------------------
 
-/// Full normalization pipeline
+/// Full normalization pipeline (single pass)
 std::string normalize_text(const std::string & text);
 
-/// Protect special patterns so they are not split on dots
+/// Reference-pipeline helpers (test oracle — see tests/test_text_normalizer.cpp)
 std::string protect_abbreviations(const std::string & text);
 std::string protect_decimals(const std::string & text);
 std::string protect_urls(const std::string & text);
-
-/// Restore protected tokens to their original form
 std::string restore_protected(const std::string & text);
-
-/// Collapse consecutive spaces, but preserve newlines
 std::string collapse_spaces(const std::string & text);
-
-/// Normalize CRLF and standalone CR to LF
 std::string normalize_line_endings(const std::string & text);
 
 } // namespace kokopop

@@ -502,9 +502,15 @@ std::vector<Chunk> chunk_text(
 
         bool flush_after = false;
         if (chunks.empty() && config.allow_short_first_chunk) {
-            flush_after = current.n_tokens >= config.first_chunk_target_max_tokens ||
-                          (current.n_tokens >= config.target_min_tokens &&
-                           is_strong_boundary(current.boundary_after));
+            // A first-chunk budget of 0 means "unset": flush at the first
+            // boundary, exactly like build_adaptative_chunk() — not after the
+            // very first unit regardless of boundary.
+            const int first_max = config.first_chunk_target_max_tokens;
+            flush_after =
+                (first_max > 0 && current.n_tokens >= first_max) ||
+                (first_max <= 0 && current.boundary_after != Boundary::None) ||
+                (current.n_tokens >= config.target_min_tokens &&
+                 is_strong_boundary(current.boundary_after));
         } else {
             flush_after = (current.n_tokens >= config.target_max_tokens &&
                            is_reasonable_boundary(current.boundary_after)) ||
@@ -517,7 +523,12 @@ std::vector<Chunk> chunk_text(
     flush();
 
     chunks = rebalance_tiny_chunks(std::move(chunks), config);
-    if (chunks.empty()) return chunks;
+    if (chunks.empty()) {
+        // Normalization can leave nothing speakable (whitespace-only text,
+        // punctuation only): say so instead of returning an empty error.
+        if (error.empty()) error = "text contains no speakable content";
+        return chunks;
+    }
 
     chunks.front().is_first = true;
     chunks.back().is_last = true;
