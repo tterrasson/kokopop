@@ -15,11 +15,6 @@ static bool ends_with(const std::string & s, const std::string & suffix) {
            s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
-static bool starts_with(const std::string & s, const std::string & prefix) {
-    return s.size() >= prefix.size() &&
-           s.compare(0, prefix.size(), prefix) == 0;
-}
-
 /* ---- UTF-8 multi-byte character helpers (shared everywhere) ---- */
 
 static bool char_is_ellipsis(const std::string & s, size_t pos) {

@@ -100,7 +100,7 @@ bool AudioEncoder::write_ogg_samples(const float * samples, size_t n_samples, st
     return true;
 }
 
-bool AudioEncoder::push(const float * samples, size_t n_samples, bool is_final,
+bool AudioEncoder::push(const float * samples, size_t n_samples, [[maybe_unused]] bool is_final,
                         std::vector<uint8_t> & out, std::string & error) {
     out.clear();
     if (!_started && !start(out, error)) return false;

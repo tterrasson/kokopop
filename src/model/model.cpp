@@ -99,12 +99,17 @@ bool load_tensor_data_to_backend(
 #else
         const uint64_t max_offset = std::numeric_limits<off_t>::max();
 #endif
-        if (data_origin > max_offset || relative_offset > max_offset - data_origin) {
+        // Compare in the uint64_t domain: on 32-bit targets (wasm32) size_t
+        // is 32-bit, so `data_origin > max_offset` is always false and clang
+        // flags it as a tautological comparison. The widening cast keeps the
+        // seek-range guard meaningful on 64-bit platforms without the warning.
+        const uint64_t origin64 = static_cast<uint64_t>(data_origin);
+        if (origin64 > max_offset || relative_offset > max_offset - origin64) {
             std::fclose(file);
             error = "GGUF tensor offset exceeds platform seek range";
             return false;
         }
-        const uint64_t off64 = data_origin + relative_offset;
+        const uint64_t off64 = origin64 + relative_offset;
         // 64-bit seek: static_cast<long> would truncate offsets > 2 GiB on
         // LLP64 platforms (Windows) and read the wrong bytes silently.
 #if defined(_WIN32)
