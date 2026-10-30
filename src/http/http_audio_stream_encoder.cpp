@@ -3,6 +3,7 @@
 #include "audio/audio_encoder.h"
 
 #include <utility>
+#include <exception>
 
 namespace kokopop {
 
@@ -31,26 +32,41 @@ public:
         return AudioEncoder::content_type(_format);
     }
 
-    void start(std::vector<char> & out) override {
+    bool start(std::vector<char> & out) override try {
         std::vector<uint8_t> bytes;
         std::string error;
-        if (_encoder->start(bytes, error)) append(bytes, out);
+        if (!_encoder->start(bytes, error)) return false;
+        append(bytes, out);
+        return true;
+    } catch (const std::exception &) {
+        out.clear();
+        return false;
     }
 
-    void write(RequestContext::AudioChunk && chunk, bool is_terminal,
-               std::vector<char> & out) override {
+    bool write(RequestContext::AudioChunk && chunk, bool is_terminal,
+               std::vector<char> & out) override try {
         std::vector<uint8_t> bytes;
         std::string error;
-        if (_encoder->push(chunk.samples.data(), chunk.samples.size(),
-                           is_terminal, bytes, error)) {
-            append(bytes, out);
+        if (!_encoder->push(chunk.samples.data(), chunk.samples.size(),
+                            is_terminal, bytes, error)) {
+            return false;
         }
+        append(bytes, out);
+        return true;
+    } catch (const std::exception &) {
+        out.clear();
+        return false;
     }
 
-    void finish(bool success, std::vector<char> & out) override {
+    bool finish(bool success, std::vector<char> & out) override try {
         std::vector<uint8_t> bytes;
         std::string error;
-        if (_encoder->finish(success, bytes, error)) append(bytes, out);
+        if (!_encoder->finish(success, bytes, error)) return false;
+        append(bytes, out);
+        return true;
+    } catch (const std::exception &) {
+        out.clear();
+        return false;
     }
 
 private:

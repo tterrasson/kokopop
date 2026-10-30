@@ -277,7 +277,11 @@ static int run_http_mode(const std::string & model_path,
 
     server.route_default(handle_not_found);
 
-    server.start(bind_addr, port);
+    if (!server.start(bind_addr, port)) {
+        std::fprintf(stderr, "error: failed to start HTTP server on %s:%d\n",
+                     bind_addr.c_str(), port);
+        return 1;
+    }
     server.join();
 
     // Cleanup (if model wasn't already unloaded by idle timeout)

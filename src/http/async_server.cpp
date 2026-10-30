@@ -292,7 +292,6 @@ void AsyncHttpServer::_event_loop() {
             // and for detecting client disconnects (POLLHUP/POLLERR) on streaming
             // connections that have no outstanding writes.
             if (conn.state == Connection::STATE_READING_HEADERS ||
-                conn.state == Connection::STATE_READING_BODY ||
                 conn.state == Connection::STATE_STREAMING) {
                 _poll_fds[nfds].events |= POLLIN;
             }
@@ -349,8 +348,7 @@ void AsyncHttpServer::_event_loop() {
         {
             int64_t now = _now_ms();
             for (auto & [fd, conn] : _connections) {
-                if ((conn.state == Connection::STATE_READING_HEADERS ||
-                     conn.state == Connection::STATE_READING_BODY) &&
+                if (conn.state == Connection::STATE_READING_HEADERS &&
                     now - conn.last_activity_ms > CONN_IDLE_TIMEOUT_MS) {
                     fds_to_close.push_back(fd);
                 }
@@ -374,11 +372,15 @@ void AsyncHttpServer::_event_loop() {
                                 rs == RequestContext::State::CANCELLED);
 
             RequestContext::AudioChunk chunk;
+            bool encoder_failed = false;
             while (conn.write_buffer.size() <= WRITE_BUFFER_HIGH_WATER &&
                    conn.req_ctx->try_pop(chunk)) {
                 if (conn.stream_encoder) {
                     std::vector<char> encoded;
-                    conn.stream_encoder->write(std::move(chunk), is_terminal, encoded);
+                    if (!conn.stream_encoder->write(std::move(chunk), is_terminal, encoded)) {
+                        encoder_failed = true;
+                        break;
+                    }
                     if (!encoded.empty()) {
                         _send_http_chunk(fd, conn, encoded);
                     }
@@ -387,17 +389,29 @@ void AsyncHttpServer::_event_loop() {
                     acc.insert(acc.end(), chunk.samples.begin(), chunk.samples.end());
                 }
             }
+            if (encoder_failed) {
+                // Headers are already sent, so the only way to signal the
+                // failure is a truncated chunked stream: close without the
+                // terminal chunk.
+                std::fprintf(stderr, "[http] audio encoder failed mid-stream\n");
+                fds_to_close.push_back(fd);
+                continue;
+            }
 
             if (is_terminal && conn.write_buffer.empty()) {
                 if (conn.stream_encoder) {
                     std::vector<char> tail;
-                    conn.stream_encoder->finish(rs == RequestContext::State::DONE, tail);
-                    if (!tail.empty()) {
-                        _send_http_chunk(fd, conn, tail);
-                    }
-                    _send_final_chunk(fd, conn);
-                    if (rs == RequestContext::State::CANCELLED) {
+                    if (!conn.stream_encoder->finish(rs == RequestContext::State::DONE, tail)) {
+                        std::fprintf(stderr, "[http] audio encoder failed at end of stream\n");
                         fds_to_close.push_back(fd);
+                    } else {
+                        if (!tail.empty()) {
+                            _send_http_chunk(fd, conn, tail);
+                        }
+                        _send_final_chunk(fd, conn);
+                        if (rs == RequestContext::State::CANCELLED) {
+                            fds_to_close.push_back(fd);
+                        }
                     }
                 } else if (rs == RequestContext::State::DONE) {
                     _send_wav_response(conn);
@@ -467,8 +481,7 @@ void AsyncHttpServer::_handle_connection_read(int fd, Connection & conn) {
 }
 
 void AsyncHttpServer::_process_pending_requests(int fd, Connection & conn) {
-    while (conn.state == Connection::STATE_READING_HEADERS ||
-           conn.state == Connection::STATE_READING_BODY) {
+    while (conn.state == Connection::STATE_READING_HEADERS) {
         auto parsed = conn.parser.next();
         if (parsed.status == AsyncHttpParseResult::Status::NeedMore) return;
         if (parsed.status == AsyncHttpParseResult::Status::Error) {
@@ -822,9 +835,16 @@ void AsyncHttpServer::_send_streaming_response(int fd, Connection & conn,
         conn.stream_encoder = make_http_audio_stream_encoder(
             fmt, conn.req_ctx->sample_rate, conn.req_ctx->ogg_prebuffer_chunks);
         assert(conn.stream_encoder && "encoder should be available — checked by http_audio_format_available");
-        conn.write_buffer = build_streaming_response_head(conn.stream_encoder->content_type());
         std::vector<char> initial;
-        conn.stream_encoder->start(initial);
+        if (!conn.stream_encoder->start(initial)) {
+            conn.stream_encoder.reset();
+            conn.req_ctx->cancelled.store(true);
+            conn.req_ctx.reset();
+            _send_error(conn, 500, "Internal Server Error",
+                        json_error("audio encoder failed to start"));
+            return;
+        }
+        conn.write_buffer = build_streaming_response_head(conn.stream_encoder->content_type());
         if (!initial.empty()) {
             _send_http_chunk(fd, conn, initial);
         }
@@ -851,15 +871,14 @@ void AsyncHttpServer::_send_wav_response(Connection & conn) {
         return;
     }
 
-    std::ostringstream oss;
-    oss << "HTTP/1.1 200 OK\r\n";
-    oss << "Content-Type: audio/wav\r\n";
-    oss << "Content-Length: " << wav.size() << "\r\n";
-    oss << "Server: kokopop-async/0.1\r\n";
-    oss << "Connection: close\r\n";
-    oss << "\r\n";
-
-    conn.write_buffer = oss.str();
+    // Reuse the shared response-head builder (adds Server, Connection, …).
+    HttpResponse res;
+    res.status_code = 200;
+    res.status_text = "OK";
+    res.headers["Content-Type"] = "audio/wav";
+    res.headers["Content-Length"] = std::to_string(wav.size());
+    res.headers["Connection"] = "close";
+    conn.write_buffer = build_http_response_head(res, false);
     conn.write_buffer.insert(conn.write_buffer.end(),
                              reinterpret_cast<const char *>(wav.data()),
                              reinterpret_cast<const char *>(wav.data() + wav.size()));

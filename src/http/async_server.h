@@ -129,8 +129,7 @@ private:
 
         enum {
             STATE_IDLE,
-            STATE_READING_HEADERS,
-            STATE_READING_BODY,
+            STATE_READING_HEADERS,  // the parser owns the body states internally
             STATE_PROCESSING,
             STATE_WRITING,
             STATE_STREAMING  // Writing chunks as they become available

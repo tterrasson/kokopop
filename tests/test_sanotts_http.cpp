@@ -1,6 +1,16 @@
 #include "test_helpers.h"
 #include "sanotts_fixtures.h"
 #include "http/http_audio_stream_encoder.h"
+
+TEST_CASE("http_opus_start_reports_invalid_sample_rate_without_throwing") {
+    using namespace kokopop;
+    if (!http_audio_format_available(RequestContext::AudioFormat::OGG_OPUS)) return;
+    auto encoder = make_http_audio_stream_encoder(RequestContext::AudioFormat::OGG_OPUS, 0, 0);
+    REQUIRE(encoder != nullptr);
+    std::vector<char> bytes;
+    CHECK_FALSE(encoder->start(bytes));
+    CHECK(bytes.empty());
+}
 #include "http/synthesis_scheduler.h"
 
 #include <chrono>
