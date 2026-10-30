@@ -65,14 +65,6 @@ struct RequestContext {
     }
 
     // ----------------------------------------------------------------
-    // Synthesis plan (filled during PREPARING phase)
-    // ----------------------------------------------------------------
-    std::shared_ptr<SynthesisPlan> plan;
-    std::vector<Unit> adaptative_units;
-    size_t adaptative_next_unit = 0;
-    AdaptativeChunkController adaptative_controller;
-
-    // ----------------------------------------------------------------
     // Progress
     // ----------------------------------------------------------------
     std::atomic<int> chunks_completed{0};
@@ -119,11 +111,6 @@ struct RequestContext {
         output_queue.push({std::move(samples), chunk_index});
         output_has_data.store(true);
     }
-
-    // ----------------------------------------------------------------
-    // Crossfade state (kept between chunks of the same request)
-    // ----------------------------------------------------------------
-    std::vector<float> prev_tail;
 
     // ----------------------------------------------------------------
     // WAV accumulation (for format=wav)

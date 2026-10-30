@@ -14,6 +14,53 @@
 
 namespace kokopop {
 
+namespace {
+
+/// Progress logs are opt-in: a library must not spam stderr on every chunk.
+/// Set KOKOPOP_VERBOSE=1 to get them back.
+bool verbose_logs() {
+    static const bool on = std::getenv("KOKOPOP_VERBOSE") != nullptr;
+    return on;
+}
+
+/// Post-process one raw chunk (trim + boundary pause) and crossfade it onto
+/// the previous chunk's tail. Updates `prev_tail` in place for the next
+/// chunk. Shared by infer_chunk() and the pipelined stream_synthesize() so
+/// the two paths cannot drift apart.
+std::vector<float> postprocess_and_crossfade(
+    const SynthesisPlan & plan,
+    int chunk_idx,
+    const std::vector<float> & raw_samples,
+    std::vector<float> & prev_tail,
+    int sample_rate)
+{
+    const Chunk & chunk = plan.chunks[static_cast<size_t>(chunk_idx)];
+
+    auto processed = postprocess_chunk_audio(raw_samples, chunk, chunk_idx,
+                                             static_cast<int>(plan.chunks.size()),
+                                             plan.config, sample_rate);
+
+    if (!prev_tail.empty() && !processed.empty()) {
+        processed = apply_crossfade_smart(prev_tail, processed, chunk.boundary_after,
+                                          plan.config.crossfade_ms, sample_rate);
+    }
+
+    // Save tail for the next chunk's crossfade.
+    const size_t crossfade_samples = ms_to_samples(plan.config.crossfade_ms, sample_rate);
+    if (!processed.empty() && crossfade_samples > 0) {
+        const size_t tail_start = processed.size() > crossfade_samples
+            ? processed.size() - crossfade_samples
+            : 0;
+        prev_tail.assign(processed.begin() + static_cast<ptrdiff_t>(tail_start),
+                         processed.end());
+    } else {
+        prev_tail.clear();
+    }
+    return processed;
+}
+
+} // namespace
+
 // ---------------------------------------------------------------------------
 // SynthesisPlan helpers
 // ---------------------------------------------------------------------------
@@ -84,12 +131,13 @@ SynthesisPlan prepare_synthesis(
     plan.speed = speed;
     plan.mode = mode;
 
-    std::string mode_name = "unknown";
-    if (mode == StreamMode::LongForm) mode_name = "long_form";
-    else if (mode == StreamMode::Adaptative) mode_name = "adaptative";
-
-    std::fprintf(stderr, "[kokopop] prepared: %zu chunks, %s mode\n",
-                plan.chunks.size(), mode_name.c_str());
+    if (verbose_logs()) {
+        std::string mode_name = "unknown";
+        if (mode == StreamMode::LongForm) mode_name = "long_form";
+        else if (mode == StreamMode::Adaptative) mode_name = "adaptative";
+        std::fprintf(stderr, "[kokopop] prepared: %zu chunks, %s mode\n",
+                     plan.chunks.size(), mode_name.c_str());
+    }
 
     return plan;
 }
@@ -114,9 +162,11 @@ std::vector<float> infer_chunk(
 
     const auto & chunk = plan.chunks[chunk_idx];
 
-    std::fprintf(stderr, "[kokopop] chunk[%d/%zu]: %d tokens, phonemes=%zu chars\n",
-                chunk_idx + 1, plan.chunks.size(),
-                chunk.n_tokens, chunk.phonemes.size());
+    if (verbose_logs()) {
+        std::fprintf(stderr, "[kokopop] chunk[%d/%zu]: %d tokens, phonemes=%zu chars\n",
+                    chunk_idx + 1, plan.chunks.size(),
+                    chunk.n_tokens, chunk.phonemes.size());
+    }
 
     // --- Synthesize raw audio ---
     // Straight from the chunk's own ids: the chunker already trimmed the
@@ -147,35 +197,17 @@ std::vector<float> infer_chunk(
     std::vector<float> raw_audio(raw.samples, raw.samples + raw.n_samples);
     kokopop_audio_free(&raw);
 
-    std::fprintf(stderr, "[kokopop] chunk[%d] synthesized: %zu samples (%.1fms)\n",
-                chunk_idx + 1, raw_audio.size(),
-                (double)raw_audio.size() / model.sample_rate(plan.voice) * 1000.0);
-
-    // --- Post-process ---
-    auto processed = postprocess_chunk_audio(
-        raw_audio, chunk, chunk_idx,
-        static_cast<int>(plan.chunks.size()),
-        plan.config, model.sample_rate(plan.voice));
-
-    // --- Crossfade with previous chunk ---
-    if (!prev_tail.empty() && !processed.empty()) {
-        auto crossed = apply_crossfade_smart(
-            prev_tail, processed,
-            chunk.boundary_after,
-            plan.config.crossfade_ms,
-            model.sample_rate(plan.voice));
-        processed = std::move(crossed);
+    const int sample_rate = model.sample_rate(plan.voice);
+    if (verbose_logs()) {
+        std::fprintf(stderr, "[kokopop] chunk[%d] synthesized: %zu samples (%.1fms)\n",
+                    chunk_idx + 1, raw_audio.size(),
+                    (double)raw_audio.size() / sample_rate * 1000.0);
     }
 
-    // --- Save tail for next crossfade ---
-    out_tail.clear();
-    const int crossfade_samples = (plan.config.crossfade_ms * model.sample_rate(plan.voice)) / 1000;
-    if (!processed.empty() && crossfade_samples > 0) {
-        size_t tail_start = processed.size() > static_cast<size_t>(crossfade_samples)
-            ? processed.size() - crossfade_samples
-            : 0;
-        out_tail.assign(processed.begin() + tail_start, processed.end());
-    }
+    // --- Post-process + crossfade with previous chunk (shared helper) ---
+    std::vector<float> tail = prev_tail;  // helper updates the tail in place
+    auto processed = postprocess_and_crossfade(plan, chunk_idx, raw_audio, tail, sample_rate);
+    out_tail = std::move(tail);
 
     return processed;
 }
@@ -299,37 +331,20 @@ StreamHandle stream_synthesize(
                 if (!cur.error.empty() || cur.samples.empty()) {
                     std::fprintf(stderr, "[kokopop] WARNING chunk[%d]: %s — skipping\n",
                                 i, cur.error.empty() ? "no audio" : cur.error.c_str());
+                    // Don't crossfade the next chunk onto a tail from before
+                    // the failed chunk.
+                    prev_tail.clear();
                     continue;
                 }
 
-                std::fprintf(stderr, "[kokopop] chunk[%d] synthesized: %zu samples (%.1fms)\n",
-                            i + 1, cur.samples.size(),
-                            (double)cur.samples.size() / sample_rate * 1000.0);
-
-                auto processed = postprocess_chunk_audio(
-                    cur.samples, plan.chunks[static_cast<size_t>(i)], i,
-                    n_chunks, plan.config, sample_rate);
-
-                if (!prev_tail.empty() && !processed.empty()) {
-                    processed = apply_crossfade_smart(
-                        prev_tail, processed,
-                        plan.chunks[static_cast<size_t>(i)].boundary_after,
-                        plan.config.crossfade_ms, sample_rate);
+                if (verbose_logs()) {
+                    std::fprintf(stderr, "[kokopop] chunk[%d] synthesized: %zu samples (%.1fms)\n",
+                                i + 1, cur.samples.size(),
+                                (double)cur.samples.size() / sample_rate * 1000.0);
                 }
 
-                // Save tail for next chunk's crossfade.
-                const int crossfade_samples =
-                    (plan.config.crossfade_ms * sample_rate) / 1000;
-                if (!processed.empty() && crossfade_samples > 0) {
-                    const size_t tail_start =
-                        processed.size() > static_cast<size_t>(crossfade_samples)
-                            ? processed.size() - static_cast<size_t>(crossfade_samples)
-                            : 0;
-                    prev_tail.assign(processed.begin() + static_cast<ptrdiff_t>(tail_start),
-                                     processed.end());
-                } else {
-                    prev_tail.clear();
-                }
+                auto processed = postprocess_and_crossfade(
+                    plan, i, cur.samples, prev_tail, sample_rate);
 
                 const bool continue_streaming = (*cb_shared)(
                     processed.data(), processed.size(), i, user_data);
@@ -416,6 +431,7 @@ void IncrementalStreamer::flush() {
         if (processed.empty()) {
             std::fprintf(stderr, "[kokopop] WARNING chunk[%d]: %s — skipping\n",
                         chunk_counter_, error.c_str());
+            prev_tail.clear();
             continue;
         }
 

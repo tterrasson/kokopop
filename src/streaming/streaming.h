@@ -71,8 +71,8 @@ struct StreamHandle {
 ///
 /// Thread-safety: once constructed, this struct is read-only and can be
 /// safely shared across threads.  The only non-const operation is
-/// clear_chunk_data() which is intended to be called after a chunk has
-/// been inferred to free memory.
+/// clear_chunk_data(), called by SynthesisSession after a chunk has been
+/// inferred (LongForm mode) to release its phonemes/tokens.
 struct SynthesisPlan {
     std::vector<Chunk> chunks;
     std::string voice;
@@ -190,7 +190,8 @@ public:
     IncrementalStreamer(const IncrementalStreamer &) = delete;
     IncrementalStreamer & operator=(const IncrementalStreamer &) = delete;
 
-    /// Add text to the buffer
+    /// Add text to the buffer. Not thread-safe with flush(): call feed/flush
+    /// from a single thread. stop() is safe to call from another thread.
     void feed_text(const std::string & text);
 
     /// Generate audio for all buffered text

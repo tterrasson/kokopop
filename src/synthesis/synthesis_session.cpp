@@ -87,7 +87,10 @@ bool SynthesisSession::prepare(std::string & error) {
                                                 frontend.phonemize,
                                                 frontend.tokenize,
                                                 frontend.style_tag, error);
-        if (_adaptative_units.empty()) return false;
+        if (_adaptative_units.empty()) {
+            if (error.empty()) error = "text contains no speakable content";
+            return false;
+        }
 
         _plan.voice = _options.voice;
         _plan.speed = _options.speed;
@@ -128,6 +131,10 @@ bool SynthesisSession::next(size_t max_chunks, size_t queued_requests,
             }
             audio = infer_chunk(_model, _plan, chunk_index, _prev_tail, out_tail, error);
             is_last_chunk = chunk_index >= _chunks_total - 1;
+            // The chunk's phonemes/tokens were consumed by infer_chunk();
+            // release them so a long document doesn't hold every chunk's
+            // text in memory for the whole session.
+            clear_chunk_data(_plan.chunks[static_cast<size_t>(chunk_index)]);
         } else {
             const int target_tokens = _adaptative_controller.target_tokens(queued_requests);
             std::string chunk_error;
