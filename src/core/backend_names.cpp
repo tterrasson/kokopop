@@ -38,21 +38,27 @@ bool backend_from_name(const char * name, int32_t & out) {
 }
 
 const char * backend_name(int32_t backend) {
+    if (backend == KOKOPOP_BACKEND_AUTO) {
+        return "auto";
+    }
     for (const BackendName & entry : k_backend_names) {
         if (entry.value == backend) {
             return entry.name;
         }
     }
-    return "auto";
+    return "unknown";
 }
 
 const char * backend_display_name(int32_t backend) {
+    if (backend == KOKOPOP_BACKEND_AUTO) {
+        return "Auto";
+    }
     for (const BackendName & entry : k_backend_names) {
         if (entry.value == backend) {
             return entry.display;
         }
     }
-    return "CPU";
+    return "Unknown";
 }
 
 const char * backend_name_list() {

@@ -15,8 +15,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <utility>
-#include <vector>
 
 #include <ggml.h>
 #include <ggml-backend.h>
@@ -26,62 +24,13 @@
 namespace kokopop {
 namespace {
 
-class OpenCLBackend final : public Backend {
+class OpenCLBackend final : public SchedBackendBase {
     ggml_backend_t backend_ = nullptr;
     ggml_backend_t cpu_backend_ = nullptr;
-    ggml_backend_sched_t sched_ = nullptr;
-    size_t sched_capacity_ = 0;
-    uint64_t sched_signature_ = 0;
+    ggml_backend_t backends_[2] = {nullptr, nullptr};
     bool env_log_sched_ = false;
     bool env_op_trace_ = false;
     bool env_pin_ = false;
-    std::vector<PendingInit> pending_inits_;
-    std::vector<ggml_tensor *> cpu_assignments_;
-
-    bool ensure_scheduler(ggml_cgraph * graph) {
-        GGML_ASSERT(graph != nullptr);
-        GGML_ASSERT(backend_ != nullptr);
-        GGML_ASSERT(cpu_backend_ != nullptr);
-
-        const size_t required = std::max<size_t>(
-            GGML_DEFAULT_GRAPH_SIZE,
-            backend_graph_capacity(graph));
-        const uint64_t signature = backend_graph_signature(graph);
-
-        if (sched_ != nullptr && (sched_signature_ != signature || sched_capacity_ < required)) {
-            ggml_backend_sched_free(sched_);
-            sched_ = nullptr;
-            sched_capacity_ = 0;
-            sched_signature_ = 0;
-        }
-
-        if (sched_ != nullptr) {
-            return true;
-        }
-
-        // CPU backend must be last. It handles unsupported ops and fallback copies.
-        ggml_backend_t backends[] = { backend_, cpu_backend_ };
-
-        sched_ = ggml_backend_sched_new(
-            backends,
-            nullptr,
-            2,
-            required,
-            true,
-            true);
-
-        if (sched_ != nullptr) {
-            sched_capacity_ = required;
-            sched_signature_ = signature;
-        }
-        return sched_ != nullptr;
-    }
-
-    static bool tensor_has_backend_buffer(const ggml_tensor * tensor) {
-        return tensor != nullptr &&
-               (tensor->buffer != nullptr ||
-                (tensor->view_src != nullptr && tensor->view_src->buffer != nullptr));
-    }
 
     void log_sched_sizes(const char * stage) const {
         if (sched_ == nullptr || !env_log_sched_) {
@@ -191,6 +140,10 @@ class OpenCLBackend final : public Backend {
 
 public:
     explicit OpenCLBackend(int32_t n_threads) {
+        // CPU backend must be last. It handles unsupported ops and fallback copies.
+        sched_op_offload_ = true;
+        sched_split_graph_ = true;
+
         try {
             env_log_sched_ = std::getenv("KOKOPOP_OPENCL_LOG_SCHED") != nullptr;
             env_op_trace_ = std::getenv("KOKOPOP_OPENCL_OP_TRACE") != nullptr;
@@ -245,13 +198,7 @@ public:
     }
 
     ~OpenCLBackend() override {
-        if (sched_ != nullptr) {
-            ggml_backend_sched_free(sched_);
-            sched_ = nullptr;
-            sched_capacity_ = 0;
-            sched_signature_ = 0;
-        }
-
+        free_scheduler();
         if (backend_ != nullptr) {
             ggml_backend_free(backend_);
             backend_ = nullptr;
@@ -267,49 +214,23 @@ public:
         return backend_ != nullptr && cpu_backend_ != nullptr;
     }
 
-    void sched_reset() override {
-        if (sched_ != nullptr) {
-            ggml_backend_sched_reset(sched_);
-        }
+    ggml_backend_t * sched_backends(size_t & n) override {
+        GGML_ASSERT(backend_ != nullptr);
+        GGML_ASSERT(cpu_backend_ != nullptr);
+        backends_[0] = backend_;
+        backends_[1] = cpu_backend_;
+        n = 2;
+        return backends_;
     }
 
-    bool sched_alloc_graph(ggml_cgraph * graph) override {
-        if (!ensure_scheduler(graph)) {
-            return false;
-        }
+    ggml_backend_t cpu_fallback_backend() const override {
+        return cpu_backend_;
+    }
 
+    void configure_sched_callbacks() override {
         if (env_op_trace_) {
             ggml_backend_sched_set_eval_callback(sched_, eval_trace_cb, sched_);
         }
-
-        // Pin deferred tensors to the CPU sub-backend BEFORE sched plans its
-        // splits. Used to escape GPU fp16 drift on precision-critical ops
-        // (e.g. duration predictor chain) — the same ops that need it on
-        // MoltenVK need it on Adreno.
-        if (!cpu_assignments_.empty()) {
-            size_t verified_cpu = 0;
-            for (ggml_tensor * t : cpu_assignments_) {
-                if (t != nullptr) {
-                    ggml_backend_sched_set_tensor_backend(sched_, t, cpu_backend_);
-                    ggml_backend_t got = ggml_backend_sched_get_tensor_backend(sched_, t);
-                    if (got == cpu_backend_) {
-                        ++verified_cpu;
-                    }
-                }
-            }
-            if (env_log_sched_) {
-                std::fprintf(stderr, "[opencl-sched] pinned %zu tensors → %zu confirmed on CPU\n",
-                             cpu_assignments_.size(), verified_cpu);
-                std::fflush(stderr);
-            }
-        }
-        cpu_assignments_.clear();
-
-        const bool ok = ggml_backend_sched_alloc_graph(sched_, graph);
-        if (ok) {
-            log_sched_sizes("alloc");
-        }
-        return ok;
     }
 
     void defer_cpu_assignment(ggml_tensor * tensor) override {
@@ -323,117 +244,25 @@ public:
         if (!env_pin_) {
             return;
         }
-        if (tensor != nullptr) {
-            cpu_assignments_.push_back(tensor);
-        }
+        SchedBackendBase::defer_cpu_assignment(tensor);
     }
 
-    void clear_pending_inits() override {
-        pending_inits_.clear();
-        pending_inits_.reserve(64);
-    }
-
-    void queue_tensor_data(ggml_tensor * tensor, const void * data, size_t size) override {
-        if (tensor == nullptr || data == nullptr || size == 0) {
-            return;
+    bool sched_alloc_graph(ggml_cgraph * graph) override {
+        // Deferred CPU pins are applied by the base class in
+        // on_scheduler_ready(), BEFORE sched plans its splits — used to
+        // escape GPU fp16 drift on precision-critical ops (e.g. the duration
+        // predictor chain), the same ops that need it on MoltenVK need it on
+        // Adreno.
+        const bool ok = SchedBackendBase::sched_alloc_graph(graph);
+        if (ok) {
+            log_sched_sizes("alloc");
         }
-
-        PendingInit init;
-        init.tensor = tensor;
-        init.bytes.resize(size);
-        std::memcpy(init.bytes.data(), data, size);
-        pending_inits_.push_back(std::move(init));
-    }
-
-    void queue_zero_tensor(ggml_tensor * tensor) override {
-        if (tensor == nullptr) {
-            return;
-        }
-
-        PendingInit init;
-        init.tensor = tensor;
-        init.zero = true;
-        pending_inits_.push_back(std::move(init));
-    }
-
-    void queue_f32_tensor(ggml_tensor * tensor, float value) override {
-        if (tensor == nullptr) {
-            return;
-        }
-
-        GGML_ASSERT(tensor->type == GGML_TYPE_F32 && "queue_f32_tensor expects an F32 tensor");
-
-        const size_t n = static_cast<size_t>(ggml_nelements(tensor));
-
-        PendingInit init;
-        init.tensor = tensor;
-        init.bytes.resize(n * sizeof(float));
-
-        auto * dst = reinterpret_cast<float *>(init.bytes.data());
-        std::fill(dst, dst + n, value);
-
-        pending_inits_.push_back(std::move(init));
-    }
-
-    bool apply_pending_inits() override {
-        for (const PendingInit & init : pending_inits_) {
-            if (init.tensor == nullptr) {
-                continue;
-            }
-
-            GGML_ASSERT(tensor_has_backend_buffer(init.tensor) &&
-                        "pending init tensor buffer not set before apply_pending_inits");
-
-            const size_t nbytes = ggml_nbytes(init.tensor);
-
-            if (init.zero) {
-                ggml_backend_tensor_memset(init.tensor, 0, 0, nbytes);
-                continue;
-            }
-
-            if (!init.bytes.empty()) {
-                GGML_ASSERT(init.bytes.size() <= nbytes && "pending init exceeds tensor size");
-                ggml_backend_tensor_set(init.tensor, init.bytes.data(), 0, init.bytes.size());
-            }
-        }
-
-        pending_inits_.clear();
-        return true;
+        return ok;
     }
 
     ggml_status compute(ggml_context * ctx, ggml_cgraph * graph) override {
-        (void) ctx;
-        GGML_ASSERT(sched_ != nullptr && "compute called before sched_alloc_graph");
-        GGML_ASSERT(graph != nullptr);
-
         log_sched_sizes("compute-begin");
-        return ggml_backend_sched_graph_compute(sched_, graph);
-    }
-
-    void tensor_set(ggml_tensor * tensor, const void * data, size_t offset, size_t size) override {
-        if (tensor == nullptr || data == nullptr || size == 0) {
-            return;
-        }
-
-        GGML_ASSERT(tensor_has_backend_buffer(tensor) &&
-                    "tensor buffer not set before backend tensor_set");
-        GGML_ASSERT(offset + size <= ggml_nbytes(tensor) &&
-                    "backend tensor_set exceeds tensor size");
-
-        ggml_backend_tensor_set(tensor, data, offset, size);
-    }
-
-    void tensor_get(ggml_tensor * tensor, void * data, size_t offset, size_t size) override {
-        if (tensor == nullptr || data == nullptr || size == 0) {
-            return;
-        }
-
-        GGML_ASSERT(tensor_has_backend_buffer(tensor) &&
-                    "tensor buffer not set before backend tensor_get");
-        GGML_ASSERT(offset + size <= ggml_nbytes(tensor) &&
-                    "backend tensor_get exceeds tensor size");
-
-        ggml_backend_tensor_get(tensor, data, offset, size);
+        return SchedBackendBase::compute(ctx, graph);
     }
 
     void preload_lstm_whh(const std::string &, const float * w_hh_f32,
@@ -479,9 +308,6 @@ public:
     int32_t type() const override {
         return KOKOPOP_BACKEND_OPENCL;
     }
-
-
-
 };
 
 } // anonymous namespace

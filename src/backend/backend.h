@@ -1,7 +1,9 @@
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <vector>
@@ -200,6 +202,218 @@ struct PendingInit {
     ggml_tensor * tensor = nullptr;
     std::vector<uint8_t> bytes;
     bool zero = false;
+};
+
+/// Shared boilerplate for the six ggml-sched-based backends (CPU, Metal, CUDA,
+/// Vulkan, OpenCL, WebGPU): scheduler lifecycle, deferred tensor inits and
+/// tensor I/O are identical, so they live here once. Concrete backends provide
+/// only their sub-backend list (`sched_backends()`), device setup and any
+/// backend-specific compute behavior.
+class SchedBackendBase : public Backend {
+public:
+    // Concrete destructors must call free_scheduler() before freeing their
+    // sub-backends: scheduler cleanup still uses those backends.
+    ~SchedBackendBase() override { free_scheduler(); }
+
+    void sched_reset() override {
+        if (sched_ != nullptr) {
+            ggml_backend_sched_reset(sched_);
+        }
+        // Callers may reset after building the graph, so preserve its pins.
+    }
+
+    bool sched_alloc_graph(ggml_cgraph * graph) override {
+        if (!ensure_scheduler(graph)) {
+            return false;
+        }
+        configure_sched_callbacks();
+        on_scheduler_ready(graph);
+        return ggml_backend_sched_alloc_graph(sched_, graph);
+    }
+
+    void clear_pending_inits() override {
+        pending_inits_.clear();
+        pending_inits_.reserve(64);
+        // This marks the start of a new graph, including after an abandoned
+        // graph. Do not carry its raw tensor pointers into the new one.
+        cpu_assignments_.clear();
+    }
+
+    void queue_tensor_data(ggml_tensor * tensor, const void * data, size_t size) override {
+        if (tensor == nullptr || data == nullptr || size == 0) {
+            return;
+        }
+        PendingInit init;
+        init.tensor = tensor;
+        init.bytes.resize(size);
+        std::memcpy(init.bytes.data(), data, size);
+        pending_inits_.push_back(std::move(init));
+    }
+
+    void queue_zero_tensor(ggml_tensor * tensor) override {
+        if (tensor == nullptr) {
+            return;
+        }
+        PendingInit init;
+        init.tensor = tensor;
+        init.zero = true;
+        pending_inits_.push_back(std::move(init));
+    }
+
+    void queue_f32_tensor(ggml_tensor * tensor, float value) override {
+        if (tensor == nullptr) {
+            return;
+        }
+        GGML_ASSERT(tensor->type == GGML_TYPE_F32 && "queue_f32_tensor expects an F32 tensor");
+        const size_t n = static_cast<size_t>(ggml_nelements(tensor));
+        PendingInit init;
+        init.tensor = tensor;
+        init.bytes.resize(n * sizeof(float));
+        auto * dst = reinterpret_cast<float *>(init.bytes.data());
+        std::fill(dst, dst + n, value);
+        pending_inits_.push_back(std::move(init));
+    }
+
+    bool apply_pending_inits() override {
+        for (const PendingInit & init : pending_inits_) {
+            if (init.tensor == nullptr) {
+                continue;
+            }
+            GGML_ASSERT(tensor_has_backend_buffer(init.tensor) &&
+                        "pending init tensor buffer not set before apply_pending_inits");
+            const size_t nbytes = ggml_nbytes(init.tensor);
+            if (init.zero) {
+                ggml_backend_tensor_memset(init.tensor, 0, 0, nbytes);
+                continue;
+            }
+            if (!init.bytes.empty()) {
+                GGML_ASSERT(init.bytes.size() <= nbytes && "pending init exceeds tensor size");
+                ggml_backend_tensor_set(init.tensor, init.bytes.data(), 0, init.bytes.size());
+            }
+        }
+        pending_inits_.clear();
+        return true;
+    }
+
+    ggml_status compute(ggml_context * ctx, ggml_cgraph * graph) override {
+        (void) ctx;
+        GGML_ASSERT(sched_ != nullptr && "compute called before sched_alloc_graph");
+        GGML_ASSERT(graph != nullptr);
+        return ggml_backend_sched_graph_compute(sched_, graph);
+    }
+
+    void tensor_set(ggml_tensor * tensor, const void * data, size_t offset, size_t size) override {
+        if (tensor == nullptr || data == nullptr || size == 0) {
+            return;
+        }
+        GGML_ASSERT(tensor_has_backend_buffer(tensor) &&
+                    "tensor buffer not set before backend tensor_set");
+        GGML_ASSERT(offset + size <= ggml_nbytes(tensor) &&
+                    "backend tensor_set exceeds tensor size");
+        ggml_backend_tensor_set(tensor, data, offset, size);
+    }
+
+    void tensor_get(ggml_tensor * tensor, void * data, size_t offset, size_t size) override {
+        if (tensor == nullptr || data == nullptr || size == 0) {
+            return;
+        }
+        GGML_ASSERT(tensor_has_backend_buffer(tensor) &&
+                    "tensor buffer not set before backend tensor_get");
+        GGML_ASSERT(offset + size <= ggml_nbytes(tensor) &&
+                    "backend tensor_get exceeds tensor size");
+        ggml_backend_tensor_get(tensor, data, offset, size);
+    }
+
+    void defer_cpu_assignment(ggml_tensor * tensor) override {
+        if (tensor != nullptr) {
+            cpu_assignments_.push_back(tensor);
+        }
+    }
+
+    static bool tensor_has_backend_buffer(const ggml_tensor * tensor) {
+        return tensor != nullptr &&
+               (tensor->buffer != nullptr ||
+                (tensor->view_src != nullptr && tensor->view_src->buffer != nullptr));
+    }
+
+protected:
+    /// Sub-backend array handed to ggml_backend_sched_new (GPU first, CPU last).
+    virtual ggml_backend_t * sched_backends(size_t & n) = 0;
+    /// CPU fallback sub-backend used to pin deferred tensors, or null.
+    virtual ggml_backend_t cpu_fallback_backend() const { return nullptr; }
+
+    // ggml_backend_sched_new flags.
+    bool sched_op_offload_ = false;
+    bool sched_split_graph_ = false;
+    // false: recreate the scheduler for every graph (CPU policy — chunk-
+    // dependent shapes must not reuse stale allocation state); true: cache
+    // it by graph signature + capacity (GPU backends).
+    bool cache_scheduler_ = true;
+
+    /// Hook run after the scheduler exists and before alloc_graph, e.g. to
+    /// set an eval trace callback.
+    virtual void configure_sched_callbacks() {}
+    /// Hook run after the scheduler exists and before alloc_graph. Default
+    /// pins the deferred CPU assignments.
+    virtual void on_scheduler_ready(ggml_cgraph * /*graph*/) {
+        apply_cpu_assignments();
+    }
+
+    bool ensure_scheduler(ggml_cgraph * graph) {
+        GGML_ASSERT(graph != nullptr);
+        const size_t required = std::max<size_t>(
+            GGML_DEFAULT_GRAPH_SIZE,
+            backend_graph_capacity(graph));
+        const uint64_t signature = backend_graph_signature(graph);
+
+        if (sched_ != nullptr &&
+            (!cache_scheduler_ || sched_signature_ != signature || sched_capacity_ < required)) {
+            free_scheduler();
+        }
+        if (sched_ != nullptr) {
+            return true;
+        }
+
+        size_t n = 0;
+        ggml_backend_t * backends = sched_backends(n);
+        sched_ = ggml_backend_sched_new(
+            backends, nullptr, static_cast<int>(n), required,
+            sched_op_offload_, sched_split_graph_);
+        if (sched_ != nullptr) {
+            sched_capacity_ = required;
+            sched_signature_ = signature;
+        }
+        return sched_ != nullptr;
+    }
+
+    void free_scheduler() {
+        if (sched_ != nullptr) {
+            ggml_backend_sched_free(sched_);
+            sched_ = nullptr;
+        }
+        sched_capacity_ = 0;
+        sched_signature_ = 0;
+    }
+
+    void apply_cpu_assignments() {
+        ggml_backend_t cpu = cpu_fallback_backend();
+        if (cpu == nullptr) {
+            cpu_assignments_.clear();
+            return;
+        }
+        for (ggml_tensor * t : cpu_assignments_) {
+            if (t != nullptr) {
+                ggml_backend_sched_set_tensor_backend(sched_, t, cpu);
+            }
+        }
+        cpu_assignments_.clear();
+    }
+
+    ggml_backend_sched_t sched_ = nullptr;
+    size_t sched_capacity_ = 0;
+    uint64_t sched_signature_ = 0;
+    std::vector<PendingInit> pending_inits_;
+    std::vector<ggml_tensor *> cpu_assignments_;
 };
 
 struct MetalVocoderConvTransposeParams {

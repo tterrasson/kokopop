@@ -220,10 +220,28 @@ TEST_CASE("backend_names_reject_unknown") {
     // AUTO is not a spelling the tools accept.
     CHECK(!kokopop::backend_from_name("auto", parsed));
     CHECK_EQ(std::string(kokopop::backend_name(KOKOPOP_BACKEND_AUTO)), "auto");
+    CHECK_EQ(std::string(kokopop::backend_name(99)), "unknown");
+    CHECK_EQ(std::string(kokopop::backend_display_name(KOKOPOP_BACKEND_AUTO)), "Auto");
+    CHECK_EQ(std::string(kokopop::backend_display_name(99)), "Unknown");
     // Every accepted name appears in the usage list.
     const std::string list = kokopop::backend_name_list();
     CHECK(list.find("opencl") != std::string::npos);
     CHECK(list.find("vulkan") != std::string::npos);
+}
+
+TEST_CASE("scheduler_reset_preserves_deferred_pins_until_next_graph") {
+    class PendingBackend final : public kokopop::SchedBackendBase {
+    public:
+        size_t pending_pins() const { return cpu_assignments_.size(); }
+        ggml_backend_t * sched_backends(size_t & n) override { n = 0; return nullptr; }
+        ggml_backend_buffer_type_t weight_buffer_type() const override { return nullptr; }
+    } backend;
+    ggml_tensor tensor{};
+    backend.defer_cpu_assignment(&tensor);
+    backend.sched_reset();  // Kokoro and sanoTTS do this after graph construction
+    CHECK_EQ(backend.pending_pins(), 1u);
+    backend.clear_pending_inits();  // discard an abandoned graph before building another
+    CHECK_EQ(backend.pending_pins(), 0u);
 }
 
 TEST_CASE("backend_webgpu_request_is_explicit") {
