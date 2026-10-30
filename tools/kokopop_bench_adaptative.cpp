@@ -16,6 +16,7 @@
 #include "kokopop.h"
 
 #include "core/backend_names.h"
+#include "core/cli_args.h"
 #include "streaming/streaming.h"
 #include "http/synthesis_scheduler.h"
 
@@ -52,12 +53,6 @@ void usage(const char * argv0) {
         "  --runs N        Number of benchmark runs (default: 3)\n"
         "\n",
         stderr);
-}
-
-const char * arg_value(int & i, int argc, char ** argv) {
-    if (i + 1 >= argc) return nullptr;
-    ++i;
-    return argv[i];
 }
 
 using Clock = std::chrono::steady_clock;
@@ -104,26 +99,29 @@ int main(int argc, char ** argv) {
     try {
         for (int i = 1; i < argc; ++i) {
             if (std::strcmp(argv[i], "--model") == 0) {
-                model_path = arg_value(i, argc, argv);
+                model_path = kokopop::cli::arg_required(i, argc, argv, "--model", argv[0]);
             } else if (std::strcmp(argv[i], "--voice") == 0) {
-                voice = arg_value(i, argc, argv);
+                voice = kokopop::cli::arg_required(i, argc, argv, "--voice", argv[0]);
             } else if (std::strcmp(argv[i], "--text") == 0) {
-                text = arg_value(i, argc, argv);
+                text = kokopop::cli::arg_required(i, argc, argv, "--text", argv[0]);
             } else if (std::strcmp(argv[i], "--file") == 0) {
-                file_path = arg_value(i, argc, argv);
+                file_path = kokopop::cli::arg_required(i, argc, argv, "--file", argv[0]);
             } else if (std::strcmp(argv[i], "--threads") == 0) {
-                threads = std::stoi(arg_value(i, argc, argv));
+                threads = static_cast<int>(
+                    kokopop::cli::arg_int(i, argc, argv, "--threads", argv[0], 1, 256));
             } else if (std::strcmp(argv[i], "--backend") == 0) {
-                const char * v = arg_value(i, argc, argv);
+                const char * v = kokopop::cli::arg_required(i, argc, argv, "--backend", argv[0]);
                 if (!kokopop::backend_from_name(v, backend)) {
                     std::fprintf(stderr, "error: invalid backend '%s' (use %s)\n",
                                  v, kokopop::backend_name_list());
                     return 2;
                 }
             } else if (std::strcmp(argv[i], "--speed") == 0) {
-                speed = std::stof(arg_value(i, argc, argv));
+                speed = static_cast<float>(
+                    kokopop::cli::arg_double(i, argc, argv, "--speed", argv[0], 0.1, 10.0));
             } else if (std::strcmp(argv[i], "--runs") == 0) {
-                n_runs = std::stoi(arg_value(i, argc, argv));
+                n_runs = static_cast<int>(
+                    kokopop::cli::arg_int(i, argc, argv, "--runs", argv[0], 1, 1000));
             } else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
                 usage(argv[0]);
                 return 0;

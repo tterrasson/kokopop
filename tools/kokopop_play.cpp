@@ -1,6 +1,8 @@
 #include "playback/playback.h"
 #include "playback/playback_stdout.h"
 #include "playback/playback_dummy.h"
+#include "core/cli_args.h"
+#include "core/wav.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -32,63 +34,6 @@ void usage(const char * argv0) {
         argv0, argv0);
 }
 
-const char * arg_value(int & i, int argc, char ** argv) {
-    if (i + 1 >= argc) return nullptr;
-    ++i;
-    return argv[i];
-}
-
-} // namespace
-
-// ---------------------------------------------------------------------------
-// Simple WAV parser (reads header and extracts sample rate + data)
-// ---------------------------------------------------------------------------
-namespace {
-
-struct WavHeader {
-    int sample_rate = 0;
-    int bits_per_sample = 16;
-    int channels = 1;
-    bool valid = false;
-};
-
-bool parse_wav_header(const uint8_t * data, size_t size, WavHeader & header) {
-    if (size < 44) return false;
-
-    // Check RIFF header
-    if (data[0] != 'R' || data[1] != 'I' || data[2] != 'F' || data[3] != 'F') {
-        return false;
-    }
-    if (data[8] != 'W' || data[9] != 'A' || data[10] != 'V' || data[11] != 'E') {
-        return false;
-    }
-
-    // Find fmt chunk
-    size_t pos = 12;
-    while (pos + 8 <= size) {
-        char chunk_id[4];
-        std::memcpy(chunk_id, data + pos, 4);
-        uint32_t chunk_size = 0;
-        std::memcpy(&chunk_size, data + pos + 4, 4);
-        pos += 8;
-
-        if (chunk_id[0] == 'f' && chunk_id[1] == 'm' &&
-            chunk_id[2] == 't' && chunk_id[3] == ' ') {
-            if (chunk_size < 16) return false;
-            header.channels = data[pos];
-            header.sample_rate = *(int32_t *)(data + pos + 4);
-            header.bits_per_sample = data[pos + 14];
-            header.valid = true;
-            return true;
-        }
-
-        pos += chunk_size;
-        // Align to even
-        if (chunk_size % 2 != 0) ++pos;
-    }
-    return false;
-}
-
 } // namespace
 
 enum class InputFormat { PcmF32, PcmS16, Wav };
@@ -99,7 +44,7 @@ int main(int argc, char ** argv) {
 
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--format") == 0) {
-            const char * v = arg_value(i, argc, argv);
+            const char * v = kokopop::cli::arg_required(i, argc, argv, "--format", argv[0]);
             if (std::strcmp(v, "pcm-f32") == 0) format = InputFormat::PcmF32;
             else if (std::strcmp(v, "pcm-s16") == 0) format = InputFormat::PcmS16;
             else if (std::strcmp(v, "wav") == 0) format = InputFormat::Wav;
@@ -108,7 +53,8 @@ int main(int argc, char ** argv) {
                 return 2;
             }
         } else if (std::strcmp(argv[i], "--rate") == 0) {
-            sample_rate = std::stoi(arg_value(i, argc, argv));
+            sample_rate = static_cast<int>(
+                kokopop::cli::arg_int(i, argc, argv, "--rate", argv[0], 1000, 384000));
         } else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
             usage(argv[0]);
             return 0;
@@ -146,53 +92,53 @@ int main(int argc, char ** argv) {
             wav_data.insert(wav_data.end(), buf, buf + n);
         }
 
-        if (wav_data.size() < 44) {
-            std::fprintf(stderr, "WAV file too small\n");
+        kokopop::WavFileInfo info;
+        if (!kokopop::wav_parse(wav_data.data(), wav_data.size(), info)) {
+            std::fprintf(stderr, "Failed to parse WAV header (not a supported PCM/float WAV)\n");
+            kokopop::free_playback(playback);
+            return 4;
+        }
+        if (info.channels != 1) {
+            std::fprintf(stderr, "Only mono WAV input is supported (got %d channels)\n",
+                         info.channels);
             kokopop::free_playback(playback);
             return 4;
         }
 
-        WavHeader header;
-        if (!parse_wav_header(wav_data.data(), wav_data.size(), header)) {
-            std::fprintf(stderr, "Failed to parse WAV header\n");
-            kokopop::free_playback(playback);
-            return 4;
-        }
-
-        if (header.sample_rate > 0) {
-            // Restart with correct sample rate
+        if (info.sample_rate != sample_rate) {
+            // Restart with the file's sample rate
             playback->stop();
-            playback->start(header.sample_rate);
+            if (!playback->start(info.sample_rate)) {
+                std::fprintf(stderr, "Failed to restart playback at %d Hz\n", info.sample_rate);
+                kokopop::free_playback(playback);
+                return 3;
+            }
+            sample_rate = info.sample_rate;
         }
 
-        // Find data chunk
-        size_t pos = 12;
-        while (pos + 8 <= wav_data.size()) {
-            char chunk_id[4];
-            std::memcpy(chunk_id, wav_data.data() + pos, 4);
-            uint32_t chunk_size = 0;
-            std::memcpy(&chunk_size, wav_data.data() + pos + 4, 4);
-            pos += 8;
-
-            if (chunk_id[0] == 'd' && chunk_id[1] == 'a' &&
-                chunk_id[2] == 't' && chunk_id[3] == 'a') {
-                // Convert samples to float
-                std::vector<float> samples(chunk_size / (header.bits_per_sample / 8));
-                if (header.bits_per_sample == 16) {
-                    for (size_t i = 0; i < samples.size(); ++i) {
-                        int16_t s;
-                        std::memcpy(&s, wav_data.data() + pos + i * 2, 2);
-                        samples[i] = s / 32767.0f;
-                    }
-                } else if (header.bits_per_sample == 32) {
-                    std::memcpy(samples.data(), wav_data.data() + pos, samples.size() * 4);
-                }
-                playback->write(samples.data(), samples.size());
-                break;
+        // Convert samples to float. info.data_size is already clamped to the
+        // bytes actually present in the file.
+        const int bytes_per_sample = info.bits_per_sample / 8;
+        const size_t n = info.data_size / static_cast<size_t>(bytes_per_sample);
+        std::vector<float> samples(n);
+        const uint8_t * d = wav_data.data() + info.data_offset;
+        if (info.bits_per_sample == 16) {
+            for (size_t i = 0; i < n; ++i) {
+                int16_t s;
+                std::memcpy(&s, d + i * 2, 2);
+                samples[i] = s / 32768.0f;
             }
-
-            pos += chunk_size;
-            if (chunk_size % 2 != 0) ++pos;
+        } else if (info.is_float) {
+            std::memcpy(samples.data(), d, n * sizeof(float));
+        } else {  // 32-bit integer PCM
+            for (size_t i = 0; i < n; ++i) {
+                int32_t s;
+                std::memcpy(&s, d + i * 4, 4);
+                samples[i] = s / 2147483648.0f;
+            }
+        }
+        if (!samples.empty()) {
+            playback->write(samples.data(), samples.size());
         }
     } else {
         // PCM reading
