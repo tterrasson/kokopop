@@ -442,7 +442,7 @@ bool phonemize_text(const std::string & text,
                     while (!out.empty() && out.back() == ' ') {
                         out.pop_back();
                     }
-                    out += std::string(ch);
+                    out.append(ch);
                 }
             } else {
                 fragment.append(ch);

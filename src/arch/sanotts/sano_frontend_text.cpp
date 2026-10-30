@@ -1,5 +1,6 @@
 #include "arch/sanotts/sano_frontend_text.h"
 
+#include "core/replace.h"  // kokopop::replace_all (string_view overloads)
 #include "core/utf8.h"
 #include "synthesis/phonemizer.h"
 
@@ -169,18 +170,6 @@ std::string trim(std::string_view text) {
         --end;
     }
     return std::string(text.substr(begin, end - begin));
-}
-
-void replace_all(std::string & text, std::string_view needle,
-                 std::string_view replacement) {
-    if (needle.empty()) {
-        return;
-    }
-    size_t pos = 0;
-    while ((pos = text.find(needle, pos)) != std::string::npos) {
-        text.replace(pos, needle.size(), replacement);
-        pos += replacement.size();
-    }
 }
 
 // misaki's E2M table, in the order misaki produces: sorted by decreasing key
