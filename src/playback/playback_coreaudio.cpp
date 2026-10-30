@@ -41,8 +41,17 @@ CoreAudioPlayback::~CoreAudioPlayback() {
 bool CoreAudioPlayback::start(int sample_rate) {
     if (queue_) return false;
 
+    // Reject absurd rates: sample_rate * BUFFER_DURATION_MS would overflow a
+    // 32-bit int for sample_rate > ~21 MHz (the rate may come from an
+    // untrusted WAV header via kokopop_play).
+    if (sample_rate < 1000 || sample_rate > 384000) {
+        pb_log("start: refusing sample rate %d\n", sample_rate);
+        return false;
+    }
+
     sample_rate_ = sample_rate;
-    buffer_size_samples_ = (sample_rate * BUFFER_DURATION_MS) / 1000;
+    buffer_size_samples_ = static_cast<int>(
+        (static_cast<int64_t>(sample_rate) * BUFFER_DURATION_MS) / 1000);
     pb_log("start: sr=%d buf_samples=%d\n", sample_rate, buffer_size_samples_);
 
     AudioStreamBasicDescription format{};
@@ -141,15 +150,23 @@ void CoreAudioPlayback::stop() {
 
     // Enqueued is not played: an immediate stop discards up to three buffers.
     // Stop asynchronously and wait for playback to finish before disposal.
-    // Keep the mutex released: AudioQueueStop can invoke callbacks.
-    if (queue_) {
-        const OSStatus status = AudioQueueStop(queue_, false);
+    // Keep the mutex released while calling into Core Audio (callbacks take
+    // it), but null the handle under the mutex first: a callback firing during
+    // AudioQueueDispose must not see a queue that is being torn down.
+    AudioQueueRef q = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(data_mutex_);
+        q = queue_;
+        queue_ = nullptr;
+    }
+    if (q != nullptr) {
+        const OSStatus status = AudioQueueStop(q, false);
         if (status == noErr) {
             UInt32 is_running = 1;
             while (is_running) {
                 UInt32 size = sizeof(is_running);
                 const OSStatus result = AudioQueueGetProperty(
-                    queue_, kAudioQueueProperty_IsRunning, &is_running, &size);
+                    q, kAudioQueueProperty_IsRunning, &is_running, &size);
                 if (result != noErr) {
                     pb_log("AudioQueueGetProperty(IsRunning) failed: 0x%08x\n", result);
                     break;
@@ -161,11 +178,10 @@ void CoreAudioPlayback::stop() {
         }
 
         pb_log("stop: AudioQueueDispose\n");
-        AudioQueueDispose(queue_, true);
-        queue_ = nullptr;
-        buffers_.clear();
-        packet_descs_.clear();
+        AudioQueueDispose(q, true);
     }
+    buffers_.clear();
+    packet_descs_.clear();
 
     {
         std::lock_guard<std::mutex> lock(data_mutex_);
