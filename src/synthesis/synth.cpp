@@ -27,8 +27,10 @@ float hash_freq(const std::vector<uint32_t> & ids, const std::string & voice) {
 }
 
 bool allocate_audio(size_t n, int32_t sr, kokopop_audio & out) {
-    out.samples = static_cast<float *>(std::calloc(n, sizeof(float)));
-    if (out.samples == nullptr) {
+    // malloc, not calloc: every caller immediately overwrites the whole
+    // buffer with memcpy, so the zeroing pass is pure waste.
+    out.samples = static_cast<float *>(std::malloc(n * sizeof(float)));
+    if (out.samples == nullptr && n > 0) {
         return false;
     }
     out.n_samples = n;
@@ -183,15 +185,18 @@ bool synthesize_phonemes(
         return false;
     }
 
+    // Voice-aware rate: a multi-rate pack must report the selected voice's
+    // rate, not the default voice's.
+    const int32_t sr_i = model.sample_rate(voice);
     const float duration_s = std::max(0.10f, static_cast<float>(ids.size()) * 0.035f / speed);
-    const size_t n = static_cast<size_t>(duration_s * static_cast<float>(model.sample_rate()));
-    if (!allocate_audio(n, model.sample_rate(), out)) {
+    const size_t n = static_cast<size_t>(duration_s * static_cast<float>(sr_i));
+    if (!allocate_audio(n, sr_i, out)) {
         error = "failed to allocate output audio";
         return false;
     }
 
     const float freq = hash_freq(ids, voice);
-    const float sr = static_cast<float>(model.sample_rate());
+    const float sr = static_cast<float>(sr_i);
     for (size_t i = 0; i < n; ++i) {
         const float t = static_cast<float>(i) / sr;
         const float attack = static_cast<float>(i) / (0.02f * sr);
