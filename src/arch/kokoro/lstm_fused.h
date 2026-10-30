@@ -31,7 +31,7 @@ inline constexpr uint64_t kLstmOpenclParamsMagic = UINT64_C(0x4b4f4b4f4c535431);
 
 // Parameters for a single fused LSTM direction.
 // Instances must remain alive for the duration of ggml graph execution;
-// store them in Model::lstm_custom_params (pre-reserved vector).
+// store them in KokoroArch::lstm_custom_params (pointer-stable deque).
 struct LstmCustomParams {
     LstmOpenclParams opencl;
     const float * w_hh_rowwise; // [4*hidden, hidden] transposed for SIMD-friendly access

@@ -19,6 +19,7 @@
 #include <array>
 #include <string>
 #include <unordered_map>
+#include <deque>
 #include <vector>
 
 namespace kokopop {
@@ -218,12 +219,10 @@ struct KokoroArch final : ModelArch {
     std::unordered_map<std::string, std::vector<float>> diffusion_f32;
     float diffusion_sigma_data = 0.2f;
 
-    // Scratch storage for LstmCustomParams instances built during graph
-    // construction.  Reserve 24 slots before building the generation graph
-    // (12 LSTM directions × safety margin) so no reallocation occurs and
-    // stored pointers remain valid until after graph execution.
-    // See graph_ops.cpp::lstm_direction for usage.
-    std::vector<struct LstmCustomParams> lstm_custom_params;
+    // Graph nodes retain pointers to these entries as userdata. deque keeps
+    // them stable as more entries are added, until graph execution completes.
+    // See graph_ops.cpp::lstm_direction.
+    std::deque<struct LstmCustomParams> lstm_custom_params;
 
     // Scratch storage for experimental Metal vocoder custom-op parameters.
     // Reserved before building the generator graph so userdata pointers remain
