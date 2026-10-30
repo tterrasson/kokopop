@@ -419,3 +419,38 @@ TEST_CASE("postprocess_chunk_audio_matches_chained_trim_calls_for_middle_chunk")
     REQUIRE_EQ(fused.size(), chained.size());
     for (size_t i = 0; i < fused.size(); ++i) CHECK_EQ(fused[i], chained[i]);
 }
+
+// ---- Régressions: arithmétique ms×sample_rate en 64 bits ----
+
+TEST_CASE("ms_to_samples_uses_64bit_math_for_extreme_values") {
+    // INT32_MAX ms at 24 kHz overflows 32-bit int (UB) in the old code.
+    const size_t n = ms_to_samples(std::numeric_limits<int>::max(), 24000);
+    CHECK_EQ(n, static_cast<size_t>(std::numeric_limits<int>::max()) * 24000u / 1000u);
+    CHECK_EQ(ms_to_samples(-5, 24000), 0u);
+    CHECK_EQ(ms_to_samples(10, 0), 0u);
+    CHECK_EQ(ms_to_samples(0, 24000), 0u);
+}
+
+TEST_CASE("apply_crossfade_huge_ms_falls_back_to_concat") {
+    std::vector<float> prev(100, 0.5f), next(100, -0.5f);
+    // crossfade_ms = INT32_MAX must not overflow; buffers are too short for
+    // the crossfade, so plain concatenation is expected.
+    auto r = apply_crossfade(prev, next, std::numeric_limits<int>::max(), 24000);
+    REQUIRE_EQ(r.size(), 200u);
+    CHECK_EQ(r[0], 0.5f);
+    CHECK_EQ(r[199], -0.5f);
+}
+
+TEST_CASE("postprocess_chunk_audio_huge_trim_ms_does_not_crash") {
+    std::vector<float> audio(1000, 0.5f);
+    Chunk chunk;
+    chunk.is_first = false;
+    chunk.is_last = true;  // no pause appended
+    chunk.boundary_after = Boundary::None;
+    ChunkConfig cfg;
+    cfg.trim_silence = true;
+    cfg.max_silence_trim_ms = std::numeric_limits<int>::max();
+    auto result = postprocess_chunk_audio(audio, chunk, 0, 1, cfg, 24000);
+    // Non-silent audio: nothing is trimmed; no overflow, no huge allocation.
+    CHECK_EQ(result.size(), audio.size());
+}

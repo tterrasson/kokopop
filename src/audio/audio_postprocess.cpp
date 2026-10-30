@@ -5,8 +5,6 @@
 #include <cstring>
 #include <vector>
 
-#include "core/constants.h"
-
 #ifdef __ARM_NEON
 #include <arm_neon.h>
 #endif
@@ -18,10 +16,6 @@ namespace kokopop {
 namespace {
 
 static constexpr float SILENCE_THRESHOLD = 0.01f;
-
-static int ms_to_samples(int ms, int sample_rate) {
-    return (ms * sample_rate) / 1000;
-}
 
 // Returns true if any |x| > SILENCE_THRESHOLD in [data, data+count).
 // SIMD with per-lane early exit; falls back to scalar.
@@ -49,10 +43,12 @@ static bool any_above_threshold(const float * data, size_t count) {
 
 // Pointer-based variants — operate on a raw range so callers can scan a view of
 // a larger buffer without materialising it first.
-static size_t scan_leading_edge(const float * data, size_t count, size_t max_samples) {
+static size_t scan_leading_edge(const float * data, size_t count, size_t max_samples,
+                                int sample_rate) {
     const size_t check  = std::min(count, max_samples);
     if (check == 0) return 0;
-    const size_t window = static_cast<size_t>(50 * KOKOPOP_SAMPLE_RATE / 1000);
+    // 50 ms window at the effective voice rate (sanoTTS packs may mix rates).
+    const size_t window = ms_to_samples(50, sample_rate);
     const size_t step   = std::max(size_t(1), window / 4);
     for (size_t i = 0; i < check; i += step) {
         if (any_above_threshold(data + i, std::min(window, check - i))) return i;
@@ -84,8 +80,9 @@ static size_t scan_trailing_edge(const float * data, size_t count, size_t max_sa
     return scan_floor;
 }
 
-static size_t find_leading_edge(const std::vector<float> & audio, size_t max_samples) {
-    return scan_leading_edge(audio.data(), audio.size(), max_samples);
+static size_t find_leading_edge(const std::vector<float> & audio, size_t max_samples,
+                                int sample_rate) {
+    return scan_leading_edge(audio.data(), audio.size(), max_samples, sample_rate);
 }
 
 static size_t find_trailing_edge(const std::vector<float> & audio, size_t max_samples) {
@@ -102,10 +99,8 @@ std::vector<float> apply_crossfade(
     if (prev.empty()) return next;
     if (next.empty()) return prev;
 
-    int n = ms_to_samples(crossfade_ms, sample_rate);
-    if (n <= 0 ||
-        static_cast<int>(prev.size()) < n ||
-        static_cast<int>(next.size()) < n) {
+    const size_t n = ms_to_samples(crossfade_ms, sample_rate);
+    if (n == 0 || prev.size() < n || next.size() < n) {
         // Too short for crossfade, simple concat
         std::vector<float> result;
         result.reserve(prev.size() + next.size());
@@ -120,7 +115,7 @@ std::vector<float> apply_crossfade(
 
     // Main part of prev (everything except tail)
     size_t offset = 0;
-    size_t main_len = prev.size() - static_cast<size_t>(n);
+    size_t main_len = prev.size() - n;
     std::memcpy(result.data() + offset, prev.data(), main_len * sizeof(float));
     offset += main_len;
 
@@ -130,10 +125,10 @@ std::vector<float> apply_crossfade(
         result[offset] = next[0];
     } else {
         const float inv_n_minus_1 = 1.0f / static_cast<float>(n - 1);
-        const float * prev_tail   = prev.data() + (prev.size() - static_cast<size_t>(n));
+        const float * prev_tail   = prev.data() + (prev.size() - n);
         const float * next_head   = next.data();
         float       * out         = result.data() + offset;
-        int i = 0;
+        size_t i = 0;
 
 #ifdef __ARM_NEON
         {
@@ -161,7 +156,13 @@ std::vector<float> apply_crossfade(
                 __m256 v1_t = _mm256_sub_ps(vone, vt);
                 __m256 vp   = _mm256_loadu_ps(prev_tail + i);
                 __m256 vn   = _mm256_loadu_ps(next_head + i);
+#if defined(__FMA__)
                 _mm256_storeu_ps(out + i, _mm256_fmadd_ps(vp, v1_t, _mm256_mul_ps(vn, vt)));
+#else
+                // -mavx2 without -mfma: no fused multiply-add available.
+                _mm256_storeu_ps(out + i,
+                    _mm256_add_ps(_mm256_mul_ps(vp, v1_t), _mm256_mul_ps(vn, vt)));
+#endif
                 vi = _mm256_add_ps(vi, vstep);
             }
         }
@@ -171,10 +172,10 @@ std::vector<float> apply_crossfade(
             out[i] = prev_tail[i] * (1.0f - t) + next_head[i] * t;
         }
     }
-    offset += static_cast<size_t>(n);
+    offset += n;
 
     // Rest of next (everything except head)
-    size_t tail_len = next.size() - static_cast<size_t>(n);
+    size_t tail_len = next.size() - n;
     std::memcpy(result.data() + offset, next.data() + n, tail_len * sizeof(float));
 
     return result;
@@ -206,8 +207,8 @@ std::vector<float> trim_leading_silence(
     int sample_rate) {
     if (audio.empty()) return audio;
 
-    int max_samples = ms_to_samples(max_ms, sample_rate);
-    size_t edge = find_leading_edge(audio, static_cast<size_t>(max_samples));
+    const size_t max_samples = ms_to_samples(max_ms, sample_rate);
+    size_t edge = find_leading_edge(audio, max_samples, sample_rate);
 
     if (edge == 0) return audio;
 
@@ -220,8 +221,8 @@ std::vector<float> trim_trailing_silence(
     int sample_rate) {
     if (audio.empty()) return audio;
 
-    int max_samples = ms_to_samples(max_ms, sample_rate);
-    size_t edge = find_trailing_edge(audio, static_cast<size_t>(max_samples));
+    const size_t max_samples = ms_to_samples(max_ms, sample_rate);
+    size_t edge = find_trailing_edge(audio, max_samples);
 
     if (edge >= audio.size()) return audio;
 
@@ -233,8 +234,8 @@ void append_silence(
     std::vector<float> & audio,
     int ms,
     int sample_rate) {
-    if (ms <= 0) return;
-    int n = ms_to_samples(ms, sample_rate);
+    const size_t n = ms_to_samples(ms, sample_rate);
+    if (n == 0) return;
     audio.insert(audio.end(), n, 0.0f);
 }
 
@@ -272,9 +273,8 @@ std::vector<float> postprocess_chunk_audio(
     if (config.trim_silence) {
         // Leading trim: skipped on the very first chunk to preserve natural intro.
         if (!chunk.is_first) {
-            const size_t max_lead = static_cast<size_t>(
-                ms_to_samples(config.max_silence_trim_ms, sample_rate));
-            start = scan_leading_edge(audio.data(), audio.size(), max_lead);
+            const size_t max_lead = ms_to_samples(config.max_silence_trim_ms, sample_rate);
+            start = scan_leading_edge(audio.data(), audio.size(), max_lead, sample_rate);
         }
 
         // Trailing trim is performed on the post-leading-trim view (matches
@@ -283,7 +283,7 @@ std::vector<float> postprocess_chunk_audio(
         if (chunk.boundary_after != Boundary::None) {
             trim_ms = std::max(1, trim_ms / 2);
         }
-        const size_t max_trail = static_cast<size_t>(ms_to_samples(trim_ms, sample_rate));
+        const size_t max_trail = ms_to_samples(trim_ms, sample_rate);
         const size_t view_size = audio.size() - start;
         const size_t edge = scan_trailing_edge(audio.data() + start, view_size, max_trail);
         end = start + edge;
@@ -293,7 +293,7 @@ std::vector<float> postprocess_chunk_audio(
     size_t pause_n = 0;
     const int pause_ms = pause_for_boundary(chunk.boundary_after, config);
     if (pause_ms > 0 && !chunk.is_last) {
-        pause_n = static_cast<size_t>(ms_to_samples(pause_ms, sample_rate));
+        pause_n = ms_to_samples(pause_ms, sample_rate);
     }
 
     const size_t body = (end > start) ? (end - start) : 0;

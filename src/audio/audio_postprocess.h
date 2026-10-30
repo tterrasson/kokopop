@@ -16,6 +16,14 @@ namespace kokopop {
 //   - Crossfade between chunks
 // ---------------------------------------------------------------------------
 
+/// Milliseconds → samples at `sample_rate`. Computed in 64 bits: the ms
+/// values can come from the C API's int32 overrides, and `ms * sample_rate`
+/// in 32 bits would overflow (UB) for large-but-valid inputs.
+inline size_t ms_to_samples(int ms, int sample_rate) {
+    if (ms <= 0 || sample_rate <= 0) return 0;
+    return static_cast<size_t>((static_cast<int64_t>(ms) * sample_rate) / 1000);
+}
+
 /// Apply linear crossfade between the tail of prev and the head of next.
 /// Returns a new vector containing the merged audio.
 /// If either buffer is too short for crossfade, simple concatenation is used.
@@ -57,6 +65,8 @@ int pause_for_boundary(Boundary boundary, const ChunkConfig & config);
 /// Full post-processing pipeline for a single chunk
 /// - Trim silence
 /// - Add boundary pause
+/// `chunk_index`/`total_chunks` are accepted for call-site context but not
+/// used by the pipeline itself.
 std::vector<float> postprocess_chunk_audio(
     const std::vector<float> & audio,
     const Chunk & chunk,
